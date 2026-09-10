@@ -1,0 +1,361 @@
+# Default values for onramp-adapter-service.
+#
+# These are the SHAPE of the deployment. Real secret values and the real
+# environment config are supplied by a per-environment overlay of your own and by the
+# operator; nothing here is a live secret.
+# A secret that resolves to an empty value must stop the pod, never boot a
+# service that is silently unverified (README "The API key").
+
+image:
+  repository: ghcr.io/paritytech/onramp-adapter-service-community
+  # Required at render time: an empty tag now fails the render (see _helpers.tpl).
+  # It used to fall back to `.Chart.AppVersion` (0.1.0), a tag the build workflow never pushes:
+  # it publishes `YYYYmmdd-HHMMSS-<sha8>` only, so any deploy landing before the tag was set
+  # pulled an image that does not exist. Your deploy pipeline supplies this; `--set image.tag=...` supplies it
+  # for a local render.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Credentials for a private registry. The image lives in a GHCR package, so a pull needs a
+# secret unless the package is public. Empty renders no field, which is right for a public
+# package and for a local render.
+# TODO(operator): if the GHCR package is private, name the pull secret here.
+imagePullSecrets: []
+#  - name: ghcr-pull
+
+# Which deployment this is. `src/config.ts` keys the Meld host allowlist and the auth-mode
+# guards off it, and `development` is the one value that permits `auth.mode: insecure_dev`, so the
+# default here is `production`, which fails closed. It was previously absent, and
+# `configmap.yaml` filled the hole with `sandbox`.
+#
+# Defaults alone are not a bootable config (no secrets, no collection id, and `production`
+# pairs with the sandbox `meld.base_url` below, which the schema refuses). Each overlay sets
+# `environment` and `meld.base_url` together, which is the pairing the schema enforces.
+environment: production
+
+# The HTTP server surface.
+server:
+  port: 8080
+  host: 0.0.0.0
+  log_level: info
+  # Required (README): the peers in front of this service allowed to set
+  # `X-Forwarded-For`, as CIDRs or bare addresses. Decides whether the rate
+  # limit is per caller or per service.
+  # TODO(operator): the ingress controller's pod CIDR.
+  #
+  # A hop count is not a trust decision. Until this names the peers allowed to set
+  # `X-Forwarded-For`, any workload that can reach the Service forges the header and mints an
+  # unlimited supply of fresh rate-limit buckets, the only control in front of both public
+  # handshake routes.
+  #
+  # Empty is accepted and boots: no forwarded header is read and every caller behind the ingress
+  # shares one rate-limit bucket. That is visible and safe (the previous shape trusted whoever
+  # connected, which was neither), but it is not a refusal, so a running pod is no evidence this
+  # was supplied. `npm run check:chart` is what reports it as still owed.
+  trusted_proxy_cidrs: []
+  request_timeout_ms: 20000
+
+# Meld. api_key is mounted as a file, never as an env var, so it reaches the
+# process the same file way onramp's Secret type expects.
+meld:
+  base_url: https://api-sb.meld.io
+  api_version: "2025-01-01"
+  timeout_ms: 8000
+  boot_probe:
+    destination_code: DOT_ASSETHUB
+    source_amount: "20"
+    source_currency: USD
+    country_code: US
+    payment_method_type: CREDIT_DEBIT_CARD
+
+# The caller gate. personhood is the production posture.
+auth:
+  mode: personhood
+  personhood:
+    # jwt_key and people_rpc_url/collection/ring exponent are set per-env.
+    people_rpc_url: ""
+    # BLOCKED: the collection ids, awaited. A list because personhood is not one
+    # population: a full person and a lite person live in different collections and
+    # pinning one silently refuses everybody in the other. The real ids are ASCII
+    # names space-padded to 32 bytes, so do not trim the trailing 0x20 bytes.
+    # Lite first: Safety Net is a lite-personhood release, so it opens almost every
+    # proof and the second entry is not read in the common case. Order is traffic,
+    # not preference: the redeem path walks the list until one opens.
+    #   pop:polkadot.network/people-lite -> 0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652d6c697465
+    #   pop:polkadot.network/people      -> 0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652020202020
+    collections: []
+    challenge_ttl_ms: 60000
+    token_ttl_s: 300
+
+# Which destinations this deployment will actually sell, and between what amounts.
+#
+# The catalog in `meld/catalog.ts` is what the code can deliver; this is what a given deployment
+# offers. A destination the catalog knows and this list omits is refused as `RegionUnavailable`,
+# so adding one here is the whole of enabling it, and leaving one out is a silent refusal rather
+# than an error at boot.
+#
+# `USDC_ASSETHUB` is here for the regions where DOT is not offered (1 Sep meeting). The buyer is
+# sold USDC and the consumer swaps it to DOT. Same bounds as DOT deliberately: the fiat a buyer
+# may spend is a policy about the buyer, not about which token settles.
+limits:
+  - code: DOT_ASSETHUB
+    min: "10.00"
+    max: "2000.00"
+    currency: USD
+  - code: USDC_ASSETHUB
+    min: "10.00"
+    max: "2000.00"
+    currency: USD
+
+allowed_products:
+  - another-product.example
+
+# Two allowances: a proven person gets their own bucket (`per_person_max`); everyone with
+# nobody proven behind them shares one per address (`per_address_max`). See README.
+rate_limit:
+  per_person_max: 120
+  per_address_max: 30
+  window_seconds: 60
+
+session_creation_enabled: true
+
+# The durable funding-request store, on CloudSQL Postgres.
+#
+# There is no volume any more, and no `replicaCount` argument that rests on one. What still pins
+# the deployment to a single replica is the in-process rate limiter: it is keyed on the caller's
+# personhood alias and lives in the pod, so two replicas would serve two independent allowances
+# and double every caller's spend ceiling. That is a change to make deliberately, not as a
+# side effect of moving the database.
+store:
+  # TODO(operator): the CloudSQL instance. Two shapes, and they are not interchangeable. Pick one;
+  # the template refuses the halfway states:
+  #
+  #   Auth Proxy sidecar: `host: 127.0.0.1`, `ssl: false`, `authProxy.enabled: true` with an
+  #   instance. The proxy terminates TLS itself over a hop that never leaves the pod.
+  #
+  #   Direct private IP: `host: <ip>`, `ssl: true`, `authProxy.enabled: false`. Needs the CA noted
+  #   below, which this config has nowhere to put yet.
+  #
+  # The default is neither: a host that is nobody, so a deployment that forgot to choose fails at
+  # boot rather than quietly reaching the wrong place.
+  host: cloudsql.invalid
+  port: 5432
+  database: onramp
+  user: onramp
+  # Mounted from a Secret, like the Meld key and the JWT key. A third credential to manage (see
+  # the threat model), unless the cluster operator issues IAM database authentication instead.
+  passwordPath: /run/secrets/store-password
+  # TODO(operator): the Secret that holds the CloudSQL user's password.
+  passwordSecret: onramp-store-password
+  passwordSecretKey: store-password
+  # Refused outside development by the config schema unless `host` is loopback, which is the
+  # Auth Proxy sidecar, terminating TLS to the instance itself over a hop that stays inside the pod.
+  #
+  # TODO(operator): a direct private IP instead of the proxy needs `true` here and a CA. Cloud
+  # SQL server certificates are signed by a per-instance CA rather than a public root, so
+  # `rejectUnauthorized` alone cannot verify one and `StoreConfig` has nowhere to put it yet. The
+  # proxy is the shape this chart is configured for.
+  ssl: true
+  # Per replica. This process serves HTTP and runs the worker against one pool, so a pool the
+  # worker can saturate is a pool that starves request handlers.
+  pool_max: 10
+  # Optional: a non-default Postgres schema, when the instance is shared.
+  schema: ""
+  # The Cloud SQL Auth Proxy sidecar. Required whenever `host` is loopback; the template refuses
+  # to render the two out of step, because a loopback host with nothing listening on it is a pod
+  # that cannot reach its database and only says so at boot.
+  authProxy:
+    enabled: false
+    # TODO(operator): the instance you provision, as PROJECT:REGION:INSTANCE. Left empty rather
+    # than guessed: the proxy refuses to start without it, which is a loud boot failure and the
+    # same posture as an empty `collections` list.
+    instance: ""
+    image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+    # The proxy's own health endpoint, used by its startup and liveness probes. Not exposed by the
+    # Service: it is for the kubelet, not for callers.
+    healthPort: 9090
+
+# The background worker that advances in-flight funding requests.
+worker:
+  interval_ms: 15000
+  enabled: true
+  # A floor under how long an unpaid settlement surface stays in flight, not a cap on it.
+  # The worker deadline is `max(rail expiry, created_at + session_max_age_ms)`
+  # (`deadlineFor` in src/funding/worker.ts): a rail expiry longer than this window extends
+  # the deadline, a shorter one is ignored, and a rail that gave no expiry at all gets this
+  # window. Raising it keeps records in flight longer; lowering it never expires anything the
+  # rail still considers live.
+  #
+  # Read the other way round ("the rail's own expiry wins"), this looks like a cap, which is
+  # exactly the misreading that marked paid purchases `expired`.
+  #
+  # 72h, because 24h was exactly the boundary. Bank-transfer rails settle in up to 24 hours, so
+  # a 24-hour window concluded any transfer landing a minute late, and concluded it `expired`,
+  # which asserts the buyer did not pay. A Friday initiation settling Monday busts it by two days.
+  # Meld's `expiresAt` does not help: it says when the capture page closes, not when settlement
+  # completes.
+  session_max_age_ms: 259200000
+  # How long a locally refused row is kept before the worker deletes it. A retention policy, so it
+  # is a value rather than a constant, decided by whoever answers for the data, not by this chart.
+  # Only refusals: every other terminal state records something that reached a payment rail.
+  refusal_retention_days: 90
+
+# Kubernetes injection; the deploy does not bake a config file.
+# One pod, and this is a constraint rather than a starting point, but no longer a storage one.
+# The store is CloudSQL and the worker leases the rows it advances, so two pods are safe against
+# the database. What still pins this to 1 is the rate limiter: it is in-process and keyed on the
+# caller's personhood alias, so each replica serves an independent allowance and N replicas
+# multiply every caller's ceiling by N. Horizontal scaling needs the limiter moved out of the
+# process first.
+replicaCount: 1
+
+# One stable name for every object, the Vault path and the hostname.
+fullnameOverride: "onramp-adapter-service"
+
+# Applied to the pod template. Some clusters enforce a label policy that rejects pods without an
+# owning-team label at admission, so one is set here. Change it to whatever your cluster expects.
+extraLabels:
+  team: "onramp"
+
+# A dedicated identity that mounts no Kubernetes API token. The service calls no cluster API.
+serviceAccount:
+  create: true
+  # Point at an account somebody else manages by setting this with `create: false`.
+  name: ""
+  annotations: {}
+  # TODO(operator): when `store.authProxy.enabled` is true, this must carry the Workload Identity
+  # binding the proxy authenticates with:
+  #
+  #   annotations:
+  #     iam.gke.io/gcp-service-account: onramp-sql@<project>.iam.gserviceaccount.com
+  #
+  # Without it the pod starts and the proxy cannot authenticate, which surfaces as a database
+  # error rather than an IAM one.
+
+# Where secret files are mounted (config.json references these paths).
+secretMountPath: /run/secrets
+
+# The two runtime secrets, mounted as files so they never appear in `env` or the image.
+#
+# Declared here with empty `existingSecret` rather than omitted: the templates reference these
+# paths, and leaving the key absent made `helm template` with default values fail on a nil
+# pointer, so the chart could not be rendered, linted or dry-run without an environment overlay.
+# An empty value renders no mount, which is the right default for a chart nobody has given
+# secrets to yet; `startup` then refuses to boot rather than running without a credential.
+secrets:
+  meldApiKey:
+    existingSecret: ""
+    key: meld-api-key
+  jwtKey:
+    existingSecret: ""
+    key: jwt-key
+
+# `ephemeral-storage` is still bounded, and its justification has changed twice. It used to be the
+# ceiling on the unbounded refusal write path, back when those rows lived on an `emptyDir`. They
+# are in CloudSQL now, and since 2026-08-29 the worker prunes them, so that argument is retired
+# entirely. What this limit still does is stop a runaway log or a pathological `/tmp` write taking
+# the node: worth having, and a much smaller claim than the one it replaced.
+#
+# TODO(operator): 2Gi was sized against the funding store's 1Gi volume plus `/tmp`. Nothing writes
+# 2Gi here any more; it is deliberately left rather than guessed at, because shrinking a limit is
+# an eviction risk and the cluster operator owns the node's budget.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+    ephemeral-storage: 256Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+    ephemeral-storage: 2Gi
+
+# The scratch-space ceiling for `/tmp`, which exists only because the root filesystem is
+# read-only. There used to be a second `emptyDir` holding the funding store; it went with SQLite,
+# and so did the 1Gi term this comment used to add up.
+emptyDirSizeLimit:
+  # /tmp only exists because the root filesystem is read-only; nothing large is written there.
+  tmp: 64Mi
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# The SPA calls this service from a browser, so it needs a hostname and a certificate. Off by
+# default because the host differs per environment; the overlays set it.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  #  - host: onramp-adapter-service.example.com
+  #    path: /
+  #    pathType: Prefix
+  tls: []
+
+# A network boundary for a pod that holds a payment provider's API key.
+#
+# Nothing rendered a NetworkPolicy before this, so the ClusterIP and both public handshake routes
+# were reachable from every workload in the cluster. A compromised sibling pod could call
+# `challenge`/`redeem` directly on the ClusterIP, bypassing the ingress, and each attacker pod gets
+# its own per-address rate-limit bucket (the 8-socket cap stays global and bounds the chain read).
+#
+# Off by default for two reasons. The exact peer that may reach the port is the same value being
+# decided as `server.trusted_proxy_cidrs`; nothing here can fill it. And a NetworkPolicy that is
+# too tight for the actual egress (a People-chain RPC move, a Meld base URL change, a DNS range
+# that differs from the one below) has its failure mode months later, when a pod silently cannot
+# reach something that was never exercised at deploy time. Enabling it is an operator decision,
+# made in an overlay together with filling the CIDR.
+networkPolicy:
+  # Renders nothing when false. The default cluster posture (no policy = allow all) then applies.
+  enabled: false
+  # The namespace(s) the ingress controller runs in: the peers that reach the Service's http port
+  # with real browser traffic. Usually `ingress-nginx` / `ingress`, or `gke-system` for GLB.
+  # Required when `enabled` is true: an empty list would render an ingress rule that denies all
+  # ingress, including the controller itself.
+  ingressControllerNamespaces: []
+  # Egress destinations, each enumerated because fail-closed egress kills everything not named,
+  # and a `cidr` that is wrong cuts a dependency the pod turns out to need. The pod's own loopback
+  # (the Cloud SQL Auth Proxy sidecar) is always allowed. DNS is UDP and TCP 53 to `kube-system`.
+  dns:
+    namespaces: [kube-system]
+  peers:
+    # People-chain RPC (personhood proofs) and Meld (funding). Named as namespace selectors plus
+    # CIDRs because the pod must reach both on GKE's VPC-native per-pod-CIDR shape; blocking on
+    # one shape alone is what would break.
+    peopleChain:
+      namespaces: []
+      cidrs: []
+      rpcPort: 443   # overridden when the RPC is served on a non-443 port (e.g. 9944 for a default relay)
+    # What the Cloud SQL Auth Proxy sidecar must reach. Required when `store.authProxy.enabled`.
+    #
+    # TODO(operator): the Cloud SQL instance CIDR, plus the googleapis range
+    # if this project uses Private Google Access.
+    #
+    # The proxy runs in this pod, so this policy governs its egress: the instance on 3307 (5432 is
+    # only its local listen port) and the Cloud SQL Admin API on 443, for instance metadata and the
+    # ephemeral client certificate. The render fails rather than shipping a policy that cuts the pod
+    # off from its own database.
+    cloudsql:
+      # TODO(operator): the Cloud SQL instance CIDR. Required whenever the
+      # policy is enabled, in both store shapes: with the Auth Proxy the sidecar reaches the
+      # instance on 3307; without it the app reaches the instance directly on `store.port`.
+      instanceCidrs: []
+      # TODO(operator): the range this project reaches the Cloud SQL Admin API through; the proxy
+      # calls it for instance metadata and its ephemeral client certificate. Private Google Access
+      # uses 199.36.153.8/30. Required only when `store.authProxy.enabled`.
+      #
+      # Separate from `instanceCidrs` on purpose: one list carrying both ports granted 3307 to the
+      # API range and 443 to the instance, and this policy exists to name exactly what is needed.
+      apiCidrs: []
+      instancePort: 3307
+      apiPort: 443
+    meld:
+      namespaces: []
+      cidrs: []
+      httpPort: 443
+
+# Include a readiness/liveness via /health (curl healthcheck in the image).
+# If you need more (HPA, Ingress) add below; kept minimal to match a key-holding
+# service that only runs server-to-server.
+healthcheck:
+  path: /health

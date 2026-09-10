@@ -1,0 +1,54 @@
+# A complete, deployable-shaped overlay used only by `npm run check:chart`.
+#
+# A template overlay deliberately carries operator placeholders: the People collection id and RPC
+# are the operator's to supply, and an all-zeroes stand-in would have passed validation and
+# verified every proof against a commitment that does not exist. So a template cannot be parsed
+# against the schema until those holes are filled.
+#
+# This file fills every one of those holes with a valid but obviously fake value, so the chart's
+# ability to render a config this service accepts is still proven on every commit. Nothing here is
+# a credential and nothing here is deployed.
+environment: sandbox
+
+image:
+  repository: ghcr.io/paritytech/onramp-adapter-service-community
+  tag: "ci"
+
+server:
+  # Fake but valid, like every other value here: the point is that the chart can render a config
+  # this service accepts, and trust is decided by peer rather than by a hop count.
+  trusted_proxy_cidrs:
+    - "10.0.0.0/8"
+
+meld:
+  base_url: https://api-sb.meld.io
+
+auth:
+  mode: personhood
+  personhood:
+    people_rpc_url: "wss://people-paseo.example.invalid"
+    collections:
+      - identifier: "0x1111111111111111111111111111111111111111111111111111111111111111"
+        ring_exponent: 9
+    challenge_ttl_ms: 60000
+    token_ttl_s: 300
+
+cors:
+  allowed_origins:
+    - https://your-app.example
+
+ingress:
+  enabled: true
+  className: traefik-external
+  hosts:
+    - host: onramp-adapter-service.staging.example.invalid
+      path: /
+      pathType: Prefix
+
+secrets:
+  meldApiKey:
+    existingSecret: onramp-meld-api-key
+    key: meld-api-key
+  jwtKey:
+    existingSecret: onramp-jwt-key
+    key: jwt-key

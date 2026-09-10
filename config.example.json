@@ -1,0 +1,106 @@
+{
+  "environment": "sandbox",
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0",
+    "log_level": "info",
+    "trusted_proxy_cidrs": [
+      "127.0.0.1/32"
+    ],
+    "request_timeout_ms": 20000
+  },
+  "meld": {
+    "base_url": "https://api-sb.meld.io",
+    "api_key": {
+      "mode": "file",
+      "path": "/run/secrets/meld-api-key"
+    },
+    "api_version": "2025-01-01",
+    "timeout_ms": 8000,
+    "boot_probe": {
+      "destination_code": "DOT_ASSETHUB",
+      "source_amount": "20",
+      "source_currency": "USD",
+      "country_code": "US",
+      "payment_method_type": "CREDIT_DEBIT_CARD"
+    }
+  },
+  "auth": {
+    "mode": "personhood",
+    "personhood": {
+      "jwt_key": {
+        "mode": "file",
+        "path": "/run/secrets/jwt-key"
+      },
+      "people_rpc_url": "wss://paseo-people-next-system-rpc.polkadot.io",
+      "collections": [
+        {
+          "identifier": "0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652d6c697465",
+          "ring_exponent": 9
+        },
+        {
+          "identifier": "0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652020202020",
+          "ring_exponent": 9
+        }
+      ],
+      "challenge_ttl_ms": 60000,
+      "token_ttl_s": 300
+    }
+  },
+  "limits": [
+    {
+      "code": "DOT_ASSETHUB",
+      "min": "10.00",
+      "max": "2000.00",
+      "currency": "USD"
+    },
+    {
+      "code": "USDC_ASSETHUB",
+      "min": "10.00",
+      "max": "2000.00",
+      "currency": "USD"
+    },
+    {
+      "code": "USDT_ASSETHUB",
+      "min": "10.00",
+      "max": "2000.00",
+      "currency": "USD"
+    }
+  ],
+  "allowed_products": [
+    "your-app.dev",
+    "another-app.example"
+  ],
+  "session_creation_enabled": true,
+  "cors": {
+    "allowed_origins": [
+      "https://your-app.example",
+      "https://another-app.example"
+    ]
+  },
+  "rate_limit": {
+    "per_person_max": 120,
+    "per_address_max": 30,
+    "window_seconds": 60
+  },
+  "store": {
+    "host": "127.0.0.1",
+    "port": 5432,
+    "database": "onramp",
+    "user": "onramp",
+    "password": {
+      "mode": "file",
+      "path": "/run/secrets/store-password"
+    },
+    "ssl": true,
+    "pool_max": 10,
+    "statement_timeout_ms": 10000,
+    "connection_timeout_ms": 5000
+  },
+  "worker": {
+    "interval_ms": 15000,
+    "enabled": true,
+    "session_max_age_ms": 259200000,
+    "refusal_retention_days": 90
+  }
+}

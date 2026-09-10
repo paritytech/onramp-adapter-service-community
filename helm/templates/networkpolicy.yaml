@@ -1,0 +1,186 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- if not .Values.networkPolicy.ingressControllerNamespaces }}
+{{- fail "networkPolicy.enabled is true but networkPolicy.ingressControllerNamespaces is empty: with no named ingress peer the ingress rule would be empty and the policy would deny *all* ingress, including the ingress controller, so not even browser traffic would arrive. Name the namespace(s) the ingress controller runs in, or keep networkPolicy.enabled false." }}
+{{- end }}
+{{- if not (or .Values.networkPolicy.peers.peopleChain.namespaces .Values.networkPolicy.peers.peopleChain.cidrs) }}
+{{- fail "networkPolicy.enabled is true but no egress peer is named for the People chain: every personhood handshake would fail, which is the whole auth surface in personhood mode. The previous guard was a single or across all four lists, so naming one destination for one upstream satisfied it while its message promised per upstream. Name a namespace selector and/or IP block under networkPolicy.peers.peopleChain." }}
+{{- end }}
+{{- if not (or .Values.networkPolicy.peers.meld.namespaces .Values.networkPolicy.peers.meld.cidrs) }}
+{{- fail "networkPolicy.enabled is true but no egress peer is named for Meld: every quote and every session creation would fail. Name a namespace selector and/or IP block under networkPolicy.peers.meld." }}
+{{- end }}
+{{- if not .Values.networkPolicy.peers.cloudsql.instanceCidrs }}
+{{- fail "networkPolicy.enabled is true but networkPolicy.peers.cloudsql.instanceCidrs is empty, so nothing permits egress to the database and the pod crash-loops on its startup probe, a failure three layers from its cause. With store.authProxy.enabled the Auth Proxy is a sidecar in *this* pod, so this policy governs its egress and it needs the instance on 3307; without the proxy the app reaches the instance directly on store.port. Either way, name the instance CIDR." }}
+{{- end }}
+{{- if and .Values.store.authProxy.enabled (not .Values.networkPolicy.peers.cloudsql.apiCidrs) }}
+{{- fail "networkPolicy.enabled is true and store.authProxy.enabled is true, but networkPolicy.peers.cloudsql.apiCidrs is empty: the Auth Proxy also calls the Cloud SQL Admin API for instance metadata and its ephemeral client certificate, and cannot start without it. Name the googleapis range your project reaches it through (Private Google Access uses 199.36.153.8/30)." }}
+{{- end }}
+{{- if not .Values.networkPolicy.dns.namespaces }}
+{{- fail "networkPolicy.enabled is true but networkPolicy.dns.namespaces is empty: the pod needs DNS (UDP and TCP 53) to resolve both upstreams, and a pod without it fails closed. Keep the kube-system default or name the namespace that runs the cluster DNS." }}
+{{- end }}
+---
+# Close the ClusterIP to sibling workloads.
+#
+# This pod holds the Meld API key. Before this template nothing rendered a NetworkPolicy, so any
+# workload in the cluster could call the ClusterIP and reach the two public handshake routes
+# (`/api/v1/auth/challenge`, `/api/v1/auth/redeem`) directly, bypassing the ingress, and each
+# attacker pod gets its own per-address rate-limit bucket, multiplying the pre-auth budget against
+# the People-chain reader (the 8-socket cap stays global and still bounds the chain read).
+#
+# What this policy allows is the minimal surface the pod actually needs:
+#   - ingress only from the ingress controller namespace(s) named in values, the peers that
+#     forward browser traffic. Everything else is refused, so a compromised sibling cannot reach
+#     the port at all;
+#   - egress to the pod's own loopback (the Cloud SQL Auth Proxy sidecar lives in this pod), to
+#     DNS (`kube-system`, UDP and TCP 53), and to the two upstreams (People-chain RPC and Meld),
+#     each named by namespace selector and/or IP block because both must work on GKE's VPC-native
+#     per-pod-CIDR shape; blocking on one shape alone is what would break.
+#
+# Everything not named is refused. That is the point. `0.0.0.0/0` must not be added here; if a
+# new egress target is required, the values gain it deliberately, alongside a confirmation
+# of its CIDR. Empty egress is fail-closed at render time via the guards above, so a NetworkPolicy
+# can never ship that denies even its own DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "onramp.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "onramp.fullname" . }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "onramp.fullname" . }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values: {{ .Values.networkPolicy.ingressControllerNamespaces | toJson }}
+      # The service port only. Without this the ingress namespace also reaches the Auth Proxy's
+      # health surface, which binds 0.0.0.0 and which values.yaml calls "for the kubelet, not for
+      # callers".
+      ports:
+        - protocol: TCP
+          port: {{ .Values.server.port | int }}
+  egress:
+    # DNS. Every pod in kube-system is the kubelet's resolver surface; only 53 is reachable.
+    - to:
+        - namespaceSelector:
+            # Every named namespace, not `first`. The ingress field above already iterates; this one
+            # silently dropped all but the first, so a cluster running NodeLocalDNS or CoreDNS
+            # outside `kube-system` got a pod that could not resolve, and the second namespace the
+            # operator carefully added did nothing. Same class as the `index .cidrs 0` bug fixed for
+            # the peer CIDRs, left in place here.
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values: {{ .Values.networkPolicy.dns.namespaces | toJson }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- if .Values.store.authProxy.enabled }}
+    # The Cloud SQL Auth Proxy's own egress. Not loopback.
+    #
+    # A rule selecting this pod's own label used to stand here, commented "local egress to the Auth
+    # Proxy sidecar, which listens on the pod's own loopback". It did nothing of the kind: the proxy
+    # is a sidecar in this pod, containers in one pod share a network namespace, and
+    # `127.0.0.1:5432` never traverses the CNI, so no NetworkPolicy governs it. What that rule
+    # actually granted was egress to other pods carrying the same label.
+    #
+    # Meanwhile the egress the proxy really makes was permitted nowhere, so enabling this policy
+    # cut the pod off from its database: the proxy needs the instance itself on 3307 (5432 is only
+    # its local listen port) and the Cloud SQL Admin API for instance metadata and the ephemeral
+    # client certificate. Both destinations depend on the project's networking, so both are
+    # operator-supplied, and the guard above refuses to render without them.
+    # Two destinations, two rules. A single list carrying both ports granted 3307 to the Admin API
+    # range and 443 to the instance; neither is needed, and this template's own header says
+    # everything not named is refused. One fewer values field is not a reason to widen egress.
+    - to:
+        {{- range .Values.networkPolicy.peers.cloudsql.instanceCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.peers.cloudsql.instancePort | default 3307 | int }}
+    - to:
+        {{- range .Values.networkPolicy.peers.cloudsql.apiCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.peers.cloudsql.apiPort | default 443 | int }}
+    # GKE-specific. The GKE metadata server, for the Workload Identity token the proxy
+    # authenticates with. A fixed link-local address on 988, not a general Kubernetes fact. If this
+    # template is copied into `generic-helm` for another platform, this rule is the first thing to
+    # re-derive. Still egress, and a policy that omits it leaves the proxy unable to get a token.
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 988
+{{- else }}
+    # The direct-private-IP shape, which the chart supports and `values.yaml`'s `store` block
+    # describes as the alternative to the proxy. Without this rule that shape rendered a policy
+    # with no route to the database on any port and nothing refused it: the same failure as the
+    # proxy branch above, for the other half of a decision the operator has not made yet.
+    # `store.port` rather than 3307: with no proxy the app speaks to the instance directly.
+    - to:
+        {{- range .Values.networkPolicy.peers.cloudsql.instanceCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.store.port | int }}
+{{- end }}
+    {{- with .Values.networkPolicy.peers.peopleChain }}
+    {{- if .namespaces }}
+    - to:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values: {{ .namespaces | toJson }}
+      ports:
+        - protocol: TCP
+          port: {{ default 443 .rpcPort | int }}
+    {{- end }}
+    {{- range $cidr := .cidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ $cidr | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ default 443 $.Values.networkPolicy.peers.peopleChain.rpcPort | int }}
+    {{- end }}
+    {{- end }}
+    {{- with .Values.networkPolicy.peers.meld }}
+    {{- if .namespaces }}
+    - to:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values: {{ .namespaces | toJson }}
+      ports:
+        - protocol: TCP
+          port: {{ default 443 .httpPort | int }}
+    {{- end }}
+    {{- range $cidr := .cidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ $cidr | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ default 443 $.Values.networkPolicy.peers.meld.httpPort | int }}
+    {{- end }}
+    {{- end }}
+{{- end }}

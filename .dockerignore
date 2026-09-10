@@ -1,0 +1,24 @@
+# Nothing a build needs that isn't package.json/lock + src. Keeping the context
+# small also keeps any stray local secret file out of the build context.
+#
+# Defence in depth rather than the only control: the Dockerfile COPYs the package
+# files, the tsconfigs and src/ by name, so nothing else reaches an image even if
+# it reaches the context. The patterns below are here because "excludes
+# config.json" is not the promise this header makes. A local .env or a test
+# keypair went to the daemon regardless, and would land in any image the day a
+# broader COPY is added.
+node_modules/
+dist/
+coverage/
+.git/
+.github/
+docs/
+config.json
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+.eslintrc*

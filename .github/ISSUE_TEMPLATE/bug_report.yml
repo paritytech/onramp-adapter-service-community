@@ -1,0 +1,91 @@
+name: Bug report
+description: The service behaves incorrectly, refuses something it should accept, or crashes.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a report. This project is a prototype and reference implementation, so
+        rough edges are expected, but a clear repro still helps a lot. Please do not include API
+        keys, secrets, JWTs, or private keys in this issue. Redact request and response bodies
+        before pasting them.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability (those go to the Polkadot Security Hub, see SECURITY.md).
+          required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did the service do? Include the exact error code and message from the response body.
+      placeholder: 'POST /session answered 400 with "CURRENCY_UNSUPPORTED" for a corridor Meld serves ...'
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What should have happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Numbered steps someone else can follow. Include the request (method, path, and a redacted
+        body) and the config keys that matter, such as the auth mode and the rail.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the service does this touch?
+      options:
+        - Quote / pricing (POST /quote)
+        - Session creation (POST /session)
+        - Funding request status, cancel, or the background worker
+        - Capability discovery (GET /supported)
+        - Personhood handshake / auth
+        - Rail integration (Meld, Chainflip)
+        - Store / migrations (Postgres)
+        - Config, Helm, or deployment
+        - Build / CI / tooling
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Build / environment
+      description: Where you ran it, as a commit SHA or an image tag.
+      placeholder: "commit abc1234, or ghcr.io/<your-org>/<image>:0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: auth-mode
+    attributes:
+      label: Auth mode
+      description: From your config's `auth.mode`.
+      options:
+        - personhood
+        - insecure_dev
+        - Not sure
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or response bodies
+      description: |
+        Service logs and the response body help most. Redact API keys, bearer tokens, wallet
+        addresses, and anything else identifying before pasting.

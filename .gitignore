@@ -1,0 +1,51 @@
+node_modules/
+dist/
+coverage/
+config.json
+*.log
+
+# `package-lock.json` is committed on purpose. This is an application rather than
+# a library, so a reproducible install matters more than resolving fresh ranges.
+
+# Secrets and local overrides. `.env*` rather than `.env.local`, because the
+# narrower forms do not match a plain `.env`, which is exactly where credentials
+# land. `.env.example` is allow-listed back in.
+.env*
+!.env.example
+*.local
+
+# OS noise
+.DS_Store
+
+# Editor state. Both write into the repo root by default, so without these the
+# first accidental commit is somebody's local workspace.
+.vscode/
+.idea/
+
+# Agent state, per-checkout rather than per-repo. Only session, cache and local
+# settings. `.claude/commands/`, `.claude/skills/`, `.claude/agents/` and
+# `CLAUDE.md` are shared configuration and stay tracked if they ever appear.
+.claude/settings.local.json
+.claude/sessions/
+.claude/cache/
+.cursor/
+.codeium/
+.gemini/
+.aider*
+.codex/
+.cline/
+.roo/
+.windsurf/
+.continue/
+.swarm/
+.ai/
+.llm/
+.mcp.json
+opencode.json
+
+# Build outputs from toolchains this project does not use today. Listed so a
+# contributor who reaches for one does not commit its output by accident.
+target/
+.turbo/
+.output/
+.nuxt/

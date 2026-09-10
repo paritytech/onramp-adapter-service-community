@@ -1,0 +1,15 @@
+apiVersion: v2
+name: onramp-adapter-service
+description: >
+  Holds the Meld API key and returns scoped, single-buyer widget URLs. The key
+  never reaches a client. Stateful despite its size: it owns a funding store on
+  CloudSQL Postgres, and the worker leases the rows it advances so overlapping
+  pods are safe. replicaCount is still pinned to 1, now because the rate limiter
+  is in-process and N replicas would multiply every caller's allowance by N.
+  Secrets are mounted at runtime; no key in the image.
+# Native sidecars (`initContainers` with `restartPolicy: Always`) are 1.29 and later. The Auth
+# Proxy is one, because a plain container races the app's boot and can outlive it on shutdown.
+kubeVersion: ">=1.29.0-0"
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

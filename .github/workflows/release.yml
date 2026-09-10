@@ -1,0 +1,136 @@
+name: Build & Release
+
+# Builds and publishes an image. It does not deploy: continuous delivery is a separate
+# promotion step, and promotion to production is a manual policy rather than anything this repo
+# triggers.
+#
+# It publishes from `main` only. A deployment config that sets `tag: ""` leaves the promotion tool
+# selecting the lexically highest tag matching `^\d{8}-\d{6}-[0-9a-f]{8}$`, so whatever this
+# workflow publishes is what a downstream environment runs, automatically. Building only on `main`
+# is what puts a reviewed merge in front of the first deployment.
+#
+# What it costs: nothing reaches a downstream environment until it is merged to `main`. That is the
+# intended trade, and it is the first thing to check when a fix does not appear.
+#
+# The tag stays `YYYYmmdd-HHMMSS-<sha8>` because that is the shape the promotion filter matches. A `v*`
+# tag would mean tagging a commit before it could be tested.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        # Must match `^\d{8}-\d{6}-[0-9a-f]{8}$` or the promotion tool will not select it: the image publishes and
+        # nothing deploys, with no error anywhere to say why. Leave empty unless you have a reason.
+        description: "Explicit image tag for a one-off rebuild. Must match YYYYmmdd-HHMMSS-<sha8> to be deployable."
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancelling a superseded build is safe here, because this workflow only publishes an image and
+  # never rolls one out. Deploying from a workflow is what makes cancellation dangerous: a rollout
+  # interrupted halfway can leave the old instance already stopped and the new one not yet up.
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # GHCR's push token. A called workflow can only narrow the caller's permissions, never widen
+  # them, so dropping this here would fail the push inside `reusable-build-images.yml` no matter
+  # what that file declares.
+  packages: write
+
+jobs:
+  # Whatever this workflow publishes is what a downstream environment runs, so `main` has to be the
+  # only source of one. `workflow_dispatch` accepts any ref, which would otherwise leave the gate
+  # advisory: dispatch on some other branch, publish a tag, promotion selects it, and the reviewed
+  # merge was skipped. A one-off rebuild is a rebuild of `main`; building an unmerged branch is what
+  # pull-request CI is for, and that verifies without publishing.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::release.yml publishes an image that gets deployed, so it only runs on main."
+          echo "::error::Ref was ${{ github.ref }}. Merge to main, or use pull-request CI to verify without publishing."
+          exit 1
+      - run: echo "ref is main"
+
+  # The CI gate for a release.
+  #
+  # `ci.yml` runs on a push to `main` as well, but as a separate workflow: nothing makes the
+  # publish wait for it, and a `workflow_dispatch` rebuild need not have had a run at all. So the
+  # image could reach the registry beside a CI run that was still going, or one already red. A
+  # publish can only be blocked on a gate this workflow can see.
+  #
+  # Duplicated from `ci.yml` rather than called: a `workflow_call` of the whole CI workflow would
+  # also drag in the history-scanning job, which answers a question about the tree rather than
+  # about this release. These are the three gates that say the artefact about to be published
+  # works.
+  verify:
+    needs: guard
+    name: Verify (release gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The same Postgres `ci.yml` gives its test jobs. Without it this gate failed every run from
+    # the CloudSQL migration until this block landed: `npm run verify` and `npm run test:e2e`
+    # both need a database, and nothing was published in between. The gate that says "the artefact
+    # about to be published works" was the one artefact nobody was watching.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: onramp-test
+          POSTGRES_DB: onramp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ONRAMP_TEST_PG: postgres://postgres:onramp-test@localhost:5432/onramp_test
+    steps:
+      # Same SHA pins as ci.yml: a tag is mutable, so `@v4` is a third party able to change
+      # what runs in the workflow that deploys to production.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.2
+      # `check:chart` schema-validates the rendered manifests offline; without the binary the
+      # gate silently degrades to "does it render".
+      - name: Install kubeconform
+        env:
+          KUBECONFORM_VERSION: 0.8.0
+        run: |
+          set -euo pipefail
+          base="https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}"
+          archive="kubeconform-linux-amd64.tar.gz"
+
+          curl -sSfL -o "$archive" "$base/$archive"
+          curl -sSfL -o CHECKSUMS "$base/CHECKSUMS"
+
+          # The version pin only binds a filename; verifying the published checksum binds the
+          # bytes, so a replaced release asset cannot change the gate silently.
+          grep " ${archive}\$" CHECKSUMS | sha256sum -c -
+
+          sudo tar -xzf "$archive" -C /usr/local/bin kubeconform
+          kubeconform -v
+      - run: npm ci
+      - run: npm run verify
+      - run: npm run test:e2e
+      - run: npm run check:chart
+
+  build-images:
+    name: Build Images
+    # Nothing is published until the release gate is green.
+    needs: [verify]
+    uses: ./.github/workflows/reusable-build-images.yml
+    with:
+      tag: ${{ inputs.tag || '' }}

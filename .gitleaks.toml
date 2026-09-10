@@ -1,0 +1,12 @@
+# gitleaks configuration.
+#
+# Every default rule, and no allowlist: nothing in this repository is exempt from a scan.
+#
+# If an exemption is ever needed, `condition = "AND"` is load-bearing rather than decoration.
+# gitleaks defaults an allowlist to "OR", so any ONE criterion suppresses the finding: a `paths`
+# entry on its own exempts every secret in that file, not the single value meant. Verified against
+# gitleaks 8.30.1, where a real GitHub PAT in an allowlisted path produced 0 findings under the
+# default and 1 under "AND".
+
+[extend]
+useDefault = true

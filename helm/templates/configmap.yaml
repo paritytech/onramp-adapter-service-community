@@ -1,0 +1,84 @@
+{{- /*
+  The service's on-disk config.json, assembled in the exact shape the config
+  schema expects (src/config.ts).
+
+  No `| default` on booleans. Helm's `default` treats `false` as empty and substitutes, so
+  `session_creation_enabled: false` rendered `true`. The emergency stop for a service spending a
+  payment credential could not be switched off. Every key here has a schema default in
+  values.yaml, so the pipe bought nothing and cost that. The two secret sources (meld.api_key and
+  auth.personhood.jwt_key) are emitted as file references
+  {"mode":"file","path":"/run/secrets/<key>"} because the real bytes live in
+  mounted Secret files (mounted below in the Deployment at secretMountPath).
+  A Secret that is missing makes the process fail at boot on the file read,
+  never boot with a default key.
+
+  Every number is wrapped in `int`. Helm parses values through JSON, so an integer arrives as a
+  float64 and `{{ }}` renders it with Go's %v: `session_max_age_ms: 86400000` came out as
+  `8.64e+07`. JSON.parse happens to read that back exactly at this magnitude, so nothing broke,
+  but it is a precision trap waiting on a larger value, and a config file nobody can read at a
+  glance. `int` renders the integer.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "onramp.fullname" . }}-config
+  labels:
+    app.kubernetes.io/name: {{ include "onramp.fullname" . }}
+data:
+  config.json: |
+    {
+      "environment": {{ .Values.environment | default "production" | quote }},
+      "server": {
+        "port": {{ int .Values.server.port }},
+        "host": {{ .Values.server.host | default "0.0.0.0" | quote }},
+        "log_level": {{ .Values.server.log_level | default "info" | quote }},
+        "request_timeout_ms": {{ int (.Values.server.request_timeout_ms | default 20000) }},
+        "trusted_proxy_cidrs": {{ toJson .Values.server.trusted_proxy_cidrs }}
+      },
+      "meld": {
+        "base_url": {{ .Values.meld.base_url | quote }},
+        "api_key": { "mode": "file", "path": {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.meldApiKey.key | quote }} },
+        "api_version": {{ .Values.meld.api_version | quote }},
+        "timeout_ms": {{ int (.Values.meld.timeout_ms | default 8000) }},
+        "boot_probe": {{ toJson .Values.meld.boot_probe }}
+      },
+      "auth": {
+        "mode": {{ .Values.auth.mode | quote }},
+        "personhood": {
+          "jwt_key": { "mode": "file", "path": {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.jwtKey.key | quote }} },
+          "people_rpc_url": {{ .Values.auth.personhood.people_rpc_url | quote }},
+          {{- /*
+            `toJson` rather than a hand-built array: Helm parses YAML numbers to float64 and
+            text/template renders those with %v, so a hand-written `ring_exponent` comes out as
+            `9` here but a larger value would print in exponent form. encoding/json writes the
+            integer. Same trap the config.json ConfigMap avoids wholesale.
+          */}}
+          "collections": {{ .Values.auth.personhood.collections | toJson }},
+          "challenge_ttl_ms": {{ int (.Values.auth.personhood.challenge_ttl_ms | default 60000) }},
+          "token_ttl_s": {{ int (.Values.auth.personhood.token_ttl_s | default 300) }}
+        }
+      },
+      "limits": {{ toJson .Values.limits }},
+      "allowed_products": {{ toJson .Values.allowed_products }},
+      "cors": {{ toJson (dict "allowed_origins" ((index (.Values.cors | default (dict)) "allowed_origins") | default list)) }},
+      "rate_limit": {{ toJson .Values.rate_limit }},
+      "session_creation_enabled": {{ .Values.session_creation_enabled }},
+      "store": {
+        "host": {{ .Values.store.host | quote }},
+        "port": {{ int .Values.store.port }},
+        "database": {{ .Values.store.database | quote }},
+        "user": {{ .Values.store.user | quote }},
+        "password": { "mode": "file", "path": {{ .Values.store.passwordPath | quote }} },
+        "ssl": {{ .Values.store.ssl }},
+        "pool_max": {{ int .Values.store.pool_max }}
+        {{- if .Values.store.schema }},
+        "schema": {{ .Values.store.schema | quote }}
+        {{- end }}
+      },
+      "worker": {
+        "interval_ms": {{ int .Values.worker.interval_ms }},
+        "enabled": {{ .Values.worker.enabled }},
+        "session_max_age_ms": {{ int .Values.worker.session_max_age_ms }},
+        "refusal_retention_days": {{ int .Values.worker.refusal_retention_days }}
+      }
+    }

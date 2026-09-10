@@ -1,0 +1,134 @@
+# Build and publish the onramp image.
+#
+# The registry is GHCR, which is where a public repository's packages already live;
+# so it stays where it is and no Workload Identity Federation is
+# needed. `vars.IMAGE_REGISTRY` remains as a one-variable override if that ever changes.
+#
+# The tag is `YYYYmmdd-HHMMSS-<sha8>` on a branch push, which is the shape a promotion filter
+# matches, or an explicit tag from `workflow_dispatch`. Baking is `docker buildx bake`.
+name: Build Images
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Build this exact tag. Empty derives one from the ref."
+        required: false
+        type: string
+    outputs:
+      tag:
+        value: ${{ jobs.build-image.outputs.tag }}
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      # `outputs.tag`, matching what the step writes. It read `outputs.version`, which the step
+      # never set, so the job output was always empty: the deploy that followed used an
+      # empty tag and the chart fell back to its appVersion, an image the build never pushed.
+      tag: ${{ steps.version.outputs.tag }}
+    env:
+      IMAGE_NAME: ${{ github.event.repository.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: version
+        shell: bash
+        # Both values reach the script through `env`, never through `${{ }}` interpolation.
+        # GitHub substitutes an expression into the script text before bash parses it, so a tag
+        # named `$(id)` (which `git check-ref-format` permits) becomes a command substitution
+        # that runs here, in a job holding `packages: write` and `id-token: write`. Read from the
+        # environment and bash treats the same characters as data.
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # An explicitly requested tag wins. `release.yml` accepts one on `workflow_dispatch`
+          # and used to drop it here, so dispatching "build v1.2.3" built a timestamped commit
+          # tag instead and the deploy that followed pointed at the wrong image.
+          if [ -n "$REQUESTED_TAG" ]; then
+            VERSION="$REQUESTED_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            VERSION="$REF_NAME"
+          else
+            VERSION="$(date -u '+%Y%m%d-%H%M%S')-${GITHUB_SHA::8}"
+          fi
+          # A defence in depth, and a correctness check: the tag becomes a Docker tag and an
+          # deployment parameter, and neither can hold arbitrary text.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
+            echo "Refusing tag $(printf '%q' "$VERSION"): not a valid image tag." >&2
+            exit 1
+          fi
+
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ vars.IMAGE_REGISTRY_HOST || 'ghcr.io' }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # buildx reads the GitHub Actions cache through `ACTIONS_RUNTIME_TOKEN` and the cache
+      # service URL, and the runner exposes those to actions only, not to `run:` steps. So a
+      # bare `--cache-to=type=gha` in the bake step below silently does nothing. This exports
+      # them for the rest of the job. They are scoped to this workflow run's cache, and no step
+      # after this one echoes its environment.
+      #
+      # `ACTIONS_CACHE_URL` is deliberately not exported. That is the retired v1 cache service.
+      # Exporting it made buildkit prefer v1, which now answers an HTML error page, and every
+      # release from 2026-08-29 onward died on `importing cache manifest from gha:...` with
+      # `failed to parse error response 400: <h2>Our services aren't available right now</h2>`.
+      # No image was published for three days, which is why nothing could be deployed even
+      # provisionally. `ACTIONS_RESULTS_URL` is the v2 endpoint and is what buildkit should use.
+      - name: Expose the Actions cache to buildx
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # Use the version (tag or timestamped sha) as the image tag; app.docker-bake
+      # reads a --set app.tags from VERSION directly to avoid the empty-"tag" trap.
+      - name: Bake and push
+        run: |
+          set -euo pipefail
+          # `VCS_REF` and `BUILD_DATE` are declared by docker-bake.hcl and were never supplied,
+          # so every published image was labelled `io.parity.image.revision=main` with an empty
+          # `created`: the two labels that exist to say which commit an image came from.
+          #
+          # `attest`: an SBOM and a max-mode provenance attestation are pushed alongside the
+          # image. Both files and both comments claimed supply-chain metadata this build never
+          # produced: without them the only answer to "what is in the image that holds the Meld
+          # key, and what built it" is to pull the image and look. `mode=max` records the build
+          # arguments and the source of every step, which is what makes the provenance worth
+          # keeping.
+          #
+          # `cache-from/cache-to`: the layer cache both this file and docker-bake.hcl described
+          # and neither implemented, so every release rebuilt `npm ci` twice from scratch.
+          # `mode=max` caches the build stage's layers too, not only the ones in the final image.
+          #
+          # `ignore-error=true` on the export, because a layer cache is an optimisation and a
+          # release is not. A cache backend that is down, retired or rate-limited must slow the
+          # build, never stop it. Stopping it is exactly what happened for three days.
+          docker buildx bake app \
+            --file docker-bake.hcl \
+            --set "app.tags=$REPO:$VERSION" \
+            --set "app.args.VCS_REF=$GITHUB_SHA" \
+            --set "app.args.BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --set "*.attest=type=sbom" \
+            --set "*.attest=type=provenance,mode=max" \
+            --set "*.cache-from=type=gha" \
+            --set "*.cache-to=type=gha,mode=max,ignore-error=true" \
+            --push
+        env:
+          VERSION: ${{ env.VERSION }}
+          REPO: ${{ vars.IMAGE_REGISTRY || format('ghcr.io/{0}', github.repository) }}

@@ -1,0 +1,51 @@
+{{- if .Values.ingress.enabled }}
+{{- if not .Values.ingress.hosts }}
+{{- fail "ingress.enabled is true but ingress.hosts is empty: the rendered Ingress would route nothing." }}
+{{- end }}
+---
+# The browser reaches this service directly.
+#
+# It is not a purely server-to-server component: a browser application calls the personhood handshake
+# (`/api/v1/auth/challenge`, `/api/v1/auth/redeem`) and the funding reads from a browser, which is
+# why CORS is configured with real origins. So it needs a hostname and a certificate, not just a
+# ClusterIP.
+#
+# `server.trusted_proxy_cidrs` in the rendered config must name the proxies in front of this
+# ingress. Empty and every caller behind it shares one rate-limit bucket; naming a peer that is not
+# actually in front lets that peer spoof `X-Forwarded-For` and evade the limit. Empty is the
+# default because it is the direction that cannot be exploited (see the README).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "onramp.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "onramp.fullname" . }}
+    {{- with .Values.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tls }}
+  tls:
+    {{- toYaml .Values.ingress.tls | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          - path: {{ .path | default "/" }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ include "onramp.fullname" $ }}
+                port:
+                  name: http
+    {{- end }}
+{{- end }}

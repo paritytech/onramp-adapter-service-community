@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    # `main` is the only long-lived branch here, and the one `release.yml` publishes an image from.
+    # A pull request is gated by the ruleset, so this covers the merge commit itself.
+    branches: [main]
+  pull_request:
+
+# A re-push supersedes the run it interrupts, and these jobs are the slow ones (e2e against a built
+# artefact, a chart render), so leaving both in flight buys nothing and doubles the queue.
+#
+# Cancelling is safe for pushes too, and not because anything downstream waits on this run: nothing
+# does. `release.yml` deliberately re-runs `verify` itself rather than trust a separate workflow it
+# cannot see. So a push run is a signal for whoever is reading the branch, and the newest push is
+# the one worth reading. The group keys on `github.ref`, which already separates a pull request
+# (`refs/pull/N/merge`) from a push (`refs/heads/main`), so no push is ever cancelled by a PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege for every job below. Without this block the jobs inherit the repository
+# default, which on repositories not switched to the newer default is write access to all
+# scopes, handed to `npm ci` (which runs dependency install scripts) and to the test runs.
+# Nothing here needs to write anything.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # A real Postgres, because the store's own suite asserts things only a real one does:
+    # `ON CONFLICT` arbitrating an idempotency key between two concurrent reservations,
+    # `FOR UPDATE SKIP LOCKED` leasing a row to one worker, `pg_advisory_lock` serialising two
+    # booting replicas, and a failover dropping idle connections. An emulator would answer those
+    # from a lookup table and prove nothing. The rest of the suite keeps its in-memory fakes.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: onramp-test
+          POSTGRES_DB: onramp_test
+        ports:
+          - 5432:5432
+        # Without the health check the job races the container: `npm ci` usually outlasts Postgres
+        # starting, but "usually" is a flaky gate on the money paths.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ONRAMP_TEST_PG: postgres://postgres:onramp-test@localhost:5432/onramp_test
+    steps:
+      # Actions are pinned by commit SHA, not by tag. A tag is mutable, so `@v4` means "whatever
+      # that tag points at today", which is a third party able to change what runs in CI after
+      # review. The trailing comment records the human-readable version.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run verify
+
+  # The end-to-end suite spawns the built artifact as a real process and talks to it over a
+  # socket. Separate from `verify` because it needs the build first and answers a different
+  # question: not "do the units behave" but "does the thing we ship actually start, serve, and
+  # stop", including `src/main.ts`, which no unit test can reach.
+  e2e:
+    runs-on: ubuntu-latest
+    # A real Postgres, because the store's own suite asserts things only a real one does:
+    # `ON CONFLICT` arbitrating an idempotency key between two concurrent reservations,
+    # `FOR UPDATE SKIP LOCKED` leasing a row to one worker, `pg_advisory_lock` serialising two
+    # booting replicas, and a failover dropping idle connections. An emulator would answer those
+    # from a lookup table and prove nothing. The rest of the suite keeps its in-memory fakes.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: onramp-test
+          POSTGRES_DB: onramp_test
+        ports:
+          - 5432:5432
+        # Without the health check the job races the container: `npm ci` usually outlasts Postgres
+        # starting, but "usually" is a flaky gate on the money paths.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ONRAMP_TEST_PG: postgres://postgres:onramp-test@localhost:5432/onramp_test
+    # This job spawns real processes. A regression that hangs one would otherwise burn the
+    # 360-minute default before anyone noticed.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:e2e
+
+  # The chart in this repo is what the cluster operator deploys, so "does it render, and is what
+  # it renders a config this service accepts" is a gate here rather than a discovery in a
+  # crash-looping pod.
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.2
+      # Schema-validates the rendered manifests offline. Without it the chart gate proves the
+      # chart renders and that the config inside it parses, but not that the result is a legal
+      # Deployment, so a malformed field reaches the cluster, not CI.
+      - name: Install kubeconform
+        env:
+          KUBECONFORM_VERSION: 0.8.0
+        run: |
+          set -euo pipefail
+          base="https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}"
+          archive="kubeconform-linux-amd64.tar.gz"
+
+          curl -sSfL -o "$archive" "$base/$archive"
+          curl -sSfL -o CHECKSUMS "$base/CHECKSUMS"
+
+          # The version pin only binds a filename; verifying the published checksum binds the
+          # bytes, so a replaced release asset cannot change the gate silently.
+          grep " ${archive}\$" CHECKSUMS | sha256sum -c -
+
+          sudo tar -xzf "$archive" -C /usr/local/bin kubeconform
+          kubeconform -v
+      - run: npm ci
+      - run: npm run build
+      - run: npm run check:chart
+
+  # The key is the whole reason this service exists, so a scan for one is a gate, not a habit.
+  #
+  # The gitleaks binary rather than gitleaks-action, because the action requires a paid
+  # licence for GitHub organisations while the scanner itself is free.
+  secrets:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history: a key committed and later removed is still leaked
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+
+          curl -sSfL -o "$archive" "$base/$archive"
+          curl -sSfL -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+
+          # The version pin only binds a filename. Verifying the published checksum is what
+          # binds the bytes, so a replaced release asset cannot change the gate silently.
+          grep " ${archive}\$" checksums.txt | sha256sum -c -
+
+          tar -xzf "$archive" -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Scan history for secrets
+        run: gitleaks git --no-banner --redact --exit-code 1 .

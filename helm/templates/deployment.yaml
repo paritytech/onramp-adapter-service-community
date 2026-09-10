@@ -1,0 +1,314 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "onramp.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "onramp.fullname" . }}
+spec:
+  {{- if gt (int .Values.replicaCount) 1 }}
+  {{- fail (printf "replicaCount must be 1, not %d: the rate limiter is in-process and keyed on the caller's personhood alias, so each replica serves an independent allowance and N replicas multiply every caller's spend ceiling by N. The store no longer objects (it is CloudSQL, and the worker leases the rows it advances), so lifting this is a change to the limiter, not to the database." (int .Values.replicaCount)) }}
+  {{- end }}
+  {{- if lt (int .Values.replicaCount) 0 }}
+  {{- /* 0 is the deliberate emergency stop and renders. A negative count is a typo the API
+         server rejects at admission, which is a failed sync rather than a render error. */}}
+  {{- fail (printf "replicaCount must be 1 (or 0 for the emergency stop), not %d." (int .Values.replicaCount)) }}
+  {{- end }}
+  # No `| default`: Helm's `default` treats 0 as empty and substituted 1, so scaling to zero
+  # (the emergency stop for a pod holding a payment provider's API key) silently did nothing.
+  # The guard above is the other half: the one-replica rule is stated everywhere as
+  # non-negotiable and was enforced nowhere.
+  replicas: {{ .Values.replicaCount }}
+  # `RollingUpdate`, which is what the move to CloudSQL buys. Under SQLite this had to be
+  # `Recreate`: one file on a ReadWriteOnce volume meant the new pod could not even schedule until
+  # the old one released it, so every deploy was a full outage of a browser-facing service.
+  #
+  # Two pods now overlap briefly, and both are safe against the store: the worker leases the rows
+  # it advances, so the second one claims nothing the first holds. What does overlap is the
+  # in-process rate limiter. For the length of the rollout a caller may be served by either pod and
+  # so may spend up to twice their allowance. That bounds a metered upstream quota, not money (the
+  # per-destination amount limits are checked per request and are unaffected), and it lasts one
+  # rollout rather than for ever, which is the trade `replicaCount: 1` above refuses to make
+  # permanently.
+  #
+  # `maxUnavailable: 0` is what makes it zero-downtime at one replica: the new pod must be ready
+  # before the old one goes. Its startup probe already proves the Meld credential and the store
+  # migration, so a pod that cannot reach CloudSQL never takes traffic.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "onramp.fullname" . }}
+  template:
+    metadata:
+      annotations:
+        # Roll the pod when the rendered config changes. Without this the Deployment is
+        # byte-identical after a ConfigMap-only edit, so the day an operator finally fills in
+        # `collections`, the deploy updates the ConfigMap and the running pod keeps the old
+        # one indefinitely.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        app.kubernetes.io/name: {{ include "onramp.fullname" . }}
+        # Required by the cluster's Team Label Requirement Policy: a pod without it is rejected
+        # at admission, so this is a deploy blocker rather than a nicety. It is also the label
+        # Prometheus target-labels on.
+        #
+        # Guarded: a bare `toYaml` over an empty or null map emits nothing and leaves a dangling
+        # key, which fails the whole render rather than merely omitting a label.
+        #
+        # And asserted, because `with` over an empty map is silent: the chart rendered clean
+        # without a `team` label and the rejection arrived from the admission controller at sync
+        # time. A deploy blocker belongs in the render.
+        {{- if not (get (.Values.extraLabels | default dict) "team") }}
+        {{- fail "extraLabels.team is required: the cluster's Team Label Requirement Policy rejects pods without it at admission, so an unset team is a failed deploy rather than a missing label." }}
+        {{- end }}
+        {{- with .Values.extraLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # The image is a GHCR package. If it is private, the kubelet needs a pull secret and
+      # without one the pod sits in `ImagePullBackOff`. Empty renders no field, which is
+      # correct for a public package.
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "onramp.serviceAccountName" . }}
+      {{- if .Values.store.authProxy.enabled }}
+      # The proxy authenticates via Workload Identity, carried by an
+      # `iam.gke.io/gcp-service-account` annotation on this pod's service account
+      # (`serviceAccount.annotations`). Without it the pod starts, the proxy cannot authenticate,
+      # the app cannot connect, and the operator reads a database error for an IAM fault. Not
+      # a render guard, because a template overlay is deliberately incomplete and the value is
+      # an operator hole like `collections`, but it is the first thing to check when a
+      # pod with a proxy cannot reach CloudSQL.
+      #
+      # A native sidecar, not a plain container. `initContainers` with `restartPolicy: Always`
+      # is a sidecar that Kubernetes starts before the app containers and waits on, and stops
+      # after them. Both halves matter here:
+      #
+      #   Startup. The app opens its pool during boot and `main.ts` exits non-zero when it cannot,
+      #   so a plain container would race: the proxy takes a second or two to establish, the app
+      #   waits `connection_timeout_ms`, and every pod start is a coin flip resolved by
+      #   CrashLoopBackOff with backoff until the timing happens to line up.
+      #
+      #   Shutdown. A plain proxy can exit while a worker tick is still writing. Terminated last,
+      #   it outlives the connections that need it.
+      #
+      # Requires Kubernetes 1.29 or newer, which `Chart.yaml`'s `kubeVersion` now states.
+      initContainers:
+        - name: cloud-sql-proxy
+          restartPolicy: Always
+          image: {{ .Values.store.authProxy.image | quote }}
+          args:
+            - "--structured-logs"
+            - "--port={{ int .Values.store.port }}"
+            # Its own health surface. Without it a proxy that starts and then loses its upstream is
+            # indistinguishable from a healthy one, and the only symptom is the app's connection
+            # errors, a fault reported by the thing that depends on it rather than by itself.
+            - "--health-check"
+            - "--http-address=0.0.0.0"
+            - "--http-port={{ int .Values.store.authProxy.healthPort }}"
+            # Empty until an operator fills it, like `collections`. The proxy refuses to
+            # start without an instance, so the hole is a loud boot failure rather than a pod that
+            # comes up pointing nowhere.
+            - {{ .Values.store.authProxy.instance | quote }}
+          startupProbe:
+            httpGet:
+              path: /startup
+              port: {{ int .Values.store.authProxy.healthPort }}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /liveness
+              port: {{ int .Values.store.authProxy.healthPort }}
+            periodSeconds: 10
+            timeoutSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      {{- end }}
+      # Belt and braces, and the property that actually matters: even pointed at an account
+      # somebody else manages, this pod gets no Kubernetes API token. With `create: false` it
+      # previously fell back to the namespace `default` account, which automounts one: the exact
+      # inverse of what the service account exists to guarantee.
+      automountServiceAccountToken: false
+      # Never run as root: the image already declares USER node, and the pod won't override that
+      # downward.
+      #
+      # `fsGroup` still applies to the mounted Secrets, which arrive owned by root. It no longer
+      # has a funding volume to make usable: the store is CloudSQL, so there is no PersistentVolume
+      # and no StorageClass question to settle.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- /*
+        The store is CloudSQL, and an overlay that points `store.host` at loopback means the
+        Auth Proxy sidecar; the config's plaintext exemption is granted *because* that hop stays
+        inside the pod. Nothing rendered one, so the pod pointed at 127.0.0.1:5432 with nothing
+        listening: `FundingStore.open` refused, boot failed, CrashLoopBackOff. `check:chart`
+        could not catch it, because it validates the rendered config rather than pod topology.
+
+        Failing the render is the other half. A loopback host with no proxy is not a deployment
+        with a missing option; it is a deployment that cannot reach its database, and it should be
+        impossible to render rather than discovered at 3am.
+      */}}
+      {{- $loopback := or (eq .Values.store.host "127.0.0.1") (eq .Values.store.host "::1") }}
+      {{- if and $loopback (not .Values.store.authProxy.enabled) }}
+      {{- fail "store.host is loopback but store.authProxy.enabled is false: nothing would be listening there. Enable the Cloud SQL Auth Proxy sidecar, or point store.host at the instance and set store.ssl=true." }}
+      {{- end }}
+      {{- if and .Values.store.authProxy.enabled (not $loopback) }}
+      {{- fail "store.authProxy.enabled is true but store.host is not loopback: the sidecar only listens on the pod's own interface, so the connection would bypass it." }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ include "onramp.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          # Container-level, where these fields actually take effect. They were previously set on
+          # the pod securityContext, which has no such fields; Kubernetes accepted the manifest
+          # and silently applied neither, so the hardening they describe was never in force.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: CONFIG_PATH
+              value: /run/config/config.json
+            # No secret env vars are ever injected: secrets are files, mounted
+            # read-only below, so they never appear in `env` or the image.
+          ports:
+            - name: http
+              containerPort: {{ .Values.server.port | default 8080 }}
+          startupProbe:
+            # Boot proves the Meld credential before the port opens, which takes an outbound call.
+            # Without a startup probe the liveness probe starts counting during that, and a slow
+            # upstream turns a healthy boot into a restart loop.
+            #
+            # `timeoutSeconds: 5` because boot does real network work before it answers: it
+            # proves the Meld credential, then connects to CloudSQL, takes the migration advisory
+            # lock and waits behind any replica already holding it. On the 1s default a perfectly
+            # healthy pod queued behind its own sibling's migration fails this probe.
+            #
+            # Coupled to `MIGRATION_LOCK_TIMEOUT_MS` in `src/funding/schema.ts`, which is
+            # 60s and must stay comfortably inside this budget: a replica waiting on the migration
+            # advisory lock has to give up with a readable error before Kubernetes kills it, or
+            # the operator sees a CrashLoop with no cause. Lowering this below ~90s inverts that.
+            #
+            # 10s x 12 gives boot a two-minute budget.
+            # The period is raised rather than the threshold cut so the timeout stays inside one
+            # period. With a 5s timeout on a 5s period, twelve blocked probes would consume up to
+            # 120s of timeout on top of the polling, and the real budget would be double what is
+            # written down.
+            httpGet:
+              path: {{ .Values.healthcheck.path | default "/health" }}
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.healthcheck.path | default "/health" }}
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          # Deliberately far more tolerant than readiness, because the two failures cost
+          # different things: readiness failing removes one endpoint; liveness failing kills the
+          # only pod there is. `replicaCount: 1` means a restart is a full outage.
+          #
+          # The tolerance is kept, and the reason for it has changed. It used to be that
+          # `node:sqlite` was synchronous and a contended write blocked the event loop for up to
+          # five seconds. The Postgres driver does not block the loop at all; what can now delay a
+          # response is a slow query, bounded by `statement_timeout` at ten seconds. The budget
+          # was already sized for that, so it stands; tightening it is a separate change with its
+          # own outage risk, not a free consequence of this one.
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.healthcheck.path | default "/health" }}
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          {{- if not (and .Values.resources .Values.resources.requests) }}
+          {{- fail "resources.requests must be set: the cluster's resource policy rejects pods without CPU and memory requests at admission." }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          # Mount the rendered config into /run/config and the secret files into
+          # the exact paths config.json references (secretMountPath).
+          volumeMounts:
+            - name: config
+              mountPath: /run/config
+              readOnly: true
+            # `readOnlyRootFilesystem: true` above means /tmp must be provided.
+            - name: tmp
+              mountPath: /tmp
+            - name: store-password
+              mountPath: {{ .Values.store.passwordPath | quote }}
+              subPath: {{ base .Values.store.passwordPath | quote }}
+              readOnly: true
+            {{- if .Values.secrets.meldApiKey.existingSecret }}
+            - name: meld-key
+              mountPath: {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.meldApiKey.key | quote }}
+              subPath: {{ .Values.secrets.meldApiKey.key | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.secrets.jwtKey.existingSecret }}
+            - name: jwt-key
+              mountPath: {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.jwtKey.key | quote }}
+              subPath: {{ .Values.secrets.jwtKey.key | quote }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        # `/tmp` carries a `sizeLimit`. Without one an `emptyDir` is bounded only by the node's
+        # disk, and the kubelet evicts the pod under node disk pressure: with one replica, a full
+        # outage triggered by a neighbour's disk usage. Nothing large is written here; the bound is
+        # there so the blast radius is one we chose.
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.emptyDirSizeLimit.tmp | default "64Mi" }}
+        - name: config
+          configMap:
+            name: {{ include "onramp.fullname" . }}-config
+        - name: store-password
+          secret:
+            secretName: {{ required "store.passwordSecret is required: the store credential is mounted, never inlined." .Values.store.passwordSecret }}
+            defaultMode: 0400
+            optional: false
+            items:
+              - key: {{ .Values.store.passwordSecretKey | default "store-password" | quote }}
+                path: {{ base .Values.store.passwordPath | quote }}
+        {{- if .Values.secrets.meldApiKey.existingSecret }}
+        - name: meld-key
+          secret:
+            secretName: {{ .Values.secrets.meldApiKey.existingSecret }}
+            optional: false
+            # The threat model and the README both claim the chart enforces this; it did not.
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.secrets.jwtKey.existingSecret }}
+        - name: jwt-key
+          secret:
+            secretName: {{ .Values.secrets.jwtKey.existingSecret }}
+            optional: false
+            defaultMode: 0400
+        {{- end }}

@@ -1,0 +1,63 @@
+name: Feature request or improvement
+description: Suggest a change, a new capability, or a clearer contract.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. This is a reference implementation, so proposals that keep it
+        simple and readable are especially welcome. If your idea depends on a payment rail or on a
+        consumer application, say so, since it may need coordination beyond this repo.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What is awkward, missing, or confusing today? Describe the situation, not just the fix.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: |
+        What would you like to happen? Be concrete about the behaviour. If it changes a route, a
+        config key, or a response shape, say which.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed, and why this one.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Quote / pricing (POST /quote)
+        - Session creation (POST /session)
+        - Funding request status, cancel, or the background worker
+        - Capability discovery (GET /supported)
+        - Personhood handshake / auth
+        - Rail integration (Meld, Chainflip)
+        - Store / migrations (Postgres)
+        - Config, Helm, or deployment
+        - Build / CI / tooling
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This would be a breaking change to a route, config key, or response shape.
