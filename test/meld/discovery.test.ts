@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { MeldDiscovery, toCorridorDto } from '../../src/meld/discovery.js';
 
+/** One lifetime for all three endpoints, which is what these tests assumed before the split. */
+const ttls = (ms: number) => ({ countries: ms, defaults: ms, routes: ms });
+
 // A canned Meld dataset, keyed the way the live endpoints are pathed. Amounts are STRINGS: the real
 // `authedGet` preserves Meld's JSON numbers verbatim, so the module is fed strings.
 const COUNTRIES = {
@@ -101,7 +104,7 @@ function stubGet() {
 
 describe('MeldDiscovery.corridor', () => {
   it('aggregates a corridor across providers: min-of-mins, max-of-maxes, provider union', async () => {
-    const d = new MeldDiscovery(stubGet(), 3_600_000);
+    const d = new MeldDiscovery(stubGet(), ttls(3_600_000));
     const { methods } = await d.corridor('US', 'USD', 'DOT_ASSETHUB');
 
     const card = methods.find((m) => m.paymentMethodType === 'CREDIT_DEBIT_CARD');
@@ -119,12 +122,12 @@ describe('MeldDiscovery.corridor', () => {
   });
 
   it('reads an empty route array as a corridor that is not served', async () => {
-    const d = new MeldDiscovery(stubGet(), 3_600_000);
+    const d = new MeldDiscovery(stubGet(), ttls(3_600_000));
     expect((await d.corridor('IN', 'INR', 'DOT_ASSETHUB')).methods).toEqual([]);
   });
 
   it('maps every payment-type bucket: card, wallet, and an unknown type as other', async () => {
-    const d = new MeldDiscovery(stubGet(), 3_600_000);
+    const d = new MeldDiscovery(stubGet(), ttls(3_600_000));
     const { methods } = await d.corridor('MX', 'MXN', 'DOT_ASSETHUB');
     const cat = (id: string) => methods.find((m) => m.paymentMethodType === id)?.category;
     expect(cat('CREDIT_DEBIT_CARD')).toBe('card');
@@ -134,7 +137,7 @@ describe('MeldDiscovery.corridor', () => {
 
   it('caches a corridor for its TTL: a second identical call hits no upstream', async () => {
     const get = stubGet();
-    const d = new MeldDiscovery(get, 3_600_000);
+    const d = new MeldDiscovery(get, ttls(3_600_000));
     await d.corridor('CA', 'CAD', 'DOT_ASSETHUB');
     await d.corridor('CA', 'CAD', 'DOT_ASSETHUB');
     expect(get.mock.calls.filter(([p]) => p.includes('/routes/')).length).toBe(1);
@@ -143,7 +146,7 @@ describe('MeldDiscovery.corridor', () => {
 
 describe('MeldDiscovery.countries', () => {
   it('returns every on-ramp country, name-sorted and unfiltered', async () => {
-    const d = new MeldDiscovery(stubGet(), 3_600_000);
+    const d = new MeldDiscovery(stubGet(), ttls(3_600_000));
     const rows = await d.countries('DOT_ASSETHUB');
     // The whole list, sorted by NAME; deliverability is decided per selection, not pre-filtered.
     // Canada, Errorland, India, Mexico, Nofiat, Routeless, United States.
@@ -153,7 +156,7 @@ describe('MeldDiscovery.countries', () => {
 
   it('memoises the catalog per crypto: a repeat call is served without a re-fetch', async () => {
     const get = stubGet();
-    const d = new MeldDiscovery(get, 3_600_000);
+    const d = new MeldDiscovery(get, ttls(3_600_000));
     const first = await d.countries('DOT_ASSETHUB');
     expect(await d.countries('DOT_ASSETHUB')).toBe(first);
     expect(get.mock.calls.filter(([p]) => p.includes('/supported/countries')).length).toBe(1);
@@ -166,7 +169,7 @@ describe('MeldDiscovery.countries', () => {
   it('reads the catalog through catalogGet and the corridor through get', async () => {
     const get = stubGet();
     const catalogGet = stubGet();
-    const d = new MeldDiscovery(get, 3_600_000, undefined, catalogGet);
+    const d = new MeldDiscovery(get, ttls(3_600_000), undefined, catalogGet);
 
     await d.countries('DOT_ASSETHUB');
     await d.corridor('US', 'USD', 'DOT_ASSETHUB');
@@ -184,7 +187,7 @@ describe('MeldDiscovery.countries', () => {
 
   it('falls back to the corridor transport when no catalogGet is given', async () => {
     const get = stubGet();
-    const d = new MeldDiscovery(get, 3_600_000);
+    const d = new MeldDiscovery(get, ttls(3_600_000));
     await d.countries('DOT_ASSETHUB');
     expect(get.mock.calls.filter(([p]) => p.includes('/supported/countries')).length).toBe(1);
   });
@@ -192,14 +195,14 @@ describe('MeldDiscovery.countries', () => {
 
 describe('MeldDiscovery.corridorForCountry', () => {
   it('resolves the country default fiat, then reads that corridor', async () => {
-    const d = new MeldDiscovery(stubGet(), 3_600_000);
+    const d = new MeldDiscovery(stubGet(), ttls(3_600_000));
     const c = await d.corridorForCountry('CA', 'DOT_ASSETHUB');
     expect(c.fiat).toBe('CAD');
     expect(c.methods.map((m) => m.paymentMethodType)).toEqual(['CREDIT_DEBIT_CARD']);
   });
 
   it('is empty when the country has a default fiat but no route for the crypto', async () => {
-    const d = new MeldDiscovery(stubGet(), 3_600_000);
+    const d = new MeldDiscovery(stubGet(), ttls(3_600_000));
     expect(await d.corridorForCountry('IN', 'DOT_ASSETHUB')).toMatchObject({
       country: 'IN',
       fiat: 'INR',
@@ -208,7 +211,7 @@ describe('MeldDiscovery.corridorForCountry', () => {
   });
 
   it('is empty (no fiat) when the country carries no default currency', async () => {
-    const d = new MeldDiscovery(stubGet(), 3_600_000);
+    const d = new MeldDiscovery(stubGet(), ttls(3_600_000));
     expect(await d.corridorForCountry('NF', 'DOT_ASSETHUB')).toEqual({
       country: 'NF',
       fiat: '',
@@ -218,28 +221,81 @@ describe('MeldDiscovery.corridorForCountry', () => {
   });
 
   it('is empty when the defaults probe itself fails', async () => {
-    const d = new MeldDiscovery(stubGet(), 3_600_000);
+    const d = new MeldDiscovery(stubGet(), ttls(3_600_000));
     expect((await d.corridorForCountry('XX', 'DOT_ASSETHUB')).methods).toEqual([]);
   });
 });
 
 describe('MeldDiscovery defensive parsing', () => {
   it('reads an unparseable countries payload as an empty list', async () => {
-    const d = new MeldDiscovery(async () => 'not an envelope', 3_600_000);
+    const d = new MeldDiscovery(async () => 'not an envelope', ttls(3_600_000));
     expect(await d.countries('DOT_ASSETHUB')).toEqual([]);
   });
 
   it('falls back to the country code when a row carries no name', async () => {
-    const d = new MeldDiscovery(async () => ({ countries: [{ countryCode: 'ZZ' }] }), 3_600_000);
+    const d = new MeldDiscovery(async () => ({ countries: [{ countryCode: 'ZZ' }] }), ttls(3_600_000));
     expect(await d.countries('DOT_ASSETHUB')).toEqual([{ country: 'ZZ', name: 'ZZ' }]);
   });
 
   it('treats an explicit null default currency as no fiat', async () => {
     const d = new MeldDiscovery(
       async (p) => (p.includes('/defaults/') ? { countryCode: 'ZZ', currencyCode: null } : []),
-      3_600_000,
+      ttls(3_600_000),
     );
     expect(await d.corridorForCountry('ZZ', 'DOT_ASSETHUB')).toMatchObject({ fiat: '', methods: [] });
+  });
+});
+
+describe('MeldDiscovery.defaultFiat', () => {
+  /** Count the `/defaults/` calls, so a cache hit is visible as a call that did not happen. */
+  const counting = (body: unknown) => {
+    let calls = 0;
+    const get = async (path: string) => {
+      if (path.includes('/defaults/')) calls += 1;
+      return body;
+    };
+    return { get, calls: () => calls };
+  };
+
+  it('serves a repeat from cache, which is the Meld call this endpoint exists to stop making', async () => {
+    const meld = counting({ countryCode: 'CA', currencyCode: 'CAD' });
+    const d = new MeldDiscovery(meld.get, ttls(3_600_000));
+
+    expect(await d.defaultFiat('CA')).toBe('CAD');
+    expect(await d.defaultFiat('CA')).toBe('CAD');
+    expect(meld.calls()).toBe(1);
+  });
+
+  it('re-reads once the lifetime has passed', async () => {
+    let now = 1_000;
+    const meld = counting({ countryCode: 'CA', currencyCode: 'CAD' });
+    const d = new MeldDiscovery(meld.get, ttls(1_000), () => now);
+
+    await d.defaultFiat('CA');
+    now += 1_001;
+    await d.defaultFiat('CA');
+    expect(meld.calls()).toBe(2);
+  });
+
+  it('does not cache a failed call, so one bad response cannot pin a country to no-fiat', async () => {
+    let calls = 0;
+    const d = new MeldDiscovery(async () => {
+      calls += 1;
+      throw new Error('meld down');
+    }, ttls(3_600_000));
+
+    expect(await d.defaultFiat('CA')).toBe('');
+    expect(await d.defaultFiat('CA')).toBe('');
+    expect(calls).toBe(2);
+  });
+
+  it('caches a parsed envelope that names no currency, which is a real answer', async () => {
+    const meld = counting({ countryCode: 'NF' });
+    const d = new MeldDiscovery(meld.get, ttls(3_600_000));
+
+    expect(await d.defaultFiat('NF')).toBe('');
+    expect(await d.defaultFiat('NF')).toBe('');
+    expect(meld.calls()).toBe(1);
   });
 });
 
@@ -264,7 +320,7 @@ describe('MeldDiscovery currency and cache hygiene', () => {
             },
           ]
         : [];
-    const d = new MeldDiscovery(get, 3_600_000);
+    const d = new MeldDiscovery(get, ttls(3_600_000));
     const { methods } = await d.corridor('GB', 'GBP', 'DOT_ASSETHUB');
 
     expect(methods.map((m) => m.paymentMethodType)).toEqual(['SEPA']);
@@ -283,7 +339,7 @@ describe('MeldDiscovery currency and cache hygiene', () => {
             },
           ]
         : [];
-    const d = new MeldDiscovery(get, 3_600_000);
+    const d = new MeldDiscovery(get, ttls(3_600_000));
     expect((await d.corridor('GB', 'GBP', 'DOT_ASSETHUB')).methods).toHaveLength(1);
   });
 
@@ -293,7 +349,7 @@ describe('MeldDiscovery currency and cache hygiene', () => {
       path.includes('/routes/')
         ? [{ partner: 'TRANSAK', paymentMethods: [{ name: 'PIX', paymentType: 'BANK_TRANSFER', limits: { min: '1', max: '9' } }] }]
         : [];
-    const d = new MeldDiscovery(get, 3_600_000);
+    const d = new MeldDiscovery(get, ttls(3_600_000));
     const { methods } = await d.corridor('BR', 'BRL', 'DOT_ASSETHUB');
     expect(methods).toHaveLength(1);
     expect(methods[0]?.currency).toBe('BRL');
@@ -308,7 +364,7 @@ describe('MeldDiscovery currency and cache hygiene', () => {
    */
   it('evicts expired entries instead of holding every corridor ever probed', async () => {
     let now = 0;
-    const d = new MeldDiscovery(stubGet(), 1_000, () => now);
+    const d = new MeldDiscovery(stubGet(), ttls(1_000), () => now);
 
     await d.corridor('US', 'USD', 'DOT_ASSETHUB');
     await d.corridor('CA', 'CAD', 'DOT_ASSETHUB');
@@ -322,7 +378,7 @@ describe('MeldDiscovery currency and cache hygiene', () => {
 
   it('keeps entries that are still fresh when a new one is written', async () => {
     let now = 0;
-    const d = new MeldDiscovery(stubGet(), 1_000_000, () => now);
+    const d = new MeldDiscovery(stubGet(), ttls(1_000_000), () => now);
 
     await d.corridor('US', 'USD', 'DOT_ASSETHUB');
     now = 10;
@@ -353,7 +409,7 @@ describe('MeldDiscovery does not cache an answer it cannot trust', () => {
             { partner: 'TRANSAK', paymentMethods: [{ name: 'CREDIT_DEBIT_CARD', paymentType: 'CARD', limits: { min: '5', max: '3000' } }] },
           ]
         : [];
-    const d = new MeldDiscovery(get, 3_600_000);
+    const d = new MeldDiscovery(get, ttls(3_600_000));
     const { methods } = await d.corridor('US', 'USD', 'DOT_ASSETHUB');
 
     expect(methods.map((m) => m.paymentMethodType)).toEqual(['CREDIT_DEBIT_CARD']);
@@ -366,7 +422,7 @@ describe('MeldDiscovery does not cache an answer it cannot trust', () => {
       calls += 1;
       return [{ paymentMethods: [] }, { partner: 'TRANSAK', paymentMethods: [] }];
     };
-    const d = new MeldDiscovery(get, 3_600_000);
+    const d = new MeldDiscovery(get, ttls(3_600_000));
 
     await d.corridor('US', 'USD', 'DOT_ASSETHUB');
     await d.corridor('US', 'USD', 'DOT_ASSETHUB');
@@ -381,7 +437,7 @@ describe('MeldDiscovery does not cache an answer it cannot trust', () => {
       calls += 1;
       return { unexpected: 'shape' };
     };
-    const d = new MeldDiscovery(get, 3_600_000);
+    const d = new MeldDiscovery(get, ttls(3_600_000));
 
     expect((await d.corridor('US', 'USD', 'DOT_ASSETHUB')).methods).toEqual([]);
     await d.corridor('US', 'USD', 'DOT_ASSETHUB');
@@ -395,7 +451,7 @@ describe('MeldDiscovery does not cache an answer it cannot trust', () => {
       calls += 1;
       return [];
     };
-    const d = new MeldDiscovery(get, 3_600_000);
+    const d = new MeldDiscovery(get, ttls(3_600_000));
 
     await d.corridor('ZZ', 'USD', 'DOT_ASSETHUB');
     await d.corridor('ZZ', 'USD', 'DOT_ASSETHUB');
@@ -408,7 +464,7 @@ describe('MeldDiscovery does not cache an answer it cannot trust', () => {
     const d = new MeldDiscovery(async () => {
       calls += 1;
       return 'not an envelope';
-    }, 3_600_000);
+    }, ttls(3_600_000));
 
     expect(await d.countries('DOT_ASSETHUB')).toEqual([]);
     await d.countries('DOT_ASSETHUB');
@@ -420,7 +476,7 @@ describe('MeldDiscovery does not cache an answer it cannot trust', () => {
     const d = new MeldDiscovery(async () => {
       calls += 1;
       return { countries: [] };
-    }, 3_600_000);
+    }, ttls(3_600_000));
 
     await d.countries('DOT_ASSETHUB');
     await d.countries('DOT_ASSETHUB');

@@ -61,6 +61,13 @@ meld:
   base_url: https://api-sb.meld.io
   api_version: "2025-01-01"
   timeout_ms: 8000
+  # One cache lifetime per endpoint. Each must stay strictly under the `supported.*_interval_ms`
+  # that renews it or the pod fails config validation at boot: the refresh reads through these
+  # caches and a lifetime past its interval serves it its own last copy. Countries and defaults
+  # are rarely-changing (Meld permits up to a week); routes carry the limits that gate a charge.
+  countries_cache_ttl_ms: 21600000
+  defaults_cache_ttl_ms: 21600000
+  routes_cache_ttl_ms: 900000
   boot_probe:
     destination_code: DOT_ASSETHUB
     source_amount: "20"
@@ -174,6 +181,20 @@ store:
     # The proxy's own health endpoint, used by its startup and liveness probes. Not exposed by the
     # Service: it is for the kubelet, not for callers.
     healthPort: 9090
+
+# The background job behind `GET /supported/corridors`: every deliverable corridor for a crypto in
+# one payload out of Postgres, instead of a per-country fan-out to Meld.
+#
+# Two cadences. The catalog pass reads the country list and each country's default fiat (Meld calls
+# both rarely-changing), daily and at startup. The routes pass reads the per-country limits over
+# that catalog, every two hours, one Meld call per country.
+#
+# Each `meld.*_cache_ttl_ms` must stay strictly under the interval that renews it, or config refuses
+# the pair at boot: the refresh reads through those caches and would be served its own last copy.
+supported:
+  enabled: true
+  catalog_interval_ms: 86400000
+  routes_interval_ms: 7200000
 
 # The background worker that advances in-flight funding requests.
 worker:

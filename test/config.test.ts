@@ -53,6 +53,8 @@ describe('parseConfig', () => {
     ['rate_limit.per_address_max', ['rate_limit', 'per_address_max'], 0, undefined],
     ['worker.interval_ms', ['worker', 'interval_ms'], 999, 300_001],
     ['worker.session_max_age_ms', ['worker', 'session_max_age_ms'], 59_999, 30 * 24 * 3_600_000 + 1],
+    ['supported.catalog_interval_ms', ['supported', 'catalog_interval_ms'], 59_999, 7 * 86_400_000 + 1],
+    ['supported.routes_interval_ms', ['supported', 'routes_interval_ms'], 59_999, 86_400_001],
     ['auth.personhood.challenge_ttl_ms', ['auth', 'personhood', 'challenge_ttl_ms'], 999, 300_001],
     ['auth.personhood.token_ttl_s', ['auth', 'personhood', 'token_ttl_s'], 29, 3_601],
   ])('bounds %s at both ends', (_label, path, tooLow, tooHigh) => {
@@ -842,6 +844,47 @@ describe('parseConfig', () => {
 
     expect(parseConfig(empty).cors).toEqual(parseConfig(omitted).cors);
     expect(parseConfig(empty).rate_limit).toEqual(parseConfig(omitted).rate_limit);
+  });
+
+  it('applies the supported-refresh defaults whether the block is omitted or empty', () => {
+    // `.prefault({})` like cors/rate_limit: an absent or empty block is the documented defaults.
+    const defaults = { enabled: true, catalog_interval_ms: 24 * 3_600_000, routes_interval_ms: 2 * 3_600_000 };
+    const omitted = rawConfig() as Record<string, unknown>;
+    delete omitted.supported;
+    expect(parseConfig(omitted).supported).toEqual(defaults);
+    expect(parseConfig(rawConfig({ supported: {} })).supported).toEqual(defaults);
+  });
+
+  it('gives each Meld endpoint its own cache lifetime, on the scale its data moves', () => {
+    const cfg = parseConfig(rawConfig());
+    expect(cfg.meld.countries_cache_ttl_ms).toBe(6 * 3_600_000);
+    expect(cfg.meld.defaults_cache_ttl_ms).toBe(6 * 3_600_000);
+    expect(cfg.meld.routes_cache_ttl_ms).toBe(900_000);
+  });
+
+  it('refuses the retired meld.supported_cache_ttl_ms rather than reinterpreting it', () => {
+    // One TTL became three. Kept, the old key would silently pick one, and the catalogs' lifetime
+    // applied to routes stales the limits that gate a charge. `.strict()` makes it a boot failure.
+    expect(() => parseConfig(rawConfig({ meld: { supported_cache_ttl_ms: 3_600_000 } }))).toThrow(/meld/);
+  });
+
+  it('refuses a cache lifetime at or above the refresh that is meant to renew it', () => {
+    // A TTL >= its interval means the pass is served its own last copy and never reaches Meld.
+    const raw = rawConfig() as Record<string, unknown>;
+    raw.supported = { enabled: true, catalog_interval_ms: 3_600_000, routes_interval_ms: 3_600_000 };
+    raw.meld = { ...(raw.meld as Record<string, unknown>), routes_cache_ttl_ms: 3_600_000 };
+    expect(() => parseConfig(raw)).toThrow(/routes_cache_ttl_ms/);
+  });
+
+  it('leaves the lifetimes alone when the refresh is off, because nothing is renewing them', () => {
+    const raw = rawConfig() as Record<string, unknown>;
+    raw.supported = { enabled: false, catalog_interval_ms: 60_000, routes_interval_ms: 60_000 };
+    expect(parseConfig(raw).supported.enabled).toBe(false);
+  });
+
+  it('refuses an unknown field in the supported block', () => {
+    // `.strict()`, so a typo is a boot failure rather than a silently ignored setting.
+    expect(() => parseConfig(rawConfig({ supported: { nope: true } }))).toThrow(/supported/);
   });
 
   it('refuses the retired rate_limit.max rather than reinterpreting it', () => {

@@ -23,7 +23,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { mintChallenge } from '../../src/personhood/challenge.js';
 import { mintToken } from '../../src/personhood/token.js';
-import { createSchema, dropOwnSchemas, liveBackends, storeConfigFor, storePassword } from '../pg.js';
+import { createSchema, dropOwnSchemas, liveBackends, rawQuery, storeConfigFor, storePassword } from '../pg.js';
 
 /** What `spawn` with piped stdout/stderr and no stdin actually returns. */
 type Spawned = ChildProcessByStdio<null, Readable, Readable>;
@@ -80,7 +80,9 @@ async function fakeMeld(
     // The fake enforces the parts of Meld's contract the client is responsible for. Accepting
     // any shape made this suite blind to exactly the regressions it should catch: swapping
     // `BASIC` for `Bearer`, dropping the version header, or using the wrong verb all passed.
-    if (req.headers.authorization !== `BASIC ${MELD_KEY}`) {
+    // The country catalog is the one call the service makes unkeyed (`publicGet`), as Meld allows.
+    const unkeyed = req.url?.startsWith('/network-partner/supported/countries') === true;
+    if (!unkeyed && req.headers.authorization !== `BASIC ${MELD_KEY}`) {
       json({ code: 'UNAUTHORIZED' }, 401);
       return;
     }
@@ -91,7 +93,9 @@ async function fakeMeld(
     // The settlement worker's transaction search is the one GET the client makes; everything
     // else is a POST and a wrong verb should still be refused.
     const searching = req.url?.startsWith('/payments/transactions') === true;
-    if (req.method !== (searching ? 'GET' : 'POST')) {
+    // Discovery is the other family of GETs: countries, defaults, routes.
+    const discovering = req.url?.startsWith('/network-partner/') === true;
+    if (req.method !== (searching || discovering ? 'GET' : 'POST')) {
       json({ code: 'BAD_METHOD' }, 405);
       return;
     }
@@ -122,6 +126,46 @@ async function fakeMeld(
                 },
               ],
             },
+      );
+      return;
+    }
+    if (discovering) {
+      // `NF` has no default fiat (catalog pass drops it); `ZZ` has a fiat but no route (routes
+      // pass skips it without writing a row).
+      if (req.url?.startsWith('/network-partner/supported/countries')) {
+        json({
+          countries: [
+            { countryCode: 'US', name: 'United States' },
+            { countryCode: 'BR', name: 'Brazil' },
+            { countryCode: 'NF', name: 'Nofiat' },
+            { countryCode: 'ZZ', name: 'Routeless' },
+          ],
+        });
+        return;
+      }
+      if (req.url?.startsWith('/network-partner/defaults/')) {
+        const country = req.url.split('/')[3] ?? '';
+        const currencyCode = { US: 'USD', BR: 'BRL', ZZ: 'ZZZ' }[country];
+        json(currencyCode === undefined ? { countryCode: country } : { countryCode: country, currencyCode });
+        return;
+      }
+      // `/network-partner/supported/routes/{CATEGORY}/{country}/{fiat}/{crypto}`
+      const [, , , , , country, fiat] = (req.url ?? '').split('/');
+      json(
+        country === 'ZZ'
+          ? []
+          : [
+              {
+                partner: 'TRANSAK',
+                paymentMethods: [
+                  {
+                    name: 'CREDIT_DEBIT_CARD',
+                    paymentType: 'CARD',
+                    limits: { currencyCode: fiat, min: '5', max: '3000' },
+                  },
+                ],
+              },
+            ],
       );
       return;
     }
@@ -176,6 +220,7 @@ async function writeConfig(
     worker?: { interval_ms: number; session_max_age_ms: number };
     products?: string[];
     allowedOrigins?: string[];
+    supported?: { catalog_interval_ms: number; routes_interval_ms: number };
   } = {},
 ): Promise<string> {
   const meldKeyPath = join(dir, 'meld.key');
@@ -193,6 +238,14 @@ async function writeConfig(
       api_key: { mode: 'file', path: meldKeyPath },
       api_version: '2025-01-01',
       timeout_ms: 8000,
+      ...(opts.supported === undefined
+        ? {}
+        : {
+            // Must stay under the refresh intervals, and 60s is their floor: hence intervals > 1m.
+            countries_cache_ttl_ms: 60_000,
+            defaults_cache_ttl_ms: 60_000,
+            routes_cache_ttl_ms: 60_000,
+          }),
       boot_probe: {
         destination_code: 'USDC_ASSETHUB',
         source_amount: '20',
@@ -226,6 +279,8 @@ async function writeConfig(
       opts.worker === undefined
         ? { interval_ms: 15000, enabled: false, session_max_age_ms: 86400000 }
         : { ...opts.worker, enabled: true },
+    // Off like the worker; the one test that wants it names its own intervals.
+    supported: opts.supported === undefined ? { enabled: false } : { ...opts.supported, enabled: true },
   };
   const path = join(dir, 'config.json');
   await writeFile(path, JSON.stringify(config));
@@ -643,6 +698,67 @@ describe('the service as a process', () => {
 });
 
 describe('the funding journey over real HTTP', () => {
+  it('fills the supported-corridors cache from Meld at boot, and serves it in one payload', async () => {
+    /**
+     * The refresh in a real process, against a real Postgres, over a real socket: the spawned
+     * service walks Meld on its own, writes rows another connection can see, and answers out of
+     * them without touching Meld.
+     *
+     * Boot passes only. Intervals must exceed a minute, so a second pass is not observable here;
+     * the repeat cadence is pinned by the unit tests.
+     */
+    const baseUrl = await fakeMeld();
+    const port = await freePort();
+    const schema = await createSchema();
+    const configPath = await writeConfig(baseUrl, port, schema, {
+      supported: { catalog_interval_ms: 120_000, routes_interval_ms: 120_000 },
+    });
+    child = await startService(configPath, port);
+    const base = `http://127.0.0.1:${String(port)}`;
+
+    // Boot passes run after the port opens, so the first read can legitimately be empty.
+    const deadline = Date.now() + 15_000;
+    let rows: Record<string, unknown>[] = [];
+    for (;;) {
+      rows = await rawQuery(schema, 'SELECT country, fiat, methods FROM supported_corridors ORDER BY country');
+      if (rows.length >= 2 || Date.now() > deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    // BR and US only: NF dropped (no fiat), ZZ skipped (no route).
+    expect(rows.map((r) => r.country)).toEqual(['BR', 'US']);
+    expect(rows.map((r) => r.fiat)).toEqual(['BRL', 'USD']);
+
+    // Catalog before routes, and routes asks per country with the catalog's fiat — never
+    // re-reading `defaults`, which is what makes its cadence affordable.
+    const discovery = meldCalls.filter((url) => url.startsWith('/network-partner/'));
+    expect(discovery[0]).toContain('/supported/countries');
+    expect(discovery.filter((url) => url.startsWith('/network-partner/defaults/'))).toHaveLength(4);
+    // Name-sorted, as `countries` returns and the catalog preserves.
+    expect(discovery.filter((url) => url.includes('/supported/routes/'))).toEqual([
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/BR/BRL/DOT_ASSETHUB',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/ZZ/ZZZ/DOT_ASSETHUB',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT_ASSETHUB',
+    ]);
+
+    // And the endpoint serves those rows without going to Meld.
+    const before = meldCalls.length;
+    const response = await fetch(`${base}/supported/corridors?destinationCurrencyCode=DOT_ASSETHUB`, {
+      headers: { 'x-dev-product-id': PRODUCT },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      corridors: { country: string; name: string; fiat: string; methods: { paymentMethodType: string; providers?: unknown }[] }[];
+    };
+    expect(body.corridors.map((c) => c.country)).toEqual(['BR', 'US']);
+    expect(body.corridors[0]).toMatchObject({ name: 'Brazil', fiat: 'BRL' });
+    expect(body.corridors[0]?.methods[0]).toMatchObject({ paymentMethodType: 'CREDIT_DEBIT_CARD', min: '5', max: '3000' });
+    // The provider roster never crosses the boundary.
+    expect(body.corridors[0]?.methods[0]?.providers).toBeUndefined();
+    // Read entirely from Postgres: the request added no Meld call.
+    expect(meldCalls.length).toBe(before);
+  }, 30_000);
+
   it('quotes, creates a session, and lists the request back', async () => {
     const baseUrl = await fakeMeld();
     const port = await freePort();

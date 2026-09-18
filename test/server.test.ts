@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { reject, transactionId, type CreateSessionResponse, type QuoteResponse } from '../src/contract.js';
 import type { FundingRecord } from '../src/funding/types.js';
 import { MeldHttpError } from '../src/meld/client.js';
+import type { SupportedCorridorDto } from '../src/onramp.js';
 import { Secret } from '../src/secret.js';
 import { buildServer } from '../src/server.js';
 import { ALICE, config, createRequest, fundingRecord, quoteRequestBody } from './fixtures.js';
@@ -47,6 +48,7 @@ const serve = async (
     get: () => Promise<FundingRecord | undefined>;
     list: () => Promise<FundingRecord[]>;
     cancel: () => Promise<FundingRecord | undefined>;
+    supportedCorridors: () => Promise<SupportedCorridorDto[]>;
   }> = {},
   sink?: { write: (line: string) => void },
 ) => {
@@ -57,6 +59,7 @@ const serve = async (
     list: async () => [],
     supported: async () => ({ country: 'US', fiat: 'USD', crypto: 'DOT_ASSETHUB', methods: [] }),
     supportedCountries: async () => [],
+    supportedCorridors: async () => [],
     quote: async () => ({
       // A complete breakdown, because the test below is named for it. An incomplete fixture
       // under that name is the fake and the code agreeing with each other. Amounts are decimal
@@ -141,6 +144,7 @@ describe('logging', () => {
           cancel: async () => undefined,
           supported: async () => ({ country: 'US', fiat: 'USD', crypto: 'DOT_ASSETHUB', methods: [] }),
           supportedCountries: async () => [],
+          supportedCorridors: async () => [],
           quote: async () => ({
             quotes: [],
             requested: { destinationCurrencyCode: 'USDC_ASSETHUB', sourceAmount: '20', fiat: 'USD' },
@@ -1732,5 +1736,38 @@ describe('the discovery routes', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ countries: [] });
+  });
+
+  it('GET /supported/corridors returns the cached corridors under a `corridors` key', async () => {
+    const corridors = [
+      { country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [{ paymentMethodType: 'PIX', category: 'bank' as const, min: '10', max: '5000', currency: 'BRL' }] },
+    ];
+    const built = await serve(undefined, config(), { supportedCorridors: async () => corridors });
+    const response = await built.inject({
+      method: 'GET',
+      url: '/supported/corridors?destinationCurrencyCode=DOT_ASSETHUB',
+      headers: DEV_HEADERS,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ corridors });
+  });
+
+  it('GET /supported/corridors refuses an unexpected query field (strict)', async () => {
+    const built = await serve();
+    const response = await built.inject({
+      method: 'GET',
+      url: '/supported/corridors?destinationCurrencyCode=DOT_ASSETHUB&country=BR',
+      headers: DEV_HEADERS,
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('GET /supported/corridors refuses a missing crypto', async () => {
+    const built = await serve();
+    const response = await built.inject({ method: 'GET', url: '/supported/corridors', headers: DEV_HEADERS });
+
+    expect(response.statusCode).toBe(400);
   });
 });

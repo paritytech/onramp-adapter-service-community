@@ -31,6 +31,7 @@ import {
   quoteRequest,
   supportedQuery,
   supportedCountriesQuery,
+  supportedCorridorsQuery,
   redeemRequest,
   malformedRequest,
   notFound,
@@ -52,6 +53,7 @@ type OnrampPort = Pick<
   | 'quote'
   | 'supported'
   | 'supportedCountries'
+  | 'supportedCorridors'
   | 'transaction'
   | 'cancel'
   | 'get'
@@ -304,6 +306,12 @@ export async function buildServer(
     // Projected, not forwarded: `providers` is aggregation bookkeeping no client reads, and
     // serialising it would name Meld's sub-providers on a surface that deliberately never does.
     return reply.send(toCorridorDto(await onramp.supported(q.country, q.destinationCurrencyCode)));
+  });
+
+  // Every supported corridor for a crypto in one payload, read from the DB the refresh fills (off Meld).
+  app.get<{ Querystring: Record<string, string> }>('/supported/corridors', asCaller, async (request, reply) => {
+    const q = parse(supportedCorridorsQuery, request.query);
+    return reply.send({ corridors: await onramp.supportedCorridors(q.destinationCurrencyCode) });
   });
 
   /** The one operation that leads to a card charge. */

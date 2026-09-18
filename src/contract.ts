@@ -319,6 +319,9 @@ export const supportedQuery = z.object({ country, destinationCurrencyCode }).str
 /** The query behind `GET /supported/countries`: the region dropdown for one delivered crypto. */
 export const supportedCountriesQuery = z.object({ destinationCurrencyCode }).strict();
 
+/** The query behind `GET /supported/corridors`: every cached corridor for one delivered crypto. */
+export const supportedCorridorsQuery = z.object({ destinationCurrencyCode }).strict();
+
 
 // --- responses --------------------------------------------------------------
 

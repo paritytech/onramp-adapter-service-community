@@ -3,10 +3,10 @@
 Every route, its request and response shape, and the errors it returns.
 See [README.md](../README.md) for what the service is and how to run it.
 
-Eight routes are authenticated by the short-lived JWT the handshake mints: `POST /quote`,
-`POST /session`, `GET /supported`, `GET /supported/countries`, `GET /funding`, `GET /funding/:id`,
-`POST /funding/:id/cancel` and `GET /transaction/:id`. The unauthenticated remainder is
-`GET /health`, `GET /meld/return` and the two handshake routes.
+Nine routes are authenticated by the short-lived JWT the handshake mints: `POST /quote`,
+`POST /session`, `GET /supported`, `GET /supported/countries`, `GET /supported/corridors`,
+`GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel` and `GET /transaction/:id`. The
+unauthenticated remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
 
 | Endpoint | Proxies | Purpose |
 | --- | --- | --- |
@@ -14,6 +14,7 @@ Eight routes are authenticated by the short-lived JWT the handshake mints: `POST
 | `POST /api/v1/auth/redeem` | none | Exchanges a challenge + ring-VRF proof for a short-lived JWT. Verifies against the People-chain commitment. |
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps, name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first (`/network-partner/defaults/...`). Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
+| `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `destinationCurrencyCode` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
 | `GET /transaction/:id` | `GET /payments/transactions/{id}` | Status, projected onto the five fields this service declares. |

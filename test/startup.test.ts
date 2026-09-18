@@ -394,6 +394,72 @@ afterEach(async () => {
     await after.close();
   }, 20_000);
 
+  it('runs the supported-corridors refresh when enabled, and close waits for an in-flight pass', async () => {
+    // Started only when `supported.enabled`, off the request path, and torn down by `close`. The
+    // fake blocks the country-list call so a refresh pass is in flight when close() runs: close must
+    // stop the refresh (awaiting that pass) before it returns. Remove `supported?.stop()` from
+    // close() and `closed` flips true immediately, failing the assertion below.
+    let releaseCountries: (() => void) | undefined;
+    const countriesGate = new Promise<void>((resolve) => {
+      releaseCountries = resolve;
+    });
+    let countriesRequested: (() => void) | undefined;
+    const countriesSeen = new Promise<void>((resolve) => {
+      countriesRequested = resolve;
+    });
+
+    const server = http.createServer((req, res) => {
+      meldRequests += 1;
+      if ((req.url ?? '').includes('/network-partner/supported/countries')) {
+        countriesRequested?.();
+        void countriesGate.then(() => {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'boom' }));
+        });
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ quotes: [] }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    meld = server;
+    const address = server.address();
+    const baseUrl = `http://127.0.0.1:${String(typeof address === 'object' && address ? address.port : 0)}`;
+
+    const path = await writeConfig('supported-on', baseUrl);
+    const raw = JSON.parse(await readFile(path, 'utf8')) as {
+      supported?: Record<string, unknown>;
+      meld?: Record<string, unknown>;
+    };
+    raw.supported = { enabled: true, catalog_interval_ms: 120_000, routes_interval_ms: 120_000 };
+    // Lifetimes must stay under the intervals or config refuses the pair, and 60s is their floor,
+    // hence two-minute intervals. This test gates on the refresh actually calling Meld.
+    raw.meld = {
+      ...raw.meld,
+      countries_cache_ttl_ms: 60_000,
+      defaults_cache_ttl_ms: 60_000,
+      routes_cache_ttl_ms: 60_000,
+    };
+    await writeFile(path, JSON.stringify(raw));
+
+    handle = await start(path, { write: () => undefined });
+
+    // The immediate pass is now blocked on the gated country-list call.
+    await countriesSeen;
+
+    let closed = false;
+    const closing = handle.close().then(() => {
+      closed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(closed).toBe(false);
+
+    releaseCountries?.();
+    await closing;
+    expect(closed).toBe(true);
+    handle = undefined;
+  });
+
   it('gives the worker the configured observation window, not a constant', async () => {
     // `session_max_age_ms` sits one argument away from `interval_ms` in the same call. Mutating
     // `interval_ms` is caught; mutating this one to `1` was not. At `1` every in-flight

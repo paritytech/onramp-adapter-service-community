@@ -2,8 +2,9 @@
  * The funding store's schema, versioned.
  *
  * The SQLite migration chain is gone, and deleting it was the point of moving. v0->v1->v2->v3
- * existed to bring an on-disk SQLite file forward in place; the Postgres chain is 1->2->3->4, with
- * 3->4 adding `cancelled_at`. Nothing was ever deployed, so that chain migrated a population of
+ * existed to bring an on-disk SQLite file forward in place; the Postgres chain is 1->2->3->4->5,
+ * with 3->4 adding `cancelled_at` and 4->5 adding the supported-corridors cache. Nothing was ever
+ * deployed, so that chain migrated a population of
  * zero, and CloudSQL starts from an empty database, so porting it would have meant carrying three
  * migrations for no rows, expressed against an engine this service has left. The v3 shape is the v1 shape
  * here.
@@ -17,7 +18,7 @@
 import { FUNDING_STATES } from './state.js';
 
 /** The current schema version. Bump with each migration added here. */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /** A migration: bring the previous version's rows to this version's shape. */
 export interface Migration {
@@ -29,12 +30,24 @@ export interface Migration {
   sql: string[];
 }
 
+// The supported-corridors cache keyed by (crypto, country); IF NOT EXISTS since freshSchema() and the v4->v5 migration share it.
+const SUPPORTED_CORRIDORS_TABLE =
+  'CREATE TABLE IF NOT EXISTS supported_corridors (' +
+  ' destination_currency_code TEXT NOT NULL,' +
+  ' country TEXT NOT NULL,' +
+  ' name TEXT NOT NULL,' +
+  ' fiat TEXT NOT NULL,' +
+  ' methods JSONB NOT NULL,' +
+  ' updated_at BIGINT NOT NULL,' +
+  ' PRIMARY KEY (destination_currency_code, country)' +
+  ')';
+
 /**
  * The ordered migration list.
  *
  * A fresh database is created at `SCHEMA_VERSION` directly by `freshSchema()`, so this list is
  * what an existing database walks through, one step at a time. The next migration appends
- * `{ from: 4, to: 5, sql: [...] }` and bumps `SCHEMA_VERSION`; `store.ts` needs no change.
+ * `{ from: 5, to: 6, sql: [...] }` and bumps `SCHEMA_VERSION`; `store.ts` needs no change.
  *
  * This chain is one-way. A build expecting v1 refuses a v2 database: the version check is
  * `!==`, deliberately, because reading a shape you do not understand is worse than not starting.
@@ -107,6 +120,12 @@ export const MIGRATIONS: readonly Migration[] = [
      */
     sql: ['ALTER TABLE funding_requests ADD COLUMN cancelled_at BIGINT'],
   },
+  {
+    from: 4,
+    to: 5,
+    // v4 -> v5: cache Meld's supported corridors for the bulk endpoint. Same shape as freshSchema.
+    sql: [SUPPORTED_CORRIDORS_TABLE],
+  },
 ];
 
 /**
@@ -168,6 +187,8 @@ export function freshSchema(): string[] {
     // The worker's claim scan orders by (created_at, id) within the non-terminal rows. Leading on
     // `status` lets the planner cut to those first.
     'CREATE INDEX funding_claim_scan ON funding_requests (status, created_at, id)',
+    // The supported-corridors cache. See the v4 -> v5 migration for the same statement.
+    SUPPORTED_CORRIDORS_TABLE,
   ];
 }
 

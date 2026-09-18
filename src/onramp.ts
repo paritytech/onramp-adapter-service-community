@@ -28,7 +28,7 @@ import {
 } from './contract.js';
 import { TERMINAL_STATES } from './funding/state.js';
 import type { FundingRecord } from './funding/types.js';
-import type { FundingStore } from './funding/store.js';
+import type { FundingStore, StoredMethod } from './funding/store.js';
 import type { FundingRail, MeldTransactionReader, RailName, RailRegistry } from './rail.js';
 import { DEFAULT_RAIL } from './rail.js';
 import { resolveDestination } from './meld/catalog.js';
@@ -38,8 +38,22 @@ import type { Corridor, CountryRow, Discovery } from './meld/discovery.js';
 /** Just the store surface onramp touches, injectable in a test. */
 export type FundingPort = Pick<
   FundingStore,
-  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel'
+  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel' | 'readCorridors'
 >;
+
+/** One corridor as the bulk endpoint serves it: the stored row without the internal keys. */
+export interface SupportedCorridorDto {
+  country: string;
+  name: string;
+  fiat: string;
+  methods: StoredMethod[];
+}
+
+/**
+ * How many missed routes passes retire a corridor from `GET /supported/corridors`. Rows are aged
+ * out of reads, never deleted. Three, not one, because a single failed pass is ordinary.
+ */
+const STALE_PASSES = 3;
 
 /** An injectable clock so tests can pin "now" without mocking time. */
 export type Clock = () => number;
@@ -83,6 +97,15 @@ export class Onramp {
     }
     // Fiat is resolved from the country's default corridor, so the buyer picks only a country.
     return this.discovery.corridorForCountry(country, code);
+  }
+
+  // Cached supported corridors for a crypto, read from the DB off Meld; only rows fresh within the last few passes.
+  async supportedCorridors(code: string): Promise<SupportedCorridorDto[]> {
+    resolveDestination(code);
+    // The rows are written by the routes pass, so that is the cadence staleness is measured in.
+    const freshAfter = this.clock() - this.cfg.supported.routes_interval_ms * STALE_PASSES;
+    const rows = await this.funding.readCorridors(code, freshAfter);
+    return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: r.methods }));
   }
 
   /** The countries this deployment can deliver a crypto to, for the region dropdown. */

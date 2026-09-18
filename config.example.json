@@ -102,5 +102,10 @@
     "enabled": true,
     "session_max_age_ms": 259200000,
     "refusal_retention_days": 90
+  },
+  "supported": {
+    "enabled": true,
+    "catalog_interval_ms": 86400000,
+    "routes_interval_ms": 7200000
   }
 }

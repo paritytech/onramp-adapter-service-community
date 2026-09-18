@@ -40,6 +40,14 @@ data:
         "api_key": { "mode": "file", "path": {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.meldApiKey.key | quote }} },
         "api_version": {{ .Values.meld.api_version | quote }},
         "timeout_ms": {{ int (.Values.meld.timeout_ms | default 8000) }},
+        {{- /*
+          One cache lifetime per upstream endpoint, on the scale Meld says each one moves. Each
+          must stay under the refresh interval meant to renew it, or config refuses the pair at
+          boot; see the `supported` block below and docs/configuration.md.
+        */}}
+        "countries_cache_ttl_ms": {{ int (.Values.meld.countries_cache_ttl_ms | default 21600000) }},
+        "defaults_cache_ttl_ms": {{ int (.Values.meld.defaults_cache_ttl_ms | default 21600000) }},
+        "routes_cache_ttl_ms": {{ int (.Values.meld.routes_cache_ttl_ms | default 900000) }},
         "boot_probe": {{ toJson .Values.meld.boot_probe }}
       },
       "auth": {
@@ -80,5 +88,10 @@ data:
         "enabled": {{ .Values.worker.enabled }},
         "session_max_age_ms": {{ int .Values.worker.session_max_age_ms }},
         "refusal_retention_days": {{ int .Values.worker.refusal_retention_days }}
+      },
+      "supported": {
+        "enabled": {{ .Values.supported.enabled }},
+        "catalog_interval_ms": {{ int .Values.supported.catalog_interval_ms }},
+        "routes_interval_ms": {{ int .Values.supported.routes_interval_ms }}
       }
     }

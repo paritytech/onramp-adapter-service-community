@@ -22,6 +22,7 @@
 import { Pool, types as pgTypes, type PoolClient, type PoolConfig } from 'pg';
 
 import type { FundingFailure } from '../contract.js';
+import type { CorridorDto } from '../meld/discovery.js';
 import type { RailName } from '../rail.js';
 import type { Secret } from '../secret.js';
 import type { FundingState } from './state.js';
@@ -92,6 +93,19 @@ export interface StoreConfig {
   /** Refuse a query that has run away rather than hold a connection for ever. */
   statementTimeoutMs: number;
   connectionTimeoutMs: number;
+}
+
+/** A stored corridor method: the client-facing subset of `MethodLimit`, no provider roster. */
+export type StoredMethod = CorridorDto['methods'][number];
+
+/** One supported-corridor row: a deliverable (crypto, country) with its fiat and methods. */
+export interface SupportedCorridorRow {
+  destination_currency_code: string;
+  country: string;
+  name: string;
+  fiat: string;
+  methods: StoredMethod[];
+  updated_at: number;
 }
 
 /** The outcome of a reservation attempt. See `reserve`. */
@@ -649,6 +663,27 @@ export class FundingStore {
     } finally {
       client.release();
     }
+  }
+
+  // Upsert one supported-corridor row (crypto, country); `updated_at` stamped here.
+  async upsertCorridor(row: Omit<SupportedCorridorRow, 'updated_at'>): Promise<void> {
+    await this.pool.query(
+      'INSERT INTO supported_corridors (destination_currency_code, country, name, fiat, methods, updated_at) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6) ' +
+        'ON CONFLICT (destination_currency_code, country) DO UPDATE SET ' +
+        'name = EXCLUDED.name, fiat = EXCLUDED.fiat, methods = EXCLUDED.methods, updated_at = EXCLUDED.updated_at',
+      [row.destination_currency_code, row.country, row.name, row.fiat, JSON.stringify(row.methods), Date.now()],
+    );
+  }
+
+  // Fresh supported corridors for one crypto, name-sorted; `freshAfter` ages out rows the refresh stopped touching (0 = all).
+  async readCorridors(code: string, freshAfter = 0): Promise<SupportedCorridorRow[]> {
+    const result = await this.pool.query<SupportedCorridorRow>(
+      'SELECT destination_currency_code, country, name, fiat, methods, updated_at FROM supported_corridors ' +
+        'WHERE destination_currency_code = $1 AND updated_at >= $2 ORDER BY name ASC, country ASC',
+      [code, freshAfter],
+    );
+    return result.rows;
   }
 
   /**

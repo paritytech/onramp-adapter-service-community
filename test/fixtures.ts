@@ -3,7 +3,7 @@ import { encodeAddress } from '@polkadot/util-crypto';
 import { parseConfig, type Config } from '../src/config.js';
 import { TERMINAL_STATES, type FundingState } from '../src/funding/state.js';
 import { mergeAdvance } from '../src/funding/merge.js';
-import type { FundingStore } from '../src/funding/store.js';
+import type { FundingStore, SupportedCorridorRow } from '../src/funding/store.js';
 import type { FundingRecord } from '../src/funding/types.js';
 import type { RailSessionInput } from '../src/rail.js';
 
@@ -74,6 +74,8 @@ export const rawConfig = (overrides: Record<string, unknown> = {}) => ({
     ssl: true,
   },
   worker: { interval_ms: 15_000, enabled: false },
+  // Off by default so a whole-service boot test does not start a refresh loop hitting the fake Meld.
+  supported: { enabled: false },
   ...overrides,
 });
 
@@ -203,6 +205,8 @@ export const fundingRecord = (overrides: Partial<FundingRecord> = {}): FundingRe
 export function fakeStore(initial: readonly FundingRecord[] = []) {
   const rows = new Map<string, FundingRecord>(initial.map((r) => [r.id, structuredClone(r)]));
   const leases = new Map<string, { by: string; until: number }>();
+  // In-memory supported-corridors cache, keyed `${code}|${country}`, mirroring the real table.
+  const corridors = new Map<string, SupportedCorridorRow>();
 
   /** The row already holding this record's (alias, product, reference), if any. */
   const held = (record: FundingRecord): FundingRecord | undefined =>
@@ -325,6 +329,14 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       rows.set(id, updated);
       return structuredClone(updated);
     }) satisfies FundingStore['update'],
+    upsertCorridor: async (row: Omit<SupportedCorridorRow, 'updated_at'>) => {
+      // A far-future stamp so a row is always "fresh" against any test clock's read window.
+      corridors.set(`${row.destination_currency_code}|${row.country}`, { ...structuredClone(row), updated_at: 2_000_000_000_000 });
+    },
+    readCorridors: async (code: string, freshAfter = 0) =>
+      [...corridors.values()]
+        .filter((r) => r.destination_currency_code === code && r.updated_at >= freshAfter)
+        .map((r) => structuredClone(r)),
     close: async () => undefined,
   };
 }

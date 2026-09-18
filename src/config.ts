@@ -259,10 +259,26 @@ const configSchema = z
          * has every provider enabled (a fully-provisioned production), and a mismatch otherwise.
          */
         discovery_scope: z.enum(['account', 'global']).default('account'),
-        /** How long a discovered corridor / country catalog stays fresh before a re-probe. The
-         *  crypto a catalog is built for is not configured here; it rides each request's
-         *  `destinationCurrencyCode`, validated against `DESTINATIONS`. */
-        supported_cache_ttl_ms: z.number().int().min(60_000).max(86_400_000).default(3_600_000),
+        /**
+         * One cache lifetime per endpoint, on the scale Meld's caching guide says each moves:
+         * countries and defaults rarely change (up to a week), routes carry the limits (minutes to
+         * hours). Defaults stay under the refresh intervals that renew them; see the `superRefine`.
+         *
+         * The crypto is not configured here; it rides each request's `destinationCurrencyCode`.
+         */
+        countries_cache_ttl_ms: z
+          .number()
+          .int()
+          .min(60_000)
+          .max(7 * 86_400_000)
+          .default(6 * 3_600_000),
+        defaults_cache_ttl_ms: z
+          .number()
+          .int()
+          .min(60_000)
+          .max(7 * 86_400_000)
+          .default(6 * 3_600_000),
+        routes_cache_ttl_ms: z.number().int().min(60_000).max(86_400_000).default(900_000),
       })
       .strict(),
     auth: z
@@ -507,9 +523,60 @@ const configSchema = z
           .default(90),
       })
       .strict(),
+
+    /**
+     * The background job behind `GET /supported/corridors`. Two cadences: the catalog pass reads
+     * the country list and each country's default fiat (rarely-changing), the routes pass reads the
+     * limits over that catalog. Splitting them is what makes the fast cadence affordable — routes
+     * no longer re-reads `defaults`, so a pass is one call per country rather than two.
+     */
+    supported: z
+      .object({
+        enabled: z.boolean().default(true),
+        /** Countries + default fiat. Also runs once at startup, before the first routes pass. */
+        catalog_interval_ms: z
+          .number()
+          .int()
+          .min(60_000)
+          .max(7 * 86_400_000)
+          .default(24 * 3_600_000),
+        /** Routes and their limits, over the catalog the pass above produced. */
+        routes_interval_ms: z
+          .number()
+          .int()
+          .min(60_000)
+          .max(86_400_000)
+          .default(2 * 3_600_000),
+      })
+      .strict()
+      // `.prefault({})` like `cors`/`rate_limit`: an absent block is the documented defaults.
+      .prefault({}),
   })
   .strict()
   .superRefine((cfg, ctx) => {
+    /**
+     * A cache lifetime must be shorter than the refresh meant to renew it. The refresh reads
+     * through the same caches, so a TTL at or above its interval means the pass is served the copy
+     * the previous pass wrote and never reaches Meld: a refresh loop that refreshes nothing.
+     *
+     * `>=` because `fresh` is inclusive: at exactly equal the entry still hits.
+     */
+    const renewable = (ttl: number, ttlPath: string, interval: number, intervalPath: string): void => {
+      if (cfg.supported.enabled && ttl >= interval) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['meld', ttlPath],
+          message:
+            `meld.${ttlPath} (${String(ttl)}ms) must be shorter than supported.${intervalPath} ` +
+            `(${String(interval)}ms), or the refresh pass is served its own cached copy and never ` +
+            `re-reads Meld.`,
+        });
+      }
+    };
+    renewable(cfg.meld.countries_cache_ttl_ms, 'countries_cache_ttl_ms', cfg.supported.catalog_interval_ms, 'catalog_interval_ms');
+    renewable(cfg.meld.defaults_cache_ttl_ms, 'defaults_cache_ttl_ms', cfg.supported.catalog_interval_ms, 'catalog_interval_ms');
+    renewable(cfg.meld.routes_cache_ttl_ms, 'routes_cache_ttl_ms', cfg.supported.routes_interval_ms, 'routes_interval_ms');
+
     /**
      * Parse a URL that a field-level `z.url()` has already looked at, or give up quietly.
      *
