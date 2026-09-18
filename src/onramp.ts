@@ -49,6 +49,12 @@ export interface SupportedCorridorDto {
   methods: StoredMethod[];
 }
 
+/**
+ * How many missed routes passes retire a corridor from `GET /supported/corridors`. Rows are aged
+ * out of reads, never deleted. Three, not one, because a single failed pass is ordinary.
+ */
+const STALE_PASSES = 3;
+
 /** An injectable clock so tests can pin "now" without mocking time. */
 export type Clock = () => number;
 
@@ -93,10 +99,11 @@ export class Onramp {
     return this.discovery.corridorForCountry(country, code);
   }
 
-  // Cached supported corridors for a crypto, read from the DB off Meld; only rows fresh within the last few intervals.
+  // Cached supported corridors for a crypto, read from the DB off Meld; only rows fresh within the last few passes.
   async supportedCorridors(code: string): Promise<SupportedCorridorDto[]> {
     resolveDestination(code);
-    const freshAfter = this.clock() - this.cfg.supported.interval_ms * 3;
+    // The rows are written by the routes pass, so that is the cadence staleness is measured in.
+    const freshAfter = this.clock() - this.cfg.supported.routes_interval_ms * STALE_PASSES;
     const rows = await this.funding.readCorridors(code, freshAfter);
     return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: r.methods }));
   }

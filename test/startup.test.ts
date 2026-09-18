@@ -427,8 +427,19 @@ afterEach(async () => {
     const baseUrl = `http://127.0.0.1:${String(typeof address === 'object' && address ? address.port : 0)}`;
 
     const path = await writeConfig('supported-on', baseUrl);
-    const raw = JSON.parse(await readFile(path, 'utf8')) as { supported?: Record<string, unknown> };
-    raw.supported = { enabled: true, interval_ms: 60_000 };
+    const raw = JSON.parse(await readFile(path, 'utf8')) as {
+      supported?: Record<string, unknown>;
+      meld?: Record<string, unknown>;
+    };
+    raw.supported = { enabled: true, catalog_interval_ms: 120_000, routes_interval_ms: 120_000 };
+    // Lifetimes must stay under the intervals or config refuses the pair, and 60s is their floor,
+    // hence two-minute intervals. This test gates on the refresh actually calling Meld.
+    raw.meld = {
+      ...raw.meld,
+      countries_cache_ttl_ms: 60_000,
+      defaults_cache_ttl_ms: 60_000,
+      routes_cache_ttl_ms: 60_000,
+    };
     await writeFile(path, JSON.stringify(raw));
 
     handle = await start(path, { write: () => undefined });

@@ -73,7 +73,7 @@ export async function start(
   // reads through the client's keyed GET so Meld returns this account's providers (sandbox -> its
   // onboarded set); the
   // provider is Meld's to choose at quote time and is never named here. `global` reads unkeyed for
-  // a fully-provisioned production. Lazily populated and cached for `supported_cache_ttl_ms`.
+  // a fully-provisioned production. Lazily populated, each endpoint cached on its own lifetime.
   const discoveryGet =
     cfg.meld.discovery_scope === 'global' ? meld.publicGet.bind(meld) : meld.authedGet.bind(meld);
   // The country list is always the global one, whatever `discovery_scope` says; it feeds a
@@ -84,7 +84,11 @@ export async function start(
   // answers whether the crypto actually routes there. See MeldDiscovery's header.
   const discovery = new MeldDiscovery(
     discoveryGet,
-    cfg.meld.supported_cache_ttl_ms,
+    {
+      countries: cfg.meld.countries_cache_ttl_ms,
+      defaults: cfg.meld.defaults_cache_ttl_ms,
+      routes: cfg.meld.routes_cache_ttl_ms,
+    },
     undefined,
     meld.publicGet.bind(meld),
   );
@@ -229,9 +233,8 @@ export async function start(
           discovery,
           funding,
           SUPPORTED_REFRESH_CRYPTOS,
-          cfg.supported.interval_ms,
-          // warn, not info: a persistently failing refresh silently staling the cache must be
-          // visible to an operator filtering to warn and above.
+          { catalogMs: cfg.supported.catalog_interval_ms, routesMs: cfg.supported.routes_interval_ms },
+          // warn, not info: a silently staling cache must reach an operator filtering to warn.
           (message) => {
             server.log.warn(message);
           },

@@ -77,6 +77,11 @@ function fakeDiscovery(opts: {
       return { country, fiat: 'CAD', crypto, methods: opts.methods ?? [method()] };
     },
     countries: async (_crypto): Promise<CountryRow[]> => opts.rows ?? [{ country: 'US', name: 'United States' }],
+    // `corridorForCountry` above answers with a fixed fiat, so this agrees with it.
+    defaultFiat: async (_country): Promise<string> => {
+      if (opts.corridorThrows) throw new Error('meld catalog unreachable');
+      return 'CAD';
+    },
   };
 }
 

@@ -160,13 +160,26 @@ export interface Discovery {
   corridor(country: string, fiat: string, crypto: string): Promise<Corridor>;
   corridorForCountry(country: string, crypto: string): Promise<Corridor>;
   countries(crypto: string): Promise<CountryRow[]>;
+  /** A country's default fiat, `''` when Meld names none. Split out so a caller that knows the
+   *  fiat never pays for the lookup, and so each half caches on its own lifetime. */
+  defaultFiat(country: string): Promise<string>;
+}
+
+/** One cache lifetime per endpoint, on the scale Meld's caching guide says each one moves. */
+export interface DiscoveryTtls {
+  /** `supported/countries`. Up to a week. */
+  countries: number;
+  /** `defaults/{country}/{category}`. Up to a week. */
+  defaults: number;
+  /** `supported/routes`. Minutes to hours; this one gates a charge. */
+  routes: number;
 }
 
 /**
  * Discovery client with a per-corridor and per-catalog cache.
  *
  * Cheap by construction: the charge gate asks for one corridor at a time (`corridor`), each
- * cached for `ttlMs`, so once the first probe for a country resolves the rest are served from
+ * cached for `ttls.routes`, so once the first probe for a country resolves the rest are served from
  * memory (concurrent probes before that first resolves are not de-duped). The country dropdown
  * (`countries`) is a single upstream call, memoised whole, keyed by crypto.
  *
@@ -192,11 +205,12 @@ export class MeldDiscovery implements Discovery {
   // Keyed by crypto only to mirror `countries(crypto)`'s signature; the list itself is
   // crypto-independent now, so the per-crypto slots hold identical data, a harmless small cost.
   private readonly countriesCache = new Map<string, CacheEntry<CountryRow[]>>();
+  private readonly defaultsCache = new Map<string, CacheEntry<string>>();
 
   constructor(
     /** Corridor GET, scoped per `discovery_scope`: keyed (this account's providers) by default. */
     private readonly get: AuthedGet,
-    private readonly ttlMs: number,
+    private readonly ttls: DiscoveryTtls,
     private readonly clock: () => number = Date.now,
     /**
      * Country-catalog GET. Defaults to `get` so a caller that has only one transport (every test
@@ -206,9 +220,9 @@ export class MeldDiscovery implements Discovery {
     private readonly catalogGet: AuthedGet = get,
   ) {}
 
-  private fresh<T>(entry: CacheEntry<T> | undefined): T | undefined {
+  private fresh<T>(entry: CacheEntry<T> | undefined, ttlMs: number): T | undefined {
     if (entry === undefined) return undefined;
-    return this.clock() - entry.at <= this.ttlMs ? entry.value : undefined;
+    return this.clock() - entry.at <= ttlMs ? entry.value : undefined;
   }
 
   /**
@@ -221,10 +235,10 @@ export class MeldDiscovery implements Discovery {
    * lived. Sweeping on write keeps the map proportional to what is actually live, and costs a pass
    * over a map whose whole purpose is to be small.
    */
-  private evictExpired<T>(cache: Map<string, CacheEntry<T>>): void {
+  private evictExpired<T>(cache: Map<string, CacheEntry<T>>, ttlMs: number): void {
     const now = this.clock();
     for (const [key, entry] of cache) {
-      if (now - entry.at > this.ttlMs) cache.delete(key);
+      if (now - entry.at > ttlMs) cache.delete(key);
     }
   }
 
@@ -235,7 +249,7 @@ export class MeldDiscovery implements Discovery {
    */
   async corridor(country: string, fiat: string, crypto: string): Promise<Corridor> {
     const key = `${crypto}|${country}|${fiat}`;
-    const hit = this.fresh(this.corridorCache.get(key));
+    const hit = this.fresh(this.corridorCache.get(key), this.ttls.routes);
     if (hit !== undefined) return hit;
 
     const raw = await this.get(
@@ -246,7 +260,7 @@ export class MeldDiscovery implements Discovery {
     // Parsing the array as a whole (`z.array(routeEntry).safeParse`) fails as a whole: one element
     // missing `partner`, or a 200 carrying an unexpected body, would zero the entire corridor. That
     // zero is indistinguishable from Meld's genuine "not offered" (`[]`), so the gate would refuse
-    // `CURRENCY_UNSUPPORTED` and the cache would memoise that refusal for up to `ttlMs`. A parse
+    // `CURRENCY_UNSUPPORTED` and the cache would memoise that refusal for up to `ttls.routes`. A parse
     // miss is closer to a transport miss than to an answer, and a transport miss is not cached.
     //
     // So keep the entries that parse, and treat a non-array body or any dropped element as
@@ -298,7 +312,7 @@ export class MeldDiscovery implements Discovery {
 
     const corridor: Corridor = { country, fiat, crypto, methods: [...byMethod.values()] };
     if (trustworthy) {
-      this.evictExpired(this.corridorCache);
+      this.evictExpired(this.corridorCache, this.ttls.routes);
       this.corridorCache.set(key, { at: this.clock(), value: corridor });
     }
     return corridor;
@@ -310,11 +324,11 @@ export class MeldDiscovery implements Discovery {
    * the corridor probe is not. The list is not filtered by whether the crypto routes there,
    * because that is answered per selection by `corridorForCountry`; front-loading a probe per
    * country would be hundreds of calls for a list the buyer mostly scrolls past. Memoised whole;
-   * refreshed after `ttlMs`. (`crypto` only keys the cache and validates the caller; the catalogue
+   * refreshed after `ttls.countries`. (`crypto` only keys the cache and validates the caller; the catalogue
    * itself is crypto-independent.)
    */
   async countries(crypto: string): Promise<CountryRow[]> {
-    const hit = this.fresh(this.countriesCache.get(crypto));
+    const hit = this.fresh(this.countriesCache.get(crypto), this.ttls.countries);
     if (hit !== undefined) return hit;
 
     const env = countriesEnvelope.safeParse(
@@ -325,10 +339,10 @@ export class MeldDiscovery implements Discovery {
       .sort((a, b) => a.name.localeCompare(b.name));
     // Cached only when the envelope parsed, for the reason `corridor` does not cache a parse miss:
     // an unparseable body produced the same empty list as a real one, and memoising it means the
-    // region dropdown stays empty for up to `ttlMs` after the body is well-formed again. An
+    // region dropdown stays empty for up to `ttls.countries` after the body is well-formed again. An
     // envelope that parsed to an empty or absent `countries` is a real answer and is cached.
     if (env.success) {
-      this.evictExpired(this.countriesCache);
+      this.evictExpired(this.countriesCache, this.ttls.countries);
       this.countriesCache.set(crypto, { at: this.clock(), value: catalog });
     }
     return catalog;
@@ -340,16 +354,39 @@ export class MeldDiscovery implements Discovery {
    * means "not deliverable here"; the caller then steers the buyer to another method or to crypto.
    */
   async corridorForCountry(country: string, crypto: string): Promise<Corridor> {
+    const fiat = await this.defaultFiat(country);
+    if (fiat === '') return { country, fiat: '', crypto, methods: [] };
+    return this.corridor(country, fiat, crypto);
+  }
+
+  /**
+   * A country's default fiat. `''` means Meld named none, or the call failed.
+   *
+   * Only a real answer is cached: memoising the `''` from a failed or unparseable response would
+   * pin a working country to "not deliverable" for a whole TTL.
+   */
+  async defaultFiat(country: string): Promise<string> {
+    const hit = this.fresh(this.defaultsCache.get(country), this.ttls.defaults);
+    if (hit !== undefined) return hit;
+
     let fiat = '';
+    let real = false;
     try {
       const d = defaultsEnvelope.safeParse(
         await this.get(`/network-partner/defaults/${encodeURIComponent(country)}/${CATEGORY}`),
       );
-      fiat = d.success ? (d.data.currencyCode ?? '') : '';
+      if (d.success) {
+        fiat = d.data.currencyCode ?? '';
+        real = true;
+      }
     } catch {
       fiat = '';
     }
-    if (fiat === '') return { country, fiat: '', crypto, methods: [] };
-    return this.corridor(country, fiat, crypto);
+    // A parsed envelope naming no currency is a real answer, and is cached.
+    if (real) {
+      this.evictExpired(this.defaultsCache, this.ttls.defaults);
+      this.defaultsCache.set(country, { at: this.clock(), value: fiat });
+    }
+    return fiat;
   }
 }

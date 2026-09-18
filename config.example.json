@@ -105,6 +105,7 @@
   },
   "supported": {
     "enabled": true,
-    "interval_ms": 43200000
+    "catalog_interval_ms": 86400000,
+    "routes_interval_ms": 7200000
   }
 }
