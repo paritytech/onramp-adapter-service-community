@@ -507,6 +507,16 @@ const configSchema = z
           .default(90),
       })
       .strict(),
+
+    // The background job that caches Meld's supported corridors for the bulk endpoint; 12h since the set moves rarely.
+    supported: z
+      .object({
+        enabled: z.boolean().default(true),
+        interval_ms: z.number().int().min(60_000).max(86_400_000).default(12 * 3_600_000),
+      })
+      .strict()
+      // `.prefault({})` like `cors`/`rate_limit`: an absent block is the documented defaults.
+      .prefault({}),
   })
   .strict()
   .superRefine((cfg, ctx) => {

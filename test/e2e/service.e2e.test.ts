@@ -226,6 +226,8 @@ async function writeConfig(
       opts.worker === undefined
         ? { interval_ms: 15000, enabled: false, session_max_age_ms: 86400000 }
         : { ...opts.worker, enabled: true },
+    // Off like the worker, so a spawned boot does not enumerate the fake Meld on a background loop.
+    supported: { enabled: false },
   };
   const path = join(dir, 'config.json');
   await writeFile(path, JSON.stringify(config));

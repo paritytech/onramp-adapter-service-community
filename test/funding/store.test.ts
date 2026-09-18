@@ -979,6 +979,63 @@ describe('surviving a lost connection', () => {
   });
 });
 
+describe('the supported-corridors cache', () => {
+  const pix = { paymentMethodType: 'PIX', category: 'bank' as const, min: '10', max: '5000', currency: 'BRL' };
+
+  it('inserts a corridor and reads it back, scoped by crypto and name-sorted', async () => {
+    await withStore(async (store) => {
+      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', country: 'US', name: 'United States', fiat: 'USD', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      // A different crypto's row must not leak into this read.
+      await store.upsertCorridor({ destination_currency_code: 'USDC_ASSETHUB', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+
+      const rows = await store.readCorridors('DOT_ASSETHUB');
+      expect(rows.map((r) => r.country)).toEqual(['BR', 'US']);
+      expect(rows[0]).toMatchObject({ country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      expect(typeof rows[0]?.updated_at).toBe('number');
+    });
+  });
+
+  it('updates an existing row on conflict rather than duplicating it, and refreshes updated_at', async () => {
+    await withStore(async (store) => {
+      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      const first = (await store.readCorridors('DOT_ASSETHUB'))[0]?.updated_at ?? 0;
+
+      // A gap so the second stamp is a later millisecond; drop `updated_at = EXCLUDED.updated_at`
+      // from the ON CONFLICT SET and this row's timestamp would stay frozen at `first`.
+      await new Promise((resolve) => setTimeout(resolve, 3));
+      await store.upsertCorridor({
+        destination_currency_code: 'DOT_ASSETHUB',
+        country: 'BR',
+        name: 'Brasil',
+        fiat: 'BRL',
+        methods: [{ ...pix, min: '20' }],
+      });
+
+      const rows = await store.readCorridors('DOT_ASSETHUB');
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ name: 'Brasil', methods: [{ ...pix, min: '20' }] });
+      expect(rows[0]?.updated_at).toBeGreaterThan(first);
+    });
+  });
+
+  it('returns an empty list for a crypto with no cached corridors', async () => {
+    await withStore(async (store) => {
+      expect(await store.readCorridors('DOT_ASSETHUB')).toEqual([]);
+    });
+  });
+
+  it('hides rows older than the freshness cutoff, so a stale cache ages out', async () => {
+    await withStore(async (store) => {
+      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+
+      // A cutoff in the past keeps the just-written row; one in the future hides it.
+      expect((await store.readCorridors('DOT_ASSETHUB', 0)).map((r) => r.country)).toEqual(['BR']);
+      expect(await store.readCorridors('DOT_ASSETHUB', Date.now() + 60_000)).toEqual([]);
+    });
+  });
+});
+
 describe('closing the store', () => {
   it('is idempotent, because the shutdown path that calls it promises to be', async () => {
     // SIGTERM and SIGINT are owned separately, so `close` can be asked to run twice. The second

@@ -232,6 +232,35 @@ describe('Onramp.supported / supportedCountries', () => {
   });
 });
 
+describe('Onramp.supportedCorridors', () => {
+  const pix = { paymentMethodType: 'PIX', category: 'bank' as const, min: '10', max: '5000', currency: 'BRL' };
+
+  it('reads cached corridors from the store, off Meld, without needing discovery', async () => {
+    const store = fakeStore();
+    await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+    // No discovery wired: the bulk read is DB-backed.
+    const svc = new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'funding-1', undefined);
+
+    expect(await svc.supportedCorridors('DOT_ASSETHUB')).toEqual([
+      { country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] },
+    ]);
+  });
+
+  it('hides a stale corridor whose row predates the freshness window', async () => {
+    const store = fakeStore();
+    await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+    // A clock far past the row's stamp (2e12) puts it outside `now - 3*interval`, so it is filtered.
+    const svc = new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => 3_000_000_000_000, () => 'funding-1', undefined);
+
+    expect(await svc.supportedCorridors('DOT_ASSETHUB')).toEqual([]);
+  });
+
+  it('refuses an unknown crypto before reading', async () => {
+    const svc = build(undefined);
+    expect((await refusalOf(() => svc.supportedCorridors('NOPE'))).tag).toBe('WrongAssetOrChain');
+  });
+});
+
 describe('a refusal from discovery is not an outage', () => {
   /**
    * The bare `catch` took everything, including a deliberate `Refusal`.

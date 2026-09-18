@@ -53,6 +53,7 @@ describe('parseConfig', () => {
     ['rate_limit.per_address_max', ['rate_limit', 'per_address_max'], 0, undefined],
     ['worker.interval_ms', ['worker', 'interval_ms'], 999, 300_001],
     ['worker.session_max_age_ms', ['worker', 'session_max_age_ms'], 59_999, 30 * 24 * 3_600_000 + 1],
+    ['supported.interval_ms', ['supported', 'interval_ms'], 59_999, 86_400_001],
     ['auth.personhood.challenge_ttl_ms', ['auth', 'personhood', 'challenge_ttl_ms'], 999, 300_001],
     ['auth.personhood.token_ttl_s', ['auth', 'personhood', 'token_ttl_s'], 29, 3_601],
   ])('bounds %s at both ends', (_label, path, tooLow, tooHigh) => {
@@ -842,6 +843,19 @@ describe('parseConfig', () => {
 
     expect(parseConfig(empty).cors).toEqual(parseConfig(omitted).cors);
     expect(parseConfig(empty).rate_limit).toEqual(parseConfig(omitted).rate_limit);
+  });
+
+  it('applies the supported-refresh defaults whether the block is omitted or empty', () => {
+    // `.prefault({})` like cors/rate_limit: an absent or empty block is the documented defaults.
+    const omitted = rawConfig() as Record<string, unknown>;
+    delete omitted.supported;
+    expect(parseConfig(omitted).supported).toEqual({ enabled: true, interval_ms: 12 * 3_600_000 });
+    expect(parseConfig(rawConfig({ supported: {} })).supported).toEqual({ enabled: true, interval_ms: 12 * 3_600_000 });
+  });
+
+  it('refuses an unknown field in the supported block', () => {
+    // `.strict()`, so a typo is a boot failure rather than a silently ignored setting.
+    expect(() => parseConfig(rawConfig({ supported: { nope: true } }))).toThrow(/supported/);
   });
 
   it('refuses the retired rate_limit.max rather than reinterpreting it', () => {

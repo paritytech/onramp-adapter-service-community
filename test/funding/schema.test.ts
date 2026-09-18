@@ -322,9 +322,13 @@ describe('the real migration chain', () => {
       // up, and forgetting an entry does not silently weaken the test. The migration then tries to
       // add a column that is already there and this fails loudly, which is how the omission is
       // caught.
-      const v1 = freshSchema().map((sql) =>
-        sql.replace(' country TEXT,', '').replace(' reason TEXT,', '').replace(' cancelled_at BIGINT,', ''),
-      );
+      // supported_corridors is a v5 table, so a v1 database has none: filter it out before stripping
+      // the later funding_requests columns, or its own ` country TEXT,` would be mangled too.
+      const v1 = freshSchema()
+        .filter((sql) => !sql.includes('supported_corridors'))
+        .map((sql) =>
+          sql.replace(' country TEXT,', '').replace(' reason TEXT,', '').replace(' cancelled_at BIGINT,', ''),
+        );
       for (const sql of v1) await raw(schema, sql);
       await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
       await raw(schema, 'INSERT INTO schema_migrations (version, applied_at) VALUES (1, 0)');
@@ -357,12 +361,22 @@ describe('the real migration chain', () => {
       await store.create(fundingRecord({ id: 'live', status: 'session_opened', client_reference: 'ref-live' }));
       const withdrawn = await store.cancel('alias-abc', 'app.dot', 'live', 99);
       expect(withdrawn?.cancelled_at).toBe(99);
+      // v5's table is reachable through the store, not just present: the upsert and read prove the
+      // migration landed somewhere the code can use.
+      await store.upsertCorridor({
+        destination_currency_code: 'DOT_ASSETHUB',
+        country: 'BR',
+        name: 'Brazil',
+        fiat: 'BRL',
+        methods: [{ paymentMethodType: 'PIX', category: 'bank', min: '10', max: '5000', currency: 'BRL' }],
+      });
+      expect((await store.readCorridors('DOT_ASSETHUB')).map((c) => c.country)).toEqual(['BR']);
       await store.close();
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5]);
     } finally {
       await dropSchema(schema);
     }
