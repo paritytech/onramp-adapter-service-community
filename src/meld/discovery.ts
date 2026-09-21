@@ -160,8 +160,9 @@ export interface Discovery {
   corridor(country: string, fiat: string, crypto: string): Promise<Corridor>;
   corridorForCountry(country: string, crypto: string): Promise<Corridor>;
   countries(crypto: string): Promise<CountryRow[]>;
-  /** A country's default fiat, `''` when Meld names none. Split out so a caller that knows the
-   *  fiat never pays for the lookup, and so each half caches on its own lifetime. */
+  /** A country's default fiat, `''` when Meld names none, throwing when the call itself failed.
+   *  Split out so a caller that knows the fiat never pays for the lookup, and so each half caches on
+   *  its own lifetime. */
   defaultFiat(country: string): Promise<string>;
 }
 
@@ -354,39 +355,35 @@ export class MeldDiscovery implements Discovery {
    * means "not deliverable here"; the caller then steers the buyer to another method or to crypto.
    */
   async corridorForCountry(country: string, crypto: string): Promise<Corridor> {
-    const fiat = await this.defaultFiat(country);
+    // The per-selection path swallows a transient defaults failure as "not deliverable right now".
+    let fiat: string;
+    try {
+      fiat = await this.defaultFiat(country);
+    } catch {
+      return { country, fiat: '', crypto, methods: [] };
+    }
     if (fiat === '') return { country, fiat: '', crypto, methods: [] };
     return this.corridor(country, fiat, crypto);
   }
 
   /**
-   * A country's default fiat. `''` means Meld named none, or the call failed.
+   * A country's default fiat. `''` means Meld named none. Throws when the call itself failed or was
+   * unparseable, so a caller can tell a transient failure apart from a real "no currency" and hold
+   * the last known fiat rather than dropping the country.
    *
-   * Only a real answer is cached: memoising the `''` from a failed or unparseable response would
-   * pin a working country to "not deliverable" for a whole TTL.
+   * Only a real answer is cached: a thrown failure pins nothing.
    */
   async defaultFiat(country: string): Promise<string> {
     const hit = this.fresh(this.defaultsCache.get(country), this.ttls.defaults);
     if (hit !== undefined) return hit;
 
-    let fiat = '';
-    let real = false;
-    try {
-      const d = defaultsEnvelope.safeParse(
-        await this.get(`/network-partner/defaults/${encodeURIComponent(country)}/${CATEGORY}`),
-      );
-      if (d.success) {
-        fiat = d.data.currencyCode ?? '';
-        real = true;
-      }
-    } catch {
-      fiat = '';
-    }
-    // A parsed envelope naming no currency is a real answer, and is cached.
-    if (real) {
-      this.evictExpired(this.defaultsCache, this.ttls.defaults);
-      this.defaultsCache.set(country, { at: this.clock(), value: fiat });
-    }
+    const d = defaultsEnvelope.safeParse(
+      await this.get(`/network-partner/defaults/${encodeURIComponent(country)}/${CATEGORY}`),
+    );
+    if (!d.success) throw new Error(`unparseable defaults response for ${country}`);
+    const fiat = d.data.currencyCode ?? '';
+    this.evictExpired(this.defaultsCache, this.ttls.defaults);
+    this.defaultsCache.set(country, { at: this.clock(), value: fiat });
     return fiat;
   }
 }

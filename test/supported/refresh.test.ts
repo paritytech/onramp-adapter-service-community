@@ -152,17 +152,52 @@ describe('refreshCatalog', () => {
   });
 
   it('reports a defaults-wide outage as a failed read, not an empty catalog', async () => {
-    // `defaultFiat` returns '' for a failed call, so every country looks fiat-less. Returning []
-    // would retire every corridor; the caller must keep what it has.
+    // Every /defaults call failing looks like "no country has a fiat". Returning [] would retire
+    // every corridor; the caller must keep what it has.
     const log = vi.fn();
     const catalog = await refreshCatalog(
-      disco({ countries: [{ country: 'BR', name: 'Brazil' }, { country: 'US', name: 'US' }], fiat: async () => '' }),
+      disco({
+        countries: [
+          { country: 'BR', name: 'Brazil' },
+          { country: 'US', name: 'US' },
+        ],
+        fiat: async () => {
+          throw new Error('defaults down');
+        },
+      }),
       CRYPTO,
       log,
     );
 
     expect(catalog).toBeUndefined();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('no default fiat for any'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('could not resolve any default fiat'));
+  });
+
+  it('keeps a country\'s last-known entry when its defaults call fails, but drops it when Meld says no fiat', async () => {
+    const previous = [
+      { country: 'GB', name: 'United Kingdom', fiat: 'GBP' },
+      { country: 'FR', name: 'France', fiat: 'EUR' },
+    ];
+    const log = vi.fn();
+    const catalog = await refreshCatalog(
+      disco({
+        countries: [
+          { country: 'GB', name: 'United Kingdom' },
+          { country: 'FR', name: 'France' },
+        ],
+        fiat: async (c) => {
+          if (c === 'GB') throw new Error('429'); // transient failure -> keep the last known
+          return ''; // FR genuinely has no fiat now -> drop it
+        },
+      }),
+      CRYPTO,
+      log,
+      undefined,
+      previous,
+    );
+
+    expect(catalog).toEqual([{ country: 'GB', name: 'United Kingdom', fiat: 'GBP' }]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('keeping the last known'));
   });
 
   it('reports a non-Error rejection without losing what it was', async () => {
@@ -470,9 +505,9 @@ describe('startSupportedRefresh', () => {
     await refresh.stop(0);
   });
 
-  it('logs and keeps going when a pass throws something other than the stop abort', async () => {
-    // A logger that throws is the reachable way in: the first call escapes `refreshCatalog`, the
-    // loop catches it, and the second call reports it rather than rejecting `loop`.
+  it('logs and gives up cleanly when the boot pass throws, without rejecting the loop', async () => {
+    // A logger that throws is the reachable fault. At boot it escapes the pass and the boot guard
+    // reports it rather than rejecting `loop`, which would make shutdown itself throw.
     let thrown = false;
     const log = vi.fn((_message: string) => {
       if (thrown) return;
@@ -484,6 +519,64 @@ describe('startSupportedRefresh', () => {
     await vi.waitFor(() => {
       expect(log).toHaveBeenCalledWith(expect.stringContaining('loop stopped: sink is down'));
     });
+    await refresh.stop(0);
+  });
+
+  it('keeps ticking after a periodic pass throws, rather than dying on the first one', async () => {
+    // The reachable fault is a throwing logger, fired once inside a periodic catalog pass. The loop
+    // must report it and run the next tick, not stop learning for good.
+    let threw = false;
+    const log = vi.fn((_message: string) => {
+      if (threw) return;
+      threw = true;
+      throw new Error('sink is down');
+    });
+    let calls = 0;
+    const countries = vi.fn(async () => {
+      calls += 1;
+      // Boot and later ticks succeed; the first periodic tick fails so its log throws.
+      if (calls === 2) throw new Error('meld blip');
+      return [] as CountryRow[];
+    });
+    const refresh = startSupportedRefresh(
+      { ...disco({}), countries },
+      fakeStore(),
+      [CRYPTO],
+      { catalogMs: 5, routesMs: 100_000 },
+      log,
+    );
+
+    await vi.waitFor(() => {
+      // Reported the fault and kept going: the catalog pass ran again after the throw.
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('pass failed, continuing'));
+      expect(calls).toBeGreaterThanOrEqual(3);
+    });
+    await refresh.stop(0);
+  });
+
+  it('runs one pass at a time across both loops: a hung catalog pass holds the routes pass', async () => {
+    let catalogCalls = 0;
+    const hang = new Promise<CountryRow[]>(() => undefined); // never resolves
+    const countries = vi.fn(() => {
+      catalogCalls += 1;
+      // Boot succeeds; the first periodic catalog pass hangs while holding the shared lock.
+      return catalogCalls === 1 ? Promise.resolve([{ country: 'BR', name: 'Brazil' }]) : hang;
+    });
+    const corridorFn = vi.fn(async () => corridor('BR'));
+    const refresh = startSupportedRefresh(
+      { ...disco({ corridor: corridorFn }), countries },
+      fakeStore(),
+      [CRYPTO],
+      { catalogMs: 5, routesMs: 5 },
+      () => undefined,
+    );
+
+    // Let boot and the first ticks settle, then the catalog pass is hung holding the lock.
+    await new Promise((r) => setTimeout(r, 60));
+    const probesWhileHung = corridorFn.mock.calls.length;
+    await new Promise((r) => setTimeout(r, 60));
+    // No routes probe runs while the catalog pass holds the lock.
+    expect(corridorFn.mock.calls.length).toBe(probesWhileHung);
     await refresh.stop(0);
   });
 

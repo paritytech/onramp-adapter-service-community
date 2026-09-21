@@ -38,6 +38,7 @@ export async function refreshCatalog(
   crypto: string,
   log: (message: string) => void,
   signal?: AbortSignal,
+  previous: readonly CatalogEntry[] = [],
 ): Promise<CatalogEntry[] | undefined> {
   let countries;
   try {
@@ -49,24 +50,32 @@ export async function refreshCatalog(
 
   // Through a call, not the property: TS narrows `signal.aborted` to false after the first check.
   const stopped = (): boolean => signal?.aborted === true;
+  const known = new Map(previous.map((entry) => [entry.country, entry]));
 
   const catalog: CatalogEntry[] = [];
+  let failed = 0;
   for (const { country, name } of countries) {
     if (stopped()) break;
     try {
       const fiat = await discovery.defaultFiat(country);
-      // No fiat, no routes URL to build. Not an error.
+      // Meld names no fiat here: legitimately not deliverable, so let the row drop.
       if (fiat === '') continue;
       catalog.push({ country, name, fiat });
     } catch (error) {
-      log(`supported refresh could not resolve the default fiat for ${country}: ${message(error)}`);
+      // The defaults call failed. Keep the last known entry rather than dropping a good country over a blip.
+      failed += 1;
+      const prior = known.get(country);
+      if (prior !== undefined) catalog.push(prior);
+      log(`supported refresh could not resolve the default fiat for ${country}, keeping the last known: ${message(error)}`);
     }
   }
-  // `defaultFiat` reports a failed call as `''`, so a defaults-wide outage looks like "no country
-  // has a fiat". Indistinguishable from a real empty catalog, and far likelier, so treat it as a
-  // failed read: the caller keeps its previous catalog instead of retiring every corridor.
-  if (countries.length > 0 && catalog.length === 0) {
-    log(`supported refresh resolved no default fiat for any of ${String(countries.length)} countries in ${crypto}`);
+  // A pass cut short by shutdown returns a partial or empty list; keep the previous catalog rather
+  // than clobbering it with a truncated one.
+  if (stopped()) return undefined;
+  // A defaults-wide failure with nothing to fall back on is indistinguishable from a real empty
+  // catalog and far likelier, so treat it as a failed read: the caller keeps its previous catalog.
+  if (countries.length > 0 && catalog.length === 0 && failed > 0) {
+    log(`supported refresh could not resolve any default fiat across ${String(countries.length)} countries in ${crypto}`);
     return undefined;
   }
   return catalog;
@@ -110,8 +119,9 @@ export async function refreshRoutes(
 /**
  * Drive both passes on their own intervals; returns `stop()`.
  *
- * At boot the catalog pass runs first so the routes pass has something to walk. Each loop sleeps
- * its interval *after* its previous pass returns, so passes never overlap and never burst.
+ * At boot the catalog pass runs first so the routes pass has something to walk. Each loop sleeps its
+ * interval after its previous pass returns, and a shared lock serialises the two loops, so a catalog
+ * pass and a routes pass never hit Meld at the same time and no pass overlaps another.
  * `{ ref: false }` is `timer.unref()`; one `AbortController` serves both loops and every pass.
  */
 export function startSupportedRefresh(
@@ -130,7 +140,8 @@ export function startSupportedRefresh(
   const catalogPass = async (): Promise<void> => {
     for (const crypto of cryptos) {
       if (signal.aborted) break;
-      const catalog = await refreshCatalog(discovery, crypto, log, signal);
+      // The previous catalog feeds the carry-forward for a country whose defaults call fails.
+      const catalog = await refreshCatalog(discovery, crypto, log, signal, catalogs.get(crypto) ?? []);
       // Keep the previous catalog on a failed read.
       if (catalog !== undefined) catalogs.set(crypto, catalog);
     }
@@ -143,7 +154,7 @@ export function startSupportedRefresh(
       // The boot catalog pass failed. Rebuild here rather than waiting out `catalogMs`, which
       // would leave the endpoint empty for a day over a blip during a deploy.
       if (catalog === undefined) {
-        catalog = await refreshCatalog(discovery, crypto, log, signal);
+        catalog = await refreshCatalog(discovery, crypto, log, signal, []);
         if (catalog !== undefined) catalogs.set(crypto, catalog);
       }
       if (catalog === undefined) {
@@ -164,6 +175,17 @@ export function startSupportedRefresh(
     }
   };
 
+  // One pass runs at a time across both loops, so a catalog and a routes pass never hit Meld together.
+  let chain: Promise<void> = Promise.resolve();
+  const exclusive = (pass: () => Promise<void>): Promise<void> => {
+    const next = chain.then(pass, pass);
+    chain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
+
   const every = (ms: number, pass: () => Promise<void>): Promise<void> =>
     // Re-armed after each pass, not `interval()`: that generator banks every tick that fires while
     // the consumer is awaiting and then yields them back to back with no gap, so a pass outrunning
@@ -171,7 +193,13 @@ export function startSupportedRefresh(
     guarded(async () => {
       for (;;) {
         await sleep(ms, undefined, { signal, ref: false });
-        await pass();
+        try {
+          await exclusive(pass);
+        } catch (error) {
+          // A pass never throws the stop abort: it returns early, and the abort ends this loop through
+          // the `sleep` above. Any other fault is logged and the loop keeps ticking.
+          log(`supported refresh pass failed, continuing: ${message(error)}`);
+        }
       }
     });
 

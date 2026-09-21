@@ -277,16 +277,22 @@ describe('MeldDiscovery.defaultFiat', () => {
     expect(meld.calls()).toBe(2);
   });
 
-  it('does not cache a failed call, so one bad response cannot pin a country to no-fiat', async () => {
+  it('throws on a failed call and does not cache it, so one bad response cannot pin a country to no-fiat', async () => {
     let calls = 0;
     const d = new MeldDiscovery(async () => {
       calls += 1;
       throw new Error('meld down');
     }, ttls(3_600_000));
 
-    expect(await d.defaultFiat('CA')).toBe('');
-    expect(await d.defaultFiat('CA')).toBe('');
-    expect(calls).toBe(2);
+    // Throws, rather than returning '', so a caller can tell a failure apart from a real "no currency".
+    await expect(d.defaultFiat('CA')).rejects.toThrow('meld down');
+    await expect(d.defaultFiat('CA')).rejects.toThrow('meld down');
+    expect(calls).toBe(2); // the failure is not cached; each call retries
+  });
+
+  it('throws on an unparseable response rather than reading it as no-fiat', async () => {
+    const d = new MeldDiscovery(async () => 'not an envelope', ttls(3_600_000));
+    await expect(d.defaultFiat('CA')).rejects.toThrow(/unparseable/);
   });
 
   it('caches a parsed envelope that names no currency, which is a real answer', async () => {
