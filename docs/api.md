@@ -50,14 +50,55 @@ Field names are the caller's, which are mostly Meld's: `country`, `fiat`,
 `destinationCurrencyCode`, `sourceAmount`, `paymentMethodType`. Operator configuration stays
 snake_case.
 
+## `direction`: buy and sell
+
+`POST /quote` and `POST /session` both take an optional `direction`, `"buy"` or `"sell"`.
+**Absent means `buy`**, so a caller written before sell existed is unchanged, byte for byte, in
+both request and response.
+
+**`destinationCurrencyCode` names the crypto leg and `fiat` names the fiat leg in both
+directions.** On a sell the crypto is what the seller sends, so `destinationCurrencyCode` reads
+backwards. It is deliberate: one vocabulary across the surface, and no translation layer to be
+wrong about which currency an amount is in.
+
+The amount is the field that changes, and it is a different field rather than the same one
+reinterpreted:
+
+| | buy | sell |
+| --- | --- | --- |
+| amount field | `sourceAmount`, the fiat charged | `cryptoAmount`, the crypto sold |
+| format | decimal, at most **2** fraction digits | exact decimal, up to **30** fraction digits, kept as a string end to end and never rounded |
+| `walletAddress` | **required** on `/session` | **refused**: the provider issues the deposit address after the session exists |
+
+`cryptoAmount` must be greater than zero: `"0"` and `"0.00000000"` are refused. On a sell there
+is no amount gate behind this one (the corridor's published limits are fiat while the committed
+amount is crypto), so this is the only check a zero meets.
+
+**The amount string is the identity, not the number it denotes.** The idempotency comparison is
+exact string equality, so `"1.5"` and `"1.50"` are *different requests*: a client that reuses a
+key but reformats the amount on retry gets `409 IDEMPOTENCY_KEY_REUSED`, not a replay. That is
+deliberate, and it is the safe direction to fail — the alternative is parsing two spellings into
+one number and handing back a settlement surface committed to the other one. Send the same
+bytes on a retry that you sent the first time.
+
+The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount` or
+`walletAddress`, a buy carrying `cryptoAmount`, or either direction missing its own amount, is a
+local `400 MALFORMED_REQUEST` before any upstream call.
+
+**Today every rail refuses a sell** with `400 Other{ DIRECTION_UNSUPPORTED }`. Meld because its
+sell path is not built here yet; Chainflip permanently, having no fiat leg to pay a seller from.
+A sell is parsed, validated and routed like any other request, and declined by the rail with that
+reason rather than by a misleading currency or quote error.
+
 ## `POST /quote`
 
 **Source-denominated**, because Meld's quote endpoint is source-only: this asks what 21.47 USD
 buys, not what 20 USDC costs. A consumer thinking in destination amounts works backwards itself.
 
-`sourceAmount` is a decimal string with at most two fraction digits. `rail` is optional
-(`meld` | `chainflip`, default `meld`); `chainflip` refuses, having no fiat leg. **Everything else
-is required, `paymentMethodType` included**: the corridor resolves per
+`sourceAmount` is a decimal string with at most two fraction digits (on a sell it is
+`cryptoAmount` instead; see `direction` above). `rail` is optional (`meld` | `chainflip`, default
+`meld`); `chainflip` refuses, having no fiat leg. **Everything else is required,
+`paymentMethodType` included**: the corridor resolves per
 `(country, fiat, destination, method)`, so a quote for an unoffered method is a price nobody can
 pay. Omitting it is a local `MALFORMED_REQUEST`, before any upstream call.
 
@@ -128,6 +169,22 @@ not necessarily what the buyer transacted under. See threat model R11.
 }
 ```
 
+A sell sends the same body with `direction: "sell"`, `cryptoAmount` in place of `sourceAmount`,
+and no `walletAddress`:
+
+```json
+{
+  "idempotencyKey": "<caller-prefix>-<uuid-v4>",
+  "direction": "sell",
+  "country": "GB",
+  "fiat": "GBP",
+  "destinationCurrencyCode": "DOT_ASSETHUB",
+  "cryptoAmount": "12.3456789012",
+  "paymentMethodType": "PAYOUT_TO_BANK",
+  "serviceProvider": "TRANSAK"
+}
+```
+
 `serviceProvider` is **required**: Meld refuses an absent one exactly as it refuses a null one, so
 "let Meld choose" is not offered. Pick one from `POST /quote`.
 
@@ -162,6 +219,12 @@ Rejected as `REDIRECT_NOT_ALLOWED`, locally.
   }
 }
 ```
+
+On a sell, `pinned` carries `cryptoAmount` and no `walletAddress` or `sourceAmount`: those are
+terms a sell does not commit, and they are absent rather than empty. **`cryptoAmount` is the term
+a resuming client compares against.** On a buy the wallet address distinguishes two purchases in
+one corridor; a sell has none, so this is the only thing between two sales of the same asset in
+the same corridor, and a mismatch must be treated as "this is a different sale", not a warning.
 
 `serviceProviderWidgetUrl` is the provider's capture page, always present. `widgetUrl` is Meld's
 own hosted widget for the session, present only when Meld returns one; a product embedding Meld's
@@ -240,6 +303,7 @@ for another caller's alike.
 {
   "id": "3f1a9c04-8e2b-4d77-9a10-1c5b7e0d2f43",
   "rail": "meld",
+  "direction": "buy",
   "status": "transaction_seen",
   "providerStatus": "PENDING",
   "destinationCurrencyCode": "USDC_ASSETHUB",
@@ -254,6 +318,11 @@ for another caller's alike.
   ]
 }
 ```
+
+`direction` is always present. On a sell row, `walletAddress` and `sourceAmount` are absent and
+`cryptoAmount` carries the committed crypto at full precision; see `direction` above for why that
+echo is load-bearing rather than informational. A sell moves through the **same** eight states a
+buy does: the direction is a term of the request, not a stage of its life.
 
 `status` is this service's lifecycle, not Meld's: `created` -> `session_opened` ->
 `transaction_seen` -> `settled` / `failed`, plus `expired` (the rail answered and no payment
@@ -335,6 +404,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 400 | `RouteWithdrawn` | The operator has disabled session creation. |
 | 400 | `Other{ UNKNOWN_RAIL }` | A rail this build knows but this deployment has not wired. |
 | 400 | `Other{ PROVIDER_REJECTED }` | Meld understood the request and declined it, for a reason not enumerated above. Not retryable. |
+| 400 | `Other{ DIRECTION_UNSUPPORTED }` | The named rail does not serve that direction. Both rails refuse `direction: "sell"` today: Meld because the sell path is not built here yet, Chainflip permanently. Not retryable; the remedy is a different rail or a different direction, never the same request again. |
 | 400 | `Other{ RAIL_REFUSED }` | The Chainflip rail refuses **session creation**: it swaps on-chain assets and has no fiat leg. Not retryable. (Its quote leg answers `422 NoQuotesAvailable`.) |
 | 409 | `Other{ REQUEST_IN_FLIGHT }` | Another request is already opening a session under this idempotency key. Well-formed; retry shortly. |
 | 404 | `Other{ NOT_FOUND }` | No such route, or no such funding request *for this caller*. |

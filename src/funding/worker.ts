@@ -311,6 +311,13 @@ interface Advance {
  * Nothing bounds it from above: a rail returning a far-future expiry keeps the row in the scan
  * that long. Inert with Meld, whose sessions are short-lived; it would need a clamp before a rail
  * that hands out long-dated surfaces.
+ *
+ * On a sell there is no rail expiry at all, ever. Observed against the sandbox: a `SELL` session
+ * response carries no `expiresAt`, so `expires_at` is null on every sell row and the local window
+ * is not a floor under a provider deadline but the whole of it. The `?? 0` already does the right
+ * thing, so nothing changes here; it is recorded because a sell waiting for an on-chain deposit
+ * is bounded by `session_max_age_ms` alone, and that one number decides how long this service
+ * keeps looking for a seller's money.
  */
 function deadlineFor(record: FundingRecord, sessionMaxAgeMs: number): number {
   return Math.max(record.expires_at ?? 0, record.created_at + sessionMaxAgeMs);

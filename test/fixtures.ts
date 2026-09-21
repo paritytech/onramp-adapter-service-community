@@ -4,8 +4,8 @@ import { parseConfig, type Config } from '../src/config.js';
 import { TERMINAL_STATES, type FundingState } from '../src/funding/state.js';
 import { mergeAdvance } from '../src/funding/merge.js';
 import type { FundingStore, SupportedCorridorRow } from '../src/funding/store.js';
-import type { FundingRecord } from '../src/funding/types.js';
-import type { RailSessionInput } from '../src/rail.js';
+import { directionTermsViolation, type FundingRecord } from '../src/funding/types.js';
+import type { RailBuySession, RailSellSession } from '../src/rail.js';
 
 const ALICE_PUBKEY = new Uint8Array([
   0xd4, 0x35, 0x93, 0xc7, 0x15, 0xfd, 0xd3, 0x1c, 0x61, 0x14, 0x1a, 0xbd, 0x04, 0xa9, 0x9f, 0xd6,
@@ -123,19 +123,68 @@ export const createRequest = (overrides: Record<string, unknown> = {}) => ({
 });
 
 /**
+ * The sell counterpart of `createRequest`: the terms a sell actually commits.
+ *
+ * No `walletAddress` and no `sourceAmount`, because the schema refuses both on a sell rather
+ * than ignoring them, and a crypto amount at ten fraction digits, which is DOT's own precision
+ * and more than the fiat validator can express.
+ */
+export const sellRequest = (overrides: Record<string, unknown> = {}) => ({
+  idempotencyKey: 'idem-sell-0001',
+  direction: 'sell',
+  destinationCurrencyCode: 'DOT_ASSETHUB',
+  cryptoAmount: '12.3456789012',
+  fiat: 'GBP',
+  country: 'GB',
+  paymentMethodType: 'PAYOUT_TO_BANK',
+  serviceProvider: 'TRANSAK',
+  ...overrides,
+});
+
+/** The sell counterpart of `quoteRequestBody`. */
+export const sellQuoteBody = (overrides: Record<string, unknown> = {}) => ({
+  direction: 'sell',
+  destinationCurrencyCode: 'DOT_ASSETHUB',
+  cryptoAmount: '12.3456789012',
+  fiat: 'GBP',
+  country: 'GB',
+  paymentMethodType: 'PAYOUT_TO_BANK',
+  ...overrides,
+});
+
+/**
  * A neutral rail session input, as `Onramp` builds one.
  *
  * Shared for the same reason `fundingRecord` is: the struct was written out by hand in two test
  * files and five places, so adding `redirectUrl` to it missed four of them until the compiler
  * said so. `clientReference` is a funding row id, never a caller's idempotency key.
  */
-export const railSessionInput = (overrides: Partial<RailSessionInput> = {}): RailSessionInput => ({
+export const railSessionInput = (overrides: Partial<RailBuySession> = {}): RailBuySession => ({
+  direction: 'buy',
   destinationCode: 'USDC_ASSETHUB',
   walletAddress: '5x...',
   sourceAmount: '25.00',
   fiat: 'USD',
   countryCode: 'US',
   paymentMethodType: 'CREDIT_DEBIT_CARD',
+  serviceProvider: 'TRANSAK',
+  clientReference: 'funding-1',
+  redirectUrl: undefined,
+  ...overrides,
+});
+
+/**
+ * The sell counterpart: no wallet address, no fiat amount, and a crypto amount at a precision
+ * the fiat validator could not express. Separate rather than a flag, because the two carry
+ * different fields and a builder with both would hand a rail a shape the port does not have.
+ */
+export const railSellSessionInput = (overrides: Partial<RailSellSession> = {}): RailSellSession => ({
+  direction: 'sell',
+  destinationCode: 'DOT_ASSETHUB',
+  cryptoAmount: '12.3456789012',
+  fiat: 'GBP',
+  countryCode: 'GB',
+  paymentMethodType: 'PAYOUT_TO_BANK',
   serviceProvider: 'TRANSAK',
   clientReference: 'funding-1',
   redirectUrl: undefined,
@@ -161,9 +210,13 @@ export const fundingRecord = (overrides: Partial<FundingRecord> = {}): FundingRe
   id: 'funding-1',
   subject_alias: 'alias-abc',
   product_id: 'app.dot',
+  // A buy, like every row written before the direction column existed and like every fixture
+  // that does not say otherwise. `sellRecord` below is the other one.
+  direction: 'buy',
   destination_currency_code: 'USDC_ASSETHUB',
   wallet_address: '0x...',
   source_amount: '25.00',
+  crypto_amount: undefined,
   fiat: 'USD',
   payment_method_type: 'CREDIT_DEBIT_CARD',
   // Matches `createRequest`'s default, so a seeded row and a fresh request are the same
@@ -187,6 +240,28 @@ export const fundingRecord = (overrides: Partial<FundingRecord> = {}): FundingRe
   updated_at: 1_700_000_000_000,
   ...overrides,
 });
+
+/**
+ * One sell record: the mirror of `fundingRecord`, with the terms a sell actually commits.
+ *
+ * Its own builder rather than an override bag at each call site, because the three differences
+ * travel together (no address, no fiat amount, a crypto amount) and the database refuses any
+ * two of the three. A test that overrode one by hand would be asserting against a row Postgres
+ * would not accept.
+ */
+export const sellRecord = (overrides: Partial<FundingRecord> = {}): FundingRecord =>
+  fundingRecord({
+    direction: 'sell',
+    destination_currency_code: 'DOT_ASSETHUB',
+    wallet_address: undefined,
+    source_amount: undefined,
+    // Ten fraction digits: DOT's own precision, and more than `MINOR_UNIT_DECIMAL` can express.
+    crypto_amount: '12.3456789012',
+    fiat: 'GBP',
+    country: 'GB',
+    payment_method_type: 'PAYOUT_TO_BANK',
+    ...overrides,
+  });
 
 /**
  * An in-memory stand-in for `FundingStore`, honouring the parts of its contract the callers rely
@@ -218,9 +293,27 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
         r.product_id === record.product_id,
     );
 
+  /**
+   * The per-direction CHECKs, applied here because the real store's are in the database.
+   *
+   * Without this the fake is more permissive than Postgres in exactly the place the constraints
+   * were added to be strict: a sell with no crypto amount, or a buy that lost the terms the
+   * dropped NOT NULLs used to guarantee. A suite that writes such a row through the fake reasons
+   * about a shape production cannot hold, which is the same defect the shared `mergeAdvance`
+   * exists to prevent one layer up. The predicate itself is shared (`directionTermsViolation`)
+   * and pinned against a real database in `schema.test.ts`.
+   */
+  const checkTerms = (record: FundingRecord): void => {
+    const violated = directionTermsViolation(record);
+    if (violated !== undefined) {
+      throw new Error(`new row for relation "funding_requests" violates check constraint "${violated}"`);
+    }
+  };
+
   return {
     rows,
     reserve: async (record: FundingRecord) => {
+      checkTerms(record);
       const clash = held(record);
       if (clash !== undefined) return { outcome: 'existing' as const, record: structuredClone(clash) };
       if (rows.has(record.id)) throw new Error('duplicate key value violates unique constraint');
@@ -228,6 +321,7 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       return { outcome: 'inserted' as const };
     },
     create: async (record: FundingRecord) => {
+      checkTerms(record);
       if (rows.has(record.id)) throw new Error('duplicate key value violates unique constraint');
       // The partial unique index applies to `create` too, not only to `reserve`. Omitting it here
       // made the fake more permissive than the real store: a second row could take a

@@ -30,20 +30,78 @@ export const DEFAULT_RAIL: RailName = RAIL_NAMES[0];
 /** A rail's stable identity. Stored on the funding row and on the wire. */
 export type RailName = (typeof RAIL_NAMES)[number];
 
-/** Everything the quote leg needs from a wire `quoteRequest`. */
-export interface RailQuote {
+/**
+ * Which way value moves: the buyer pays fiat and receives crypto (`buy`), or sells crypto and
+ * receives fiat (`sell`).
+ *
+ * Deliberately not a second rail. Direction and rail answer different questions ("which provider"
+ * against "which way round"), and folding a sell into a `meld-sell` rail name would multiply the
+ * registry by two and leave `service_provider`, the catalog and the worker unable to say which
+ * half of the pair they meant.
+ */
+export const DIRECTIONS = ['buy', 'sell'] as const;
+
+/**
+ * The direction a request names when it omits `direction`.
+ *
+ * Single owner, exactly as `DEFAULT_RAIL` is: `DIRECTIONS[0]` is both the wire default (an absent
+ * `direction` in `contract.ts` resolves here) and the documented convention, so reordering the
+ * tuple cannot leave the default spelling a direction the schema does not know. Absent means
+ * `buy`, which is what every caller written before this existed is asking for.
+ */
+export const DEFAULT_DIRECTION: Direction = DIRECTIONS[0];
+
+/** Which way one request moves value. Stored on the funding row and on the wire. */
+export type Direction = (typeof DIRECTIONS)[number];
+
+/**
+ * What both legs carry in either direction.
+ *
+ * `destinationCurrencyCode` names the CRYPTO leg and `sourceCurrencyCode` the fiat leg in **both**
+ * directions, which reads backwards on a sell, where the crypto is what the seller sources. It is
+ * deliberate: the vocabulary is the consumer's, one convention across the whole surface, and a
+ * rail that inverts the legs for its own upstream does that inversion inside itself rather than
+ * asking every caller to hold two namings at once. See `contract.ts`'s request section.
+ */
+interface RailLegs {
   countryCode: string;
+  /** The fiat leg. The buyer's charge currency on a buy, the seller's payout currency on a sell. */
   sourceCurrencyCode: string;
+  /** The crypto leg, in both directions. */
   destinationCurrencyCode: string;
-  sourceAmount: string;
   paymentMethodType: string;
 }
 
-/** Everything the session leg needs from a wire `createSessionRequest`. */
-export interface RailSessionInput {
-  destinationCode: string;
-  walletAddress: string;
+/** A buy quote: priced from the fiat the buyer will pay. */
+export interface RailBuyQuote extends RailLegs {
+  direction: 'buy';
   sourceAmount: string;
+}
+
+/**
+ * A sell quote: priced from the crypto the seller will send.
+ *
+ * The amount is a decimal string at full precision and is never converted to minor units. Fiat
+ * minor units are two digits (`money.ts`); a crypto amount is not, and rounding one into the other
+ * is a wrong number at the exact boundary a payout is computed from.
+ */
+export interface RailSellQuote extends RailLegs {
+  direction: 'sell';
+  cryptoAmount: string;
+}
+
+/**
+ * Everything the quote leg needs from a wire `quoteRequest`.
+ *
+ * A union rather than one struct with two optional amounts: the amount a direction commits is not
+ * optional, it is different, and a union makes a rail that has narrowed the direction hold the
+ * amount that exists rather than one it must null-check and cannot explain.
+ */
+export type RailQuote = RailBuyQuote | RailSellQuote;
+
+/** What both session legs carry in either direction. */
+interface RailSessionCommon {
+  destinationCode: string;
   fiat: string;
   countryCode: string;
   paymentMethodType: string;
@@ -68,6 +126,29 @@ export interface RailSessionInput {
   redirectUrl: string | undefined;
 }
 
+/** Opening a buy: the buyer pays `sourceAmount` of fiat and the crypto is delivered to an address. */
+export interface RailBuySession extends RailSessionCommon {
+  direction: 'buy';
+  /** Where the crypto is delivered. Normalised and validated before it reaches a rail. */
+  walletAddress: string;
+  sourceAmount: string;
+}
+
+/**
+ * Opening a sell: the seller commits `cryptoAmount` and the provider issues a deposit address.
+ *
+ * No `walletAddress`, and that is the point. The address on a sell is the provider's, disclosed
+ * after the session exists, so a caller cannot supply one and a request that tried to would be
+ * naming a field nobody reads (`contract.ts` refuses it rather than ignoring it).
+ */
+export interface RailSellSession extends RailSessionCommon {
+  direction: 'sell';
+  cryptoAmount: string;
+}
+
+/** Everything the session leg needs from a wire `createSessionRequest`. See `RailQuote`. */
+export type RailSessionInput = RailBuySession | RailSellSession;
+
 /**
  * What opening a settlement surface yields: the buyer-facing handle + worker lookup facts.
  *
@@ -80,6 +161,8 @@ export interface RailSessionInput {
  *
  * `expiresAt` stays optional because Meld genuinely omits it. The worker bounds those with a
  * local ceiling (`worker.session_max_age_ms`) rather than trusting every rail to supply one.
+ * Observed against the Meld sandbox: a SELL session returns no `expiresAt` at all, ever, so on a
+ * sell the local ceiling is not a fallback but the only deadline there will be.
  */
 export interface RailSession {
   /**

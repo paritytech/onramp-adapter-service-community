@@ -29,8 +29,14 @@ import {
 import { TERMINAL_STATES } from './funding/state.js';
 import type { FundingRecord } from './funding/types.js';
 import type { FundingStore, StoredMethod } from './funding/store.js';
-import type { FundingRail, MeldTransactionReader, RailName, RailRegistry } from './rail.js';
-import { DEFAULT_RAIL } from './rail.js';
+import type {
+  Direction,
+  FundingRail,
+  MeldTransactionReader,
+  RailName,
+  RailRegistry,
+} from './rail.js';
+import { DEFAULT_DIRECTION, DEFAULT_RAIL } from './rail.js';
 import { resolveDestination } from './meld/catalog.js';
 import { toMinorUnits } from './money.js';
 import type { Corridor, CountryRow, Discovery } from './meld/discovery.js';
@@ -67,6 +73,84 @@ export type Clock = () => number;
 interface Committed {
   pinned: CreateSessionResponse['pinned'];
   redirectUrl: string | undefined;
+}
+
+/**
+ * Carry the schema's per-direction guarantee into the type system.
+ *
+ * `contract.ts`'s `superRefine` already refuses a buy without `sourceAmount` and a sell without
+ * `cryptoAmount`, but zod cannot express that as a discriminated type, so the parsed request has
+ * both as `string | undefined` while the rail port takes a union where each direction's amount is
+ * required. This is the one place the two meet.
+ *
+ * It throws rather than defaulting, and the throw is a `500`, not a refusal. Reaching it means
+ * the schema and this mapping disagree about what a direction commits, which is a defect in this
+ * repo and not something the caller did; a `''` or a `'0'` here would turn that defect into a
+ * committed amount.
+ */
+function committedTerm(value: string | undefined, field: string, direction: Direction): string {
+  if (value === undefined) {
+    throw new Error(`a ${direction} reached the rail mapping without ${field}: the request schema should have refused it`);
+  }
+  return value;
+}
+
+/**
+ * The pinned terms as a stored row holds them.
+ *
+ * One projection, used by the replay response, the replay audit line and the cancel audit line,
+ * because those three said the same thing three times and a direction-dependent field is exactly
+ * the kind that gets added to two of three. Each amount is emitted only where it exists: a buy's
+ * body is unchanged, and a sell echoes the crypto it committed rather than a fiat term it did
+ * not.
+ *
+ * The `cryptoAmount` echo is load-bearing on a sell. A resuming client compares it against the
+ * sale it believes it is resuming and refuses on a mismatch; on a buy the wallet address does
+ * that job, and a sell has none.
+ */
+/**
+ * The direction, as an audit line carries it: nothing at all on a buy.
+ *
+ * Omitted rather than emitted as `'buy'`, so every audit line a buy produces is byte-identical
+ * to the one it produced before sell existed. See `AuditEvent.direction` for why that matters to
+ * a consumer off-box, and `DEFAULT_DIRECTION` for why absence reads as `buy` consistently with
+ * the wire.
+ */
+function auditDirection(direction: Direction): { direction?: Direction } {
+  return direction === DEFAULT_DIRECTION ? {} : { direction };
+}
+
+/**
+ * The committed terms an audit line carries, **without** the country.
+ *
+ * Two of the audit sites have never emitted `country` and two always have. That inconsistency
+ * predates this change and is left exactly as it was: normalising it would add a key to a buy
+ * line that ships off-box, which is a contract change with its own release note, not something
+ * to slip in behind a sell feature. This projection is what keeps the four sites telling the
+ * truth about which ones they are.
+ */
+function auditTerms(terms: CreateSessionResponse['pinned']): Pick<
+  AuditEvent,
+  'destinationCurrencyCode' | 'walletAddress' | 'sourceAmount' | 'cryptoAmount' | 'fiat'
+> {
+  return {
+    destinationCurrencyCode: terms.destinationCurrencyCode,
+    ...(terms.walletAddress === undefined ? {} : { walletAddress: terms.walletAddress }),
+    ...(terms.sourceAmount === undefined ? {} : { sourceAmount: terms.sourceAmount }),
+    ...(terms.cryptoAmount === undefined ? {} : { cryptoAmount: terms.cryptoAmount }),
+    fiat: terms.fiat,
+  };
+}
+
+function pinnedOf(record: FundingRecord): CreateSessionResponse['pinned'] {
+  return {
+    destinationCurrencyCode: record.destination_currency_code,
+    ...(record.wallet_address === undefined ? {} : { walletAddress: record.wallet_address }),
+    ...(record.source_amount === undefined ? {} : { sourceAmount: record.source_amount }),
+    ...(record.crypto_amount === undefined ? {} : { cryptoAmount: record.crypto_amount }),
+    fiat: record.fiat,
+    ...(record.country === undefined ? {} : { country: record.country }),
+  };
 }
 
 export class Onramp {
@@ -121,6 +205,15 @@ export class Onramp {
     return this.discovery.countries(code);
   }
 
+  /**
+   * Resolve the direction a request names. Absent is `buy`, which is what every caller written
+   * before sell existed means, and the default lives in `rail.ts` beside the tuple so the wire
+   * default and the stored vocabulary cannot drift apart.
+   */
+  private direction(direction: Direction | undefined): Direction {
+    return direction ?? DEFAULT_DIRECTION;
+  }
+
   /** Resolve the rail a request names, refusing an unregistered one locally. */
   private rail(rail: RailName | undefined): FundingRail {
     const name = rail ?? DEFAULT_RAIL;
@@ -152,10 +245,18 @@ export class Onramp {
     // between the quote and the session, so finding out late only wasted a metered rail call and
     // showed the buyer a price they were never going to be allowed to pay.
     const rail = this.rail(request.rail);
+    const direction = this.direction(request.direction);
     // The fiat limit gate is Meld's corridor question; only the fiat rail has one. A non-fiat rail
     // (chainflip) has no fiat corridor and refuses at the rail with its own reason, so gating it
     // here would preempt that with a misleading currency error.
-    if (rail.provider === 'meld') {
+    //
+    // And only a buy, which is the second half of the same argument. A sell commits crypto while
+    // the corridor's published limits are fiat (observed: an off-ramp route's `limits.currencyCode`
+    // is the payout fiat), so running this gate on a sell would compare a DOT amount against a GBP
+    // bound in fiat minor units and refuse or admit by a number that means nothing. Every rail
+    // refuses a sell outright in this build, so the gate is unreachable either way; the condition
+    // is here so it cannot become reachable by accident when one of them stops refusing.
+    if (rail.provider === 'meld' && direction === 'buy') {
       await this.limitFor(
         destination.code,
         request.fiat.toUpperCase(),
@@ -166,13 +267,30 @@ export class Onramp {
         'ungate',
       );
     }
-    const quotes = await rail.quote({
+    // The legs are the same in both directions and the amount is not: a buy prices the fiat it
+    // will charge, a sell prices the crypto it will send. The rail port takes one or the other,
+    // never both, so which one is decided here rather than inside every rail.
+    const legs = {
       countryCode: request.country,
       sourceCurrencyCode: request.fiat.toUpperCase(),
       destinationCurrencyCode: destination.code,
-      sourceAmount: request.sourceAmount,
       paymentMethodType: request.paymentMethodType,
-    });
+    };
+    const priced =
+      direction === 'sell'
+        ? ({ ...legs, direction, cryptoAmount: committedTerm(request.cryptoAmount, 'cryptoAmount', direction) } as const)
+        : ({ ...legs, direction, sourceAmount: committedTerm(request.sourceAmount, 'sourceAmount', direction) } as const);
+    const quotes = await rail.quote(priced);
+
+    // Only a buy gets this far: every rail in this build refuses a sell quote outright
+    // (`DIRECTION_UNSUPPORTED`), so there is no sell that reaches the echo. Asserted rather than
+    // assumed, because the echo's `sourceAmount` is the fiat the caller committed and a sell has
+    // committed none; quietly echoing a crypto amount under that name would be the unit confusion
+    // this whole direction split exists to avoid. When a rail does serve a sell, this grows a
+    // `cryptoAmount` arm and the wire contract grows with it, deliberately and not in advance.
+    if (priced.direction === 'sell') {
+      throw new Error('a sell quote returned from a rail that is supposed to refuse every sell');
+    }
 
     // The echo is built here rather than round-tripped through the rail: every value in it is
     // already in hand, so asking the rail to hand back its own arguments bought nothing.
@@ -180,7 +298,7 @@ export class Onramp {
       quotes,
       requested: {
         destinationCurrencyCode: destination.code,
-        sourceAmount: request.sourceAmount,
+        sourceAmount: priced.sourceAmount,
         fiat: request.fiat.toUpperCase(),
       },
     };
@@ -222,6 +340,7 @@ export class Onramp {
   ): Promise<CreateSessionResponse> {
     const rail = this.rail(request.rail);
     const name = rail.provider;
+    const direction = this.direction(request.direction);
 
     if (!this.cfg.session_creation_enabled) {
       // Audited and recorded like any other refusal. The audit before the throw means a
@@ -234,14 +353,15 @@ export class Onramp {
         request,
         reject({ tag: 'RouteWithdrawn' }, 'Session creation is disabled by the operator.'),
         name,
+        direction,
       );
     }
 
     let committed;
     try {
-      committed = await this.validate(request, rail);
+      committed = await this.validate(request, rail, direction);
     } catch (cause) {
-      if (cause instanceof Refusal) await this.refuse(subject, requestId, request, cause, name);
+      if (cause instanceof Refusal) await this.refuse(subject, requestId, request, cause, name, direction);
       throw cause;
     }
     const { pinned, redirectUrl } = committed;
@@ -263,10 +383,13 @@ export class Onramp {
       this.newRecord({
         id: fundingId,
         subject,
-        // The pinned terms: what was committed, not what was asked for.
+        // The pinned terms: what was committed, not what was asked for. Exactly one of
+        // `sourceAmount` and `cryptoAmount` is present, per direction; the database says so too.
+        direction,
         destinationCurrencyCode: pinned.destinationCurrencyCode,
         walletAddress: pinned.walletAddress,
         sourceAmount: pinned.sourceAmount,
+        cryptoAmount: pinned.cryptoAmount,
         fiat: pinned.fiat,
         country: pinned.country,
         paymentMethodType: request.paymentMethodType,
@@ -317,6 +440,12 @@ export class Onramp {
         already.destination_currency_code !== pinned.destinationCurrencyCode ||
         already.wallet_address !== pinned.walletAddress ||
         already.source_amount !== pinned.sourceAmount ||
+        // Both new terms are in from the first day they exist, rather than added after someone
+        // notices. The v1 -> v2 `country` migration is here because a committed term was left out
+        // of this comparison once, and a key reused across directions is the starkest version of
+        // that mistake: a seller would be handed a buyer's capture page under their own key.
+        already.direction !== direction ||
+        already.crypto_amount !== pinned.cryptoAmount ||
         already.fiat !== pinned.fiat ||
         already.payment_method_type !== request.paymentMethodType ||
         // Country was validated, sent to the rail, and then left out of this comparison. So the
@@ -346,10 +475,10 @@ export class Onramp {
 
     let session;
     try {
-      session = await rail.createSession({
+      // The same split as `quote`: one set of legs, and the committed amount the direction
+      // actually has. A sell additionally carries no address, because there is none to carry.
+      const opening = {
         destinationCode: pinned.destinationCurrencyCode,
-        walletAddress: pinned.walletAddress,
-        sourceAmount: pinned.sourceAmount,
         fiat: pinned.fiat,
         countryCode: request.country,
         paymentMethodType: request.paymentMethodType,
@@ -357,7 +486,17 @@ export class Onramp {
         redirectUrl,
         // This record's id, not the caller's key (see `RailSessionInput.clientReference`).
         clientReference: fundingId,
-      });
+      };
+      session = await rail.createSession(
+        direction === 'sell'
+          ? { ...opening, direction, cryptoAmount: committedTerm(pinned.cryptoAmount, 'cryptoAmount', direction) }
+          : {
+              ...opening,
+              direction,
+              walletAddress: committedTerm(pinned.walletAddress, 'walletAddress', direction),
+              sourceAmount: committedTerm(pinned.sourceAmount, 'sourceAmount', direction),
+            },
+      );
     } catch (cause) {
       // What the failure proves decides what the row says and whether the key is freed. Both the
       // recorded outcome and the caller's answer derive from this one `Refusal`, so the tag on the
@@ -396,10 +535,9 @@ export class Onramp {
             productId: subject.productId,
             requestId,
             rail: name,
-            destinationCurrencyCode: pinned.destinationCurrencyCode,
-            walletAddress: pinned.walletAddress,
-            sourceAmount: pinned.sourceAmount,
-            fiat: pinned.fiat,
+            ...auditDirection(direction),
+            // No `country` here, as there never has been on this line: see `auditTerms`.
+            ...auditTerms(pinned),
             // Enumerated, like every other `reason` on this stream. A driver's own message is
             // shaped by the driver (`pg` carries host, database and user in a connection error),
             // and the audit trail is a protected asset that ships off-box, so `audit.ts` says this
@@ -420,10 +558,8 @@ export class Onramp {
           productId: subject.productId,
           requestId,
           rail: name,
-          destinationCurrencyCode: pinned.destinationCurrencyCode,
-          walletAddress: pinned.walletAddress,
-          sourceAmount: pinned.sourceAmount,
-          fiat: pinned.fiat,
+          ...auditDirection(direction),
+          ...auditTerms(pinned),
           reason,
         },
         'rail refused the session',
@@ -453,7 +589,9 @@ export class Onramp {
           productId: subject.productId,
           requestId,
           rail: name,
+          ...auditDirection(direction),
           providerSessionId: session.providerSessionId,
+          // This line has always carried the country; the one above has never carried it.
           ...pinned,
         },
         'session opened upstream but the funding record could not be advanced',
@@ -468,6 +606,7 @@ export class Onramp {
         productId: subject.productId,
         requestId,
         rail: name,
+        ...auditDirection(direction),
         // A rail must produce one, so this record's shape does not vary with whether the rail
         // named the session.
         providerSessionId: session.providerSessionId,
@@ -641,11 +780,10 @@ export class Onramp {
         productId: subject.productId,
         requestId,
         rail: record.rail,
+        ...auditDirection(record.direction),
         providerSessionId: record.provider_session_id,
-        destinationCurrencyCode: record.destination_currency_code,
-        walletAddress: record.wallet_address,
-        sourceAmount: record.source_amount,
-        fiat: record.fiat,
+        // No `country`: this line has never carried one. See `auditTerms`.
+        ...auditTerms(pinnedOf(record)),
       },
       'session replayed from the caller idempotency key',
     );
@@ -655,13 +793,7 @@ export class Onramp {
       serviceProviderWidgetUrl: record.widget_url,
       ...(record.hosted_widget_url === undefined ? {} : { widgetUrl: record.hosted_widget_url }),
       ...(record.expires_at === undefined ? {} : { expiresAt: record.expires_at }),
-      pinned: {
-        destinationCurrencyCode: record.destination_currency_code,
-        walletAddress: record.wallet_address,
-        sourceAmount: record.source_amount,
-        fiat: record.fiat,
-        ...(record.country === undefined ? {} : { country: record.country }),
-      },
+      pinned: pinnedOf(record),
     };
   }
 
@@ -740,11 +872,8 @@ export class Onramp {
       productId: subject.productId,
       requestId,
       rail: record.rail,
-      destinationCurrencyCode: record.destination_currency_code,
-      walletAddress: record.wallet_address,
-      sourceAmount: record.source_amount,
-      fiat: record.fiat,
-      ...(record.country === undefined ? {} : { country: record.country }),
+      ...auditDirection(record.direction),
+      ...pinnedOf(record),
     };
   }
 
@@ -907,17 +1036,31 @@ export class Onramp {
    * what gets sent to the rail, recorded, and echoed back, so a caller sees what was committed
    * rather than what it asked for.
    */
-  private async validate(request: CreateSessionRequest, rail: FundingRail): Promise<Committed> {
+  private async validate(
+    request: CreateSessionRequest,
+    rail: FundingRail,
+    direction: Direction,
+  ): Promise<Committed> {
     const destination = resolveDestination(request.destinationCurrencyCode);
-    const walletAddress = normalizeAddress(request.walletAddress);
     const currency = request.fiat.toUpperCase();
+    // Only a buy has an address to pin. On a sell the schema has already refused one, and the
+    // deposit address the seller will use is the provider's, issued after the session exists.
+    const walletAddress =
+      direction === 'sell'
+        ? undefined
+        : normalizeAddress(committedTerm(request.walletAddress, 'walletAddress', direction));
 
     // The fiat amount gate is Meld's corridor question; only the fiat rail has one. A non-fiat rail
     // (chainflip) has no fiat corridor and refuses at the rail with its own reason (`RAIL_REFUSED`),
     // so running a Meld corridor/limit check here would preempt that with a misleading currency
     // error. Bounds come from the live (crypto, country, fiat, method) corridor, tightened by any
     // configured business floor; the chosen method picks which bound applies.
-    if (rail.provider === 'meld') {
+    //
+    // And only a buy, for the reason spelled out in `quote`: the corridor's limits are fiat while
+    // a sell commits crypto, so this comparison would be DOT against GBP in fiat minor units.
+    // Every rail refuses a sell before a session exists, so no sell reaches a gate at all in this
+    // build; the direction condition is what keeps that true if one stops refusing.
+    if (rail.provider === 'meld' && direction === 'buy') {
       const limit = await this.limitFor(
         destination.code,
         currency,
@@ -928,28 +1071,34 @@ export class Onramp {
       // tags (`server.ts`'s `meld400`). The type has always carried `value`; only the rail's
       // version filled it, so a config-derived refusal reached the buyer as a bare "that amount is
       // below the minimum" with no number in it. A client cannot correct an amount unseen.
-      const amount = toMinorUnits(request.sourceAmount);
+      const amount = toMinorUnits(committedTerm(request.sourceAmount, 'sourceAmount', direction));
       if (amount < toMinorUnits(limit.min)) {
         throw reject(
           { tag: 'BelowMinimum', value: { amount: limit.min, currency } },
-          `${request.sourceAmount} is below the ${limit.min} minimum.`,
+          `${String(request.sourceAmount)} is below the ${limit.min} minimum.`,
         );
       }
       if (amount > toMinorUnits(limit.max)) {
         throw reject(
           { tag: 'AboveMaximum', value: { amount: limit.max, currency } },
-          `${request.sourceAmount} is above the ${limit.max} maximum.`,
+          `${String(request.sourceAmount)} is above the ${limit.max} maximum.`,
         );
       }
     }
 
     const redirectUrl = this.checkRedirect(request.redirectUrl);
 
+    // Exactly one amount, chosen by direction rather than by which field happened to be sent.
+    // The schema has already refused the other one, so an amount present here is one this
+    // direction commits; carrying both through would make the row's meaning depend on a read
+    // order.
     return {
       pinned: {
         destinationCurrencyCode: destination.code,
-        walletAddress,
-        sourceAmount: request.sourceAmount,
+        ...(walletAddress === undefined ? {} : { walletAddress }),
+        ...(direction === 'sell'
+          ? { cryptoAmount: committedTerm(request.cryptoAmount, 'cryptoAmount', direction) }
+          : { sourceAmount: committedTerm(request.sourceAmount, 'sourceAmount', direction) }),
         fiat: currency,
         country: request.country,
       },
@@ -973,9 +1122,15 @@ export class Onramp {
   private newRecord(terms: {
     id: string;
     subject: Subject;
+    /** Which way this request moves value; decides which of the two amounts below is set. */
+    direction: Direction;
     destinationCurrencyCode: string;
-    walletAddress: string;
-    sourceAmount: string;
+    /** Absent on a sell: no caller supplies the address, the provider issues it. */
+    walletAddress: string | undefined;
+    /** The committed fiat, on a buy. */
+    sourceAmount: string | undefined;
+    /** The committed crypto, on a sell, at full precision. */
+    cryptoAmount: string | undefined;
     fiat: string;
     paymentMethodType: string;
     /** Committed like the rest: it selects the provider set and the KYC path at the rail. */
@@ -992,9 +1147,11 @@ export class Onramp {
       id: terms.id,
       subject_alias: terms.subject.alias,
       product_id: terms.subject.productId,
+      direction: terms.direction,
       destination_currency_code: terms.destinationCurrencyCode,
       wallet_address: terms.walletAddress,
       source_amount: terms.sourceAmount,
+      crypto_amount: terms.cryptoAmount,
       fiat: terms.fiat,
       payment_method_type: terms.paymentMethodType,
       country: terms.country,
@@ -1007,6 +1164,14 @@ export class Onramp {
       widget_url: undefined,
       hosted_widget_url: undefined,
       expires_at: undefined,
+      // The deposit leg is observed, never requested, and nothing observes it yet: the worker
+      // that reads a provider-issued deposit address is a later step. Written out rather than
+      // omitted, so a row's shape is stated in full at the one place rows are built.
+      deposit_address: undefined,
+      deposit_amount: undefined,
+      deposit_currency: undefined,
+      deposit_memo: undefined,
+      deposit_observed_at: undefined,
       status: terms.status,
       reason: terms.reason,
       status_history: [{ status: terms.status, at: terms.now }],
@@ -1071,6 +1236,7 @@ export class Onramp {
     request: CreateSessionRequest,
     refusal: Refusal,
     rail: RailName,
+    direction: Direction,
   ): Promise<Refusal> {
     this.audit.info(
       {
@@ -1079,9 +1245,14 @@ export class Onramp {
         productId: subject.productId,
         requestId,
         rail,
+        ...auditDirection(direction),
         destinationCurrencyCode: request.destinationCurrencyCode,
-        walletAddress: request.walletAddress,
-        sourceAmount: request.sourceAmount,
+        // Submitted, not pinned, and only where the caller sent one. A sell sends no address and
+        // no fiat amount; emitting a key with `undefined` would put a field on the stream that
+        // says nothing, and a `''` would say something false.
+        ...(request.walletAddress === undefined ? {} : { walletAddress: request.walletAddress }),
+        ...(request.sourceAmount === undefined ? {} : { sourceAmount: request.sourceAmount }),
+        ...(request.cryptoAmount === undefined ? {} : { cryptoAmount: request.cryptoAmount }),
         fiat: request.fiat,
         reason: refusal.failure.tag,
       },
@@ -1096,9 +1267,11 @@ export class Onramp {
           subject,
           // The submitted terms, deliberately not pinned ones: a refusal may be because the
           // address or the code could not be pinned, so there is nothing normalised to record.
+          direction,
           destinationCurrencyCode: request.destinationCurrencyCode,
           walletAddress: request.walletAddress,
           sourceAmount: request.sourceAmount,
+          cryptoAmount: request.cryptoAmount,
           fiat: request.fiat.toUpperCase(),
           country: request.country,
           paymentMethodType: request.paymentMethodType,

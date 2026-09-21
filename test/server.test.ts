@@ -7,7 +7,15 @@ import { MeldHttpError } from '../src/meld/client.js';
 import type { SupportedCorridorDto } from '../src/onramp.js';
 import { Secret } from '../src/secret.js';
 import { buildServer } from '../src/server.js';
-import { ALICE, config, createRequest, fundingRecord, quoteRequestBody } from './fixtures.js';
+import {
+  ALICE,
+  config,
+  createRequest,
+  fundingRecord,
+  quoteRequestBody,
+  sellQuoteBody,
+  sellRequest,
+} from './fixtures.js';
 import type { AuditLog } from '../src/audit.js';
 
 const RESPONSE: CreateSessionResponse = {
@@ -163,6 +171,8 @@ describe('logging', () => {
         productId: 'app.dot',
         requestId: 'req-1',
         rail: 'meld',
+        // No `direction`: a buy's audit line carries none, which is how it stays byte-identical
+        // to the lines this service emitted before sell existed.
         destinationCurrencyCode: 'USDC_ASSETHUB',
         walletAddress: ALICE,
         sourceAmount: '25.00',
@@ -381,6 +391,147 @@ describe('declared string bounds', () => {
     expect(response.statusCode).toBe(400);
     expect(response.json().error.value.code).toBe('MALFORMED_REQUEST');
     expect(reached, 'the request reached the service instead of being refused at the boundary').toBe(0);
+  });
+});
+
+describe('the direction discriminator', () => {
+  /** Post a body at a route and answer with (status, refusal code) only. */
+  const post = async (
+    url: '/quote' | '/session',
+    payload: Record<string, unknown>,
+    seen?: (body: unknown) => void,
+  ) => {
+    const built = await serve(
+      async (...args: unknown[]) => {
+        seen?.(args[1]);
+        return RESPONSE;
+      },
+      config(),
+      {
+        quote: async (...args: unknown[]) => {
+          seen?.(args[0]);
+          return { quotes: [], requested: { destinationCurrencyCode: 'DOT_ASSETHUB', sourceAmount: '20', fiat: 'GBP' } };
+        },
+      },
+    );
+    const response = await built.inject({ method: 'POST', url, headers: DEV_HEADERS, payload });
+    return { status: response.statusCode, code: response.json<{ error?: { value?: { code?: string } } }>().error?.value?.code };
+  };
+
+  it.each(['/quote', '/session'] as const)('accepts %s with no direction at all, exactly as before', async (url) => {
+    // The whole compatibility claim: a caller written before sell existed sends no `direction`
+    // and is served identically. Absent is not "unspecified", it is `buy`.
+    const payload = url === '/quote' ? quoteRequestBody() : createRequest();
+    const { status } = await post(url, payload);
+
+    expect(status).toBe(url === '/quote' ? 200 : 201);
+  });
+
+  it.each(['/quote', '/session'] as const)('accepts an explicit buy on %s', async (url) => {
+    const payload = url === '/quote' ? quoteRequestBody({ direction: 'buy' }) : createRequest({ direction: 'buy' });
+
+    expect((await post(url, payload)).status).toBe(url === '/quote' ? 200 : 201);
+  });
+
+  it.each(['/quote', '/session'] as const)('accepts a well-formed sell on %s and hands it to the service', async (url) => {
+    // The point of the step: a sell is a request this service parses and routes, not one it
+    // fails to understand. It is refused further in, by the rail, with a reason of its own.
+    let reached: unknown;
+    const payload = url === '/quote' ? sellQuoteBody() : sellRequest();
+    const { status } = await post(url, payload, (body) => {
+      reached = body;
+    });
+
+    expect(status).toBe(url === '/quote' ? 200 : 201);
+    expect(reached).toMatchObject({ direction: 'sell', cryptoAmount: '12.3456789012' });
+  });
+
+  it.each(['/quote', '/session'] as const)('refuses a direction that is not one of the two, on %s', async (url) => {
+    const payload = url === '/quote' ? quoteRequestBody({ direction: 'swap' }) : createRequest({ direction: 'swap' });
+
+    expect(await post(url, payload)).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
+  });
+
+  it.each(['/quote', '/session'] as const)('refuses a sell that commits fiat instead of crypto, on %s', async (url) => {
+    // Rejected rather than ignored. A sell carrying `sourceAmount` is a caller who believes they
+    // have committed an amount; silently dropping it would commit nothing and price a corridor
+    // they did not ask about.
+    const payload =
+      url === '/quote'
+        ? sellQuoteBody({ sourceAmount: '20.00' })
+        : sellRequest({ sourceAmount: '20.00' });
+
+    expect(await post(url, payload)).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
+  });
+
+  it.each(['/quote', '/session'] as const)('refuses a sell with no crypto amount, on %s', async (url) => {
+    const payload = url === '/quote' ? sellQuoteBody({ cryptoAmount: undefined }) : sellRequest({ cryptoAmount: undefined });
+
+    expect(await post(url, payload)).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
+  });
+
+  it.each(['/quote', '/session'] as const)('refuses a buy that commits crypto instead of fiat, on %s', async (url) => {
+    const payload =
+      url === '/quote'
+        ? quoteRequestBody({ cryptoAmount: '1.5' })
+        : createRequest({ cryptoAmount: '1.5' });
+
+    expect(await post(url, payload)).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
+  });
+
+  it.each(['/quote', '/session'] as const)('refuses a buy with no fiat amount, on %s', async (url) => {
+    const payload =
+      url === '/quote' ? quoteRequestBody({ sourceAmount: undefined }) : createRequest({ sourceAmount: undefined });
+
+    expect(await post(url, payload)).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
+  });
+
+  it('refuses a sell that supplies a wallet address, rather than ignoring it', async () => {
+    // A seller who sends one believes they have pinned where the crypto goes. Nobody reads it:
+    // on a sell the crypto travels the other way and the provider issues the deposit address.
+    // Accepting it silently is the dangerous half of "extra fields are ignored".
+    expect(await post('/session', sellRequest({ walletAddress: ALICE }))).toEqual({
+      status: 400,
+      code: 'MALFORMED_REQUEST',
+    });
+  });
+
+  it('refuses a buy with no wallet address on /session, and asks for none on /quote', async () => {
+    // The one field the two schemas disagree about: a quote prices a corridor and needs no
+    // destination, in either direction.
+    const withoutAddress = { ...createRequest() };
+    delete (withoutAddress as Record<string, unknown>).walletAddress;
+
+    expect(await post('/session', withoutAddress)).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
+    expect((await post('/quote', quoteRequestBody())).status).toBe(200);
+  });
+
+  it('keeps a crypto amount at a precision the fiat validator cannot express', async () => {
+    // `MINOR_UNIT_DECIMAL` allows two fraction digits, and the upstream was observed echoing
+    // eighteen verbatim. A sell amount routed through the fiat rule would be refused here or,
+    // worse, rounded somewhere later into an amount nobody committed.
+    let reached: unknown;
+    const { status } = await post('/session', sellRequest({ cryptoAmount: '0.012345678901234567' }), (body) => {
+      reached = body;
+    });
+
+    expect(status).toBe(201);
+    expect(reached).toMatchObject({ cryptoAmount: '0.012345678901234567' });
+  });
+
+  it('refuses a crypto amount that is not an exact decimal', async () => {
+    // Exponent form, a thousands separator and a bare sign are all ways a client's number
+    // formatting reaches the wire. None of them is an amount this service will commit.
+    // `0` is in the list because nothing downstream would catch it on a sell: the fiat limit
+    // gate that incidentally refuses a zero buy is skipped by design, the corridor's limits
+    // being fiat while the committed amount is crypto. A zero sell would be persisted as a
+    // committed term and, once the real sell path lands, sent to the provider.
+    for (const amount of ['0', '0.00000000', '1e-7', '1,5', '-1.5', '1.2.3', '', 'abc']) {
+      expect(await post('/session', sellRequest({ cryptoAmount: amount }))).toEqual({
+        status: 400,
+        code: 'MALFORMED_REQUEST',
+      });
+    }
   });
 });
 
@@ -1366,6 +1517,7 @@ describe('the funding surface', () => {
       funding: {
         id: 'funding-1',
         rail: 'meld',
+        direction: 'buy',
         status: 'transaction_seen',
         providerStatus: 'SUCCEEDED',
         destinationCurrencyCode: 'USDC_ASSETHUB',

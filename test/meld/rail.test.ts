@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { fundingRecord, railSessionInput } from '../fixtures.js';
+import { fundingRecord, railSellSessionInput, railSessionInput } from '../fixtures.js';
 
 import { MeldClient } from '../../src/meld/client.js';
 import { Secret } from '../../src/secret.js';
 import { MeldRail } from '../../src/meld/rail.js';
+import { Refusal } from '../../src/contract.js';
 
 /** A Meld stub client exercising just the surface the Meld rail adapts, plus the spies to assert on. */
 /** One offer, so the rail's pass-through can be asserted on rather than an empty array. */
@@ -90,11 +91,52 @@ describe('MeldRail', () => {
     expect(new MeldRail(client().stub).provider).toBe('meld');
   });
 
+  it.each(['quote', 'session'] as const)('refuses a sell %s locally, without spending an upstream call', async (leg) => {
+    // Meld itself serves sells; this side of it does not yet. The inverted legs its wire wants,
+    // a crypto-denominated limit gate and the worker that observes the seller's deposit are all
+    // later steps, and half of that is a seller sending value into a flow nothing watches.
+    //
+    // Refused before the call, which is the rule `onramp.ts` opens with: reaching Meld with a
+    // half-mapped sell would come back as a currency or corridor error about the caller's
+    // request, when the truth is that this service has not built the path.
+    const { stub, quote, createWidgetSession } = client();
+    const rail = new MeldRail(stub);
+
+    const attempt = () =>
+      leg === 'quote'
+        ? rail.quote({
+            direction: 'sell',
+            countryCode: 'GB',
+            sourceCurrencyCode: 'GBP',
+            destinationCurrencyCode: 'DOT_ASSETHUB',
+            cryptoAmount: '12.3456789012',
+            paymentMethodType: 'PAYOUT_TO_BANK',
+          })
+        : rail.createSession(railSellSessionInput());
+    let refusal: Refusal | undefined;
+    try {
+      await attempt();
+    } catch (error) {
+      if (!(error instanceof Refusal)) throw error;
+      refusal = error;
+    }
+
+    expect(refusal?.status).toBe(400);
+    expect(refusal?.failure).toEqual({
+      tag: 'Other',
+      value: { code: 'DIRECTION_UNSUPPORTED', message: 'That funding direction is not available on this rail.' },
+    });
+    expect(refusal?.message).toContain('not built');
+    expect(quote).not.toHaveBeenCalled();
+    expect(createWidgetSession).not.toHaveBeenCalled();
+  });
+
   it('maps a neutral quote onto the Meld client and echoes the canonical requested shape', async () => {
     const { stub, quote } = client();
     const rail = new MeldRail(stub);
 
     const offers = await rail.quote({
+      direction: 'buy',
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
       destinationCurrencyCode: 'USDC_ASSETHUB',
@@ -103,6 +145,7 @@ describe('MeldRail', () => {
     });
 
     expect(quote).toHaveBeenCalledWith({
+      direction: 'buy',
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
       destinationCurrencyCode: 'USDC_ASSETHUB',

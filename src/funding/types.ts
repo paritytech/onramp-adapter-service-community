@@ -9,7 +9,7 @@
  */
 
 import type { FundingFailure } from '../contract.js';
-import type { RailName } from '../rail.js';
+import type { Direction, RailName } from '../rail.js';
 import { TERMINAL_STATES, type FundingState } from './state.js';
 
 /** One entry in a request's status timeline: a state and the instant it reached it. */
@@ -33,9 +33,25 @@ export interface FundingRecord {
   id: string;
   subject_alias: string;
   product_id: string;
+  /**
+   * Which way this request moves value. Never absent: rows written before the column existed are
+   * buys, and the column's `DEFAULT 'buy'` says so for them (v5 -> v6).
+   */
+  direction: Direction;
+  /** The crypto leg in both directions, even on a sell where the crypto is the source. */
   destination_currency_code: string;
-  wallet_address: string;
-  source_amount: string;
+  /** The delivery address, on a buy. A sell has none: the provider issues the deposit address. */
+  wallet_address: string | undefined;
+  /** The fiat committed, on a buy. A sell commits no fiat, only a quoted estimate of it. */
+  source_amount: string | undefined;
+  /**
+   * The crypto committed, on a sell, at full precision and exactly as sent.
+   *
+   * Never converted to a number, and never to fiat minor units: it is the term a resuming client
+   * compares against to tell one sale from another in the same corridor, so a rounded copy of it
+   * is worse than none. The database enforces its presence on a sell (`funding_sell_terms`).
+   */
+  crypto_amount: string | undefined;
   fiat: string;
   payment_method_type: string;
   /**
@@ -84,9 +100,50 @@ export interface FundingRecord {
    * buyer paid.
    */
   cancelled_at?: number | undefined;
+  /**
+   * The sell deposit leg: where the seller sends the crypto, how much, in what, with what memo,
+   * and when this service first read it off the rail.
+   *
+   * Carried on the record because the columns exist (v5 -> v6), and every one of them is
+   * `undefined` on every row this build writes. Nothing populates them yet: the worker that
+   * observes a provider-issued deposit address is a later step, and a half-filled deposit leg is
+   * an address a seller might send real value to. They are here so the shape changed once.
+   */
+  deposit_address?: string | undefined;
+  deposit_amount?: string | undefined;
+  deposit_currency?: string | undefined;
+  deposit_memo?: string | undefined;
+  deposit_observed_at?: number | undefined;
   status_history: TimelineEntry[];
   created_at: number;
   updated_at: number;
+}
+
+/**
+ * Which per-direction database constraint a record would violate, or `undefined` for a row the
+ * database will take.
+ *
+ * The rule is `funding_buy_terms` and `funding_sell_terms` in `schema.ts`, written a second time
+ * here and named after them. A second expression of one rule is normally the thing this repo
+ * refuses, and the exception is the same one `mergeAdvance` is: the in-memory store in
+ * `test/fixtures.ts` is what most of the suite writes through, and a fake that accepts rows
+ * Postgres refuses lets a test assert behaviour against a row production cannot hold. That is
+ * how a sell row with no crypto amount gets reasoned about at all.
+ *
+ * The two cannot be derived from each other (one is SQL text, one is a predicate over a struct),
+ * so they are tied by a test instead: `schema.test.ts` runs the same table of malformed rows
+ * against a real Postgres and against the fake, and requires both to refuse each one.
+ *
+ * Returns the constraint name rather than a boolean so the fake's error reads like the driver's,
+ * and a test asserting on `/funding_sell_terms/` passes against either store.
+ */
+export function directionTermsViolation(record: FundingRecord): string | undefined {
+  if (record.direction === 'sell') {
+    return record.crypto_amount === undefined ? 'funding_sell_terms' : undefined;
+  }
+  return record.wallet_address === undefined || record.source_amount === undefined
+    ? 'funding_buy_terms'
+    : undefined;
 }
 
 /**
@@ -101,12 +158,30 @@ export interface FundingRecord {
 export interface FundingRequestDto {
   id: string;
   rail: RailName;
+  /** Which way this request moves value. Always present; absent on the wire never meant `buy`. */
+  direction: Direction;
   status: FundingState;
   /** Provider's status as of the last state change, not its current one (e.g. Meld `REFUNDED`). */
   providerStatus?: string;
   destinationCurrencyCode: string;
-  walletAddress: string;
-  sourceAmount: string;
+  /**
+   * Present on a buy, absent on a sell. An approved narrowing of a shipped field: a sell has no
+   * caller-supplied address, and an empty string would be a destination nobody pinned.
+   */
+  walletAddress?: string;
+  /** The fiat committed, on a buy. Absent on a sell, which commits no fiat. */
+  sourceAmount?: string;
+  /**
+   * The crypto committed, on a sell. Load-bearing, not informational.
+   *
+   * A client resuming into an existing request compares this against the sale it believes it is
+   * resuming, and refuses on a mismatch. On a buy that job is done by the wallet address, which
+   * is unique per purchase; on a sell there is no such field and `sourceAmount` is absent, so
+   * this is the only term between two sales in one corridor. Omitting it would silently degrade
+   * that check to corridor-only matching, which hands a seller someone else's settlement surface
+   * at someone else's amount. The database refuses a sell row without one.
+   */
+  cryptoAmount?: string;
   fiat: string;
   /**
    * Where an unfinished purchase can be resumed, present only while the request is
@@ -166,11 +241,16 @@ export function toFundingRequestDto(record: FundingRecord, now: number): Funding
   return {
     id: record.id,
     rail: record.rail,
+    direction: record.direction,
     status: record.status,
     ...(record.provider_status === undefined ? {} : { providerStatus: record.provider_status }),
     destinationCurrencyCode: record.destination_currency_code,
-    walletAddress: record.wallet_address,
-    sourceAmount: record.source_amount,
+    // Each of the three committed-amount fields is emitted only where it exists, rather than
+    // defaulted: a buy's body is unchanged, and a sell's carries the crypto it committed and no
+    // fiat term it never committed.
+    ...(record.wallet_address === undefined ? {} : { walletAddress: record.wallet_address }),
+    ...(record.source_amount === undefined ? {} : { sourceAmount: record.source_amount }),
+    ...(record.crypto_amount === undefined ? {} : { cryptoAmount: record.crypto_amount }),
     fiat: record.fiat,
     ...(live && record.widget_url !== undefined ? { serviceProviderWidgetUrl: record.widget_url } : {}),
     ...(live && record.hosted_widget_url !== undefined ? { widgetUrl: record.hosted_widget_url } : {}),

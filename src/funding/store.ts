@@ -23,7 +23,7 @@ import { Pool, types as pgTypes, type PoolClient, type PoolConfig } from 'pg';
 
 import type { FundingFailure } from '../contract.js';
 import type { CorridorDto } from '../meld/discovery.js';
-import type { RailName } from '../rail.js';
+import type { Direction, RailName } from '../rail.js';
 import type { Secret } from '../secret.js';
 import type { FundingState } from './state.js';
 import { TERMINAL_STATES } from './state.js';
@@ -127,9 +127,11 @@ export const COLUMN_LIST = [
   'id',
   'subject_alias',
   'product_id',
+  'direction',
   'destination_currency_code',
   'wallet_address',
   'source_amount',
+  'crypto_amount',
   'fiat',
   'payment_method_type',
   'country',
@@ -145,6 +147,15 @@ export const COLUMN_LIST = [
   'status',
   'reason',
   'cancelled_at',
+  // The sell deposit leg. Written as NULL by every path this build has: the worker that observes
+  // a provider-issued deposit address is a later step, so these are named by the INSERT (which
+  // must name every column it binds) and by nothing else. `UPDATE_QUERY` deliberately does not
+  // list them, because nothing may mutate a column no code fills.
+  'deposit_address',
+  'deposit_amount',
+  'deposit_currency',
+  'deposit_memo',
+  'deposit_observed_at',
   'status_history',
   'created_at',
   'updated_at',
@@ -721,9 +732,11 @@ interface Row {
   id: string;
   subject_alias: string;
   product_id: string;
+  direction: Direction;
   destination_currency_code: string;
-  wallet_address: string;
-  source_amount: string;
+  wallet_address: string | null;
+  source_amount: string | null;
+  crypto_amount: string | null;
   fiat: string;
   payment_method_type: string;
   country: string | null;
@@ -739,6 +752,11 @@ interface Row {
   status: FundingState;
   reason: FundingFailure['tag'] | null;
   cancelled_at: number | null;
+  deposit_address: string | null;
+  deposit_amount: string | null;
+  deposit_currency: string | null;
+  deposit_memo: string | null;
+  deposit_observed_at: number | null;
   status_history: string;
   created_at: number;
   updated_at: number;
@@ -747,6 +765,9 @@ interface Row {
 function rowToRecord(row: Row): FundingRecord {
   return {
     ...row,
+    wallet_address: row.wallet_address ?? undefined,
+    source_amount: row.source_amount ?? undefined,
+    crypto_amount: row.crypto_amount ?? undefined,
     country: row.country ?? undefined,
     service_provider: row.service_provider ?? undefined,
     client_reference: row.client_reference ?? undefined,
@@ -758,6 +779,11 @@ function rowToRecord(row: Row): FundingRecord {
     expires_at: row.expires_at ?? undefined,
     reason: row.reason ?? undefined,
     cancelled_at: row.cancelled_at ?? undefined,
+    deposit_address: row.deposit_address ?? undefined,
+    deposit_amount: row.deposit_amount ?? undefined,
+    deposit_currency: row.deposit_currency ?? undefined,
+    deposit_memo: row.deposit_memo ?? undefined,
+    deposit_observed_at: row.deposit_observed_at ?? undefined,
     status_history: JSON.parse(row.status_history) as TimelineEntry[],
   } satisfies FundingRecord;
 }
@@ -774,9 +800,11 @@ function recordToRow(r: FundingRecord): unknown[] {
     id: r.id,
     subject_alias: r.subject_alias,
     product_id: r.product_id,
+    direction: r.direction,
     destination_currency_code: r.destination_currency_code,
-    wallet_address: r.wallet_address,
-    source_amount: r.source_amount,
+    wallet_address: r.wallet_address ?? null,
+    source_amount: r.source_amount ?? null,
+    crypto_amount: r.crypto_amount ?? null,
     fiat: r.fiat,
     payment_method_type: r.payment_method_type,
     country: r.country ?? null,
@@ -792,6 +820,11 @@ function recordToRow(r: FundingRecord): unknown[] {
     status: r.status,
     reason: r.reason ?? null,
     cancelled_at: r.cancelled_at ?? null,
+    deposit_address: r.deposit_address ?? null,
+    deposit_amount: r.deposit_amount ?? null,
+    deposit_currency: r.deposit_currency ?? null,
+    deposit_memo: r.deposit_memo ?? null,
+    deposit_observed_at: r.deposit_observed_at ?? null,
     status_history: JSON.stringify(r.status_history),
     created_at: r.created_at,
     updated_at: r.updated_at,

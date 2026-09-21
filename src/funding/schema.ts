@@ -2,8 +2,9 @@
  * The funding store's schema, versioned.
  *
  * The SQLite migration chain is gone, and deleting it was the point of moving. v0->v1->v2->v3
- * existed to bring an on-disk SQLite file forward in place; the Postgres chain is 1->2->3->4->5,
- * with 3->4 adding `cancelled_at` and 4->5 adding the supported-corridors cache. Nothing was ever
+ * existed to bring an on-disk SQLite file forward in place; the Postgres chain is 1->2->3->4->5->6,
+ * with 3->4 adding `cancelled_at`, 4->5 adding the supported-corridors cache and 5->6 adding the
+ * sell direction and the terms only a sell commits. Nothing was ever
  * deployed, so that chain migrated a population of
  * zero, and CloudSQL starts from an empty database, so porting it would have meant carrying three
  * migrations for no rows, expressed against an engine this service has left. The v3 shape is the v1 shape
@@ -15,10 +16,11 @@
  * `BEGIN IMMEDIATE`, which served the same purpose against one file.
  */
 
+import { DIRECTIONS } from '../rail.js';
 import { FUNDING_STATES } from './state.js';
 
 /** The current schema version. Bump with each migration added here. */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /** A migration: bring the previous version's rows to this version's shape. */
 export interface Migration {
@@ -43,11 +45,94 @@ const SUPPORTED_CORRIDORS_TABLE =
   ')';
 
 /**
+ * The direction column, written once because `freshSchema()` and the v5 -> v6 migration must
+ * produce the same table.
+ *
+ * `NOT NULL DEFAULT 'buy'`: every row that existed before this column did was a buy, and the
+ * default is what makes that true of the existing population without a backfill pass. It stays
+ * on a fresh database too, so the two paths cannot diverge, but nothing relies on it: every
+ * insert names the column (`COLUMN_LIST`).
+ */
+const DIRECTION_COLUMN = " direction TEXT NOT NULL DEFAULT 'buy'";
+
+/**
+ * The committed crypto on a sell, at full precision, exactly as the caller sent it.
+ *
+ * A shared constant for the same reason `DIRECTION_COLUMN` is one, and it is the field that
+ * proved the reason: written out by hand it sat beside `source_amount` in `freshSchema()` and at
+ * the end of the table on the migrated path, so every column between `fiat` and `cancelled_at`
+ * held a different ordinal depending on which path made the database. Nothing in this service
+ * reads a column by position (`COLUMN_LIST` names every one, and there is no `SELECT *`), so it
+ * broke nothing here — which is exactly why it would have survived: CI creates fresh databases
+ * and production is migrated, so the divergence is invisible until a `COPY` without a column
+ * list, a `pg_dump` shape diff between environments, or a `CREATE TABLE ... LIKE` behaves one way
+ * in tests and another in production.
+ *
+ * Emitted in the migration's append position, because that is the one an existing database is
+ * forced into. `schema.test.ts` compares both tables column by column and constraint by
+ * constraint, so this cannot drift again without a failure.
+ */
+const CRYPTO_AMOUNT_COLUMN = ' crypto_amount TEXT';
+
+/**
+ * The three constraints that keep a row's terms consistent with its direction.
+ *
+ * Named explicitly, unlike the status check above, so a fresh v6 database and a migrated one
+ * carry identical constraint names rather than whatever Postgres happens to auto-generate on
+ * each path.
+ *
+ * The first is the alphabet, exactly as the status check is: the machine still owns the moves,
+ * this stops a row existing in a direction nothing knows how to read.
+ *
+ * The other two replace what the dropped `NOT NULL`s used to guarantee, per direction rather
+ * than globally. `wallet_address` and `source_amount` became nullable because a sell has
+ * neither, and without these a buy could now be written missing both.
+ *
+ * `crypto_amount` is the one worth spelling out. A consumer resuming a sell hard-compares the
+ * committed crypto against its own record to detect being resumed into a *different* sale, and
+ * on a sell there is no other distinguishing term: the wallet address that does that job on a
+ * buy does not exist, and `source_amount` is null. A sell row written without a crypto amount
+ * silently degrades that check to "same corridor", which hands a seller the settlement surface
+ * of someone else's sale at someone else's amount. A database constraint rather than a guard in
+ * the store, because it cannot be bypassed by a future write path that has not read this
+ * comment.
+ */
+const DIRECTION_CONSTRAINTS = [
+  `CONSTRAINT funding_direction_known CHECK (direction IN (${DIRECTIONS.map((d) => `'${d}'`).join(', ')}))`,
+  'CONSTRAINT funding_buy_terms CHECK (' +
+    "direction <> 'buy' OR (source_amount IS NOT NULL AND wallet_address IS NOT NULL))",
+  "CONSTRAINT funding_sell_terms CHECK (direction <> 'sell' OR crypto_amount IS NOT NULL)",
+];
+
+/**
+ * The columns the deposit leg of a sell will be observed into, and the reason they are here
+ * before anything writes them.
+ *
+ * Nothing populates these in this release: the worker path that reads a provider-issued deposit
+ * address off the rail is a later step. They are added now so the shape changes once rather than
+ * twice, because a second `ALTER TABLE` over a populated `funding_requests` is a second migration
+ * window for no schema benefit. Every one is nullable, and null is the overwhelming majority: a
+ * buy has no deposit leg at all.
+ *
+ * `deposit_memo` exists despite Polkadot Asset Hub needing no destination tag, and despite the
+ * sandbox probe finding no candidate field on Meld's transaction record. It is there because an
+ * asset that needs one and has nowhere to put it is a payout sent to the right address and
+ * credited to nobody.
+ */
+const DEPOSIT_COLUMNS = [
+  ' deposit_address TEXT',
+  ' deposit_amount TEXT',
+  ' deposit_currency TEXT',
+  ' deposit_memo TEXT',
+  ' deposit_observed_at BIGINT',
+];
+
+/**
  * The ordered migration list.
  *
  * A fresh database is created at `SCHEMA_VERSION` directly by `freshSchema()`, so this list is
  * what an existing database walks through, one step at a time. The next migration appends
- * `{ from: 5, to: 6, sql: [...] }` and bumps `SCHEMA_VERSION`; `store.ts` needs no change.
+ * `{ from: 6, to: 7, sql: [...] }` and bumps `SCHEMA_VERSION`; `store.ts` needs no change.
  *
  * This chain is one-way. A build expecting v1 refuses a v2 database: the version check is
  * `!==`, deliberately, because reading a shape you do not understand is worse than not starting.
@@ -126,6 +211,79 @@ export const MIGRATIONS: readonly Migration[] = [
     // v4 -> v5: cache Meld's supported corridors for the bulk endpoint. Same shape as freshSchema.
     sql: [SUPPORTED_CORRIDORS_TABLE],
   },
+  {
+    from: 5,
+    to: 6,
+    /**
+     * v5 -> v6: a request can now sell as well as buy.
+     *
+     * A column, not a ninth state, for the third time (see v2 -> v3 and v3 -> v4). A direction is
+     * not a stage of the lifecycle: a sell moves through the same eight states a buy does, in the
+     * same order, and the transition table is untouched by this migration. Making it a state
+     * would be wire-visible to a consumer that understands none of the eight it already has, and
+     * would have to be crossed with every one of them.
+     *
+     * Three things become nullable-or-new because a sell commits different terms:
+     *
+     * - `wallet_address` loses `NOT NULL`. A sell has no caller-supplied address; the provider
+     *   issues the deposit address after the session exists.
+     * - `source_amount` loses `NOT NULL`. A sell commits crypto. The fiat it will fetch is a
+     *   quoted estimate that moves with the rate, and storing an estimate in the column that
+     *   means "what was committed" is how an estimate gets quoted back as a term.
+     * - `crypto_amount` is that committed crypto, at full precision, as the exact string sent.
+     *
+     * The three `CHECK`s added alongside are what stops the two dropped `NOT NULL`s from
+     * loosening a buy; see `DIRECTION_CONSTRAINTS`.
+     *
+     * The deposit columns land in the same step and stay empty until the worker that fills them
+     * exists; see `DEPOSIT_COLUMNS`.
+     *
+     * ## What this step costs a live service, and when that stops being acceptable
+     *
+     * Decided, not left open. The whole step runs in one transaction with `statement_timeout = 0`
+     * (see `FundingStore.migrate`), and the first `ALTER TABLE` takes `ACCESS EXCLUSIVE`, so that
+     * lock is held until `COMMIT` and everything else queues behind it. The service is live
+     * throughout: a rollout's old pods keep serving while the new one migrates at boot.
+     *
+     * Measured at 2,000,000 rows on warm local NVMe:
+     *
+     * - `ADD COLUMN direction TEXT NOT NULL DEFAULT 'buy'`: 4.9 ms. No table rewrite, because
+     *   Postgres 11+ stores a non-volatile default in the catalog rather than writing every row.
+     * - the two `DROP NOT NULL`s: catalog-only, immeasurable.
+     * - the three `ADD CONSTRAINT ... CHECK`: 869 ms + 141 ms + 115 ms. Each validates by
+     *   scanning the whole table.
+     *
+     * So roughly **1.1 s of blackout at 2M rows**, and it scales with the row count. CloudSQL's
+     * storage is slower than the machine that produced these numbers, so treat them as a floor.
+     *
+     * `ADD CONSTRAINT ... NOT VALID` plus a later `VALIDATE CONSTRAINT` is the standard way to
+     * cut that, and it is deliberately **not** used here. It only helps if the validation happens
+     * in a *separate transaction*: inside this one the `ACCESS EXCLUSIVE` lock is held to
+     * `COMMIT` regardless, so splitting the statements without splitting the transaction moves
+     * nothing. Splitting the transaction is the part this harness cannot express, and should not
+     * learn to in this step: a step is one transaction precisely so that its SQL and its
+     * `schema_migrations` stamp commit together, which is what makes a half-applied step at a
+     * stamped version impossible (`schema.test.ts` asserts that directly). Leaving the constraint
+     * `NOT VALID` instead is not an option either: `convalidated` would then differ between a
+     * fresh database and a migrated one, which is the exact class of divergence the shared
+     * `CRYPTO_AMOUNT_COLUMN` constant above exists to prevent.
+     *
+     * **The number to act on: around 10M rows.** That is ~5.5 s of blackout by the scaling above,
+     * past half the pool's 10 s `statement_timeout`, so queued requests begin failing outright
+     * rather than merely slowing down. At that point split the harness to allow a step to declare
+     * post-commit statements, and add these constraints `NOT VALID` with a `VALIDATE` behind it.
+     * Below it, a second of queueing on a deploy is cheaper than the harness change.
+     */
+    sql: [
+      `ALTER TABLE funding_requests ADD COLUMN${DIRECTION_COLUMN}`,
+      'ALTER TABLE funding_requests ALTER COLUMN wallet_address DROP NOT NULL',
+      'ALTER TABLE funding_requests ALTER COLUMN source_amount DROP NOT NULL',
+      `ALTER TABLE funding_requests ADD COLUMN${CRYPTO_AMOUNT_COLUMN}`,
+      ...DEPOSIT_COLUMNS.map((column) => `ALTER TABLE funding_requests ADD COLUMN${column}`),
+      // Last, so every column each one names already exists.
+      ...DIRECTION_CONSTRAINTS.map((constraint) => `ALTER TABLE funding_requests ADD ${constraint}`),
+    ],
+  },
 ];
 
 /**
@@ -148,8 +306,10 @@ export function freshSchema(): string[] {
       ' subject_alias TEXT NOT NULL,' +
       ' product_id TEXT NOT NULL,' +
       ' destination_currency_code TEXT NOT NULL,' +
-      ' wallet_address TEXT NOT NULL,' +
-      ' source_amount TEXT NOT NULL,' +
+      // Nullable since v6: a sell has no caller-supplied wallet address and no committed fiat.
+      // The per-direction CHECKs below are what keeps a buy carrying both.
+      ' wallet_address TEXT,' +
+      ' source_amount TEXT,' +
       ' fiat TEXT NOT NULL,' +
       ' payment_method_type TEXT NOT NULL,' +
       ' country TEXT,' +
@@ -172,12 +332,21 @@ export function freshSchema(): string[] {
       ' reason TEXT,' +
       // When the caller withdrew the request. See the v3 -> v4 migration.
       ' cancelled_at BIGINT,' +
+      // Which way this request moves value, and the crypto a sell commits. Both in the order the
+      // v5 -> v6 migration appends them, so the two paths build the same table.
+      `${DIRECTION_COLUMN},` +
+      `${CRYPTO_AMOUNT_COLUMN},` +
+      // The sell deposit leg, unpopulated until the worker that observes it exists.
+      DEPOSIT_COLUMNS.map((column) => `${column},`).join('') +
       // The vocabulary, enforced by the database rather than only by the state machine.
       // `update()` validates transitions inside its transaction, but `create()` writes whatever
       // status it is handed; both production callers are correct and nothing at the storage layer
       // stopped a third, or a hand-run migration, from writing a state `state.ts` does not have.
       // This does not constrain transitions, only the alphabet; the machine still owns the moves.
-      ` CHECK (status IN (${FUNDING_STATES.map((state) => `'${state}'`).join(', ')}))` +
+      ` CHECK (status IN (${FUNDING_STATES.map((state) => `'${state}'`).join(', ')})),` +
+      // The direction alphabet, and the per-direction term constraints the v6 migration adds to
+      // an existing table. Same text on both paths, so the two tables are the same table.
+      DIRECTION_CONSTRAINTS.map((constraint) => ` ${constraint}`).join(',') +
       ')',
     'CREATE INDEX funding_by_alias ON funding_requests (subject_alias, product_id, created_at DESC, id DESC)',
     // Partial, matching the `WHERE client_reference IS NOT NULL` predicate exactly: a refused row

@@ -93,6 +93,9 @@ describe('toFundingRequestDto', () => {
     expect(dto).toEqual({
       id: 'funding-1',
       rail: 'meld',
+      // Always present, never inferred from an absence: a caller reading a row must not have to
+      // read "no direction" as "buy".
+      direction: 'buy',
       status: 'transaction_seen',
       providerStatus: 'SUCCEEDED',
       destinationCurrencyCode: 'USDC_ASSETHUB',

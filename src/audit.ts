@@ -6,7 +6,7 @@
  * and no card detail.
  */
 
-import type { RailName } from './rail.js';
+import type { Direction, RailName } from './rail.js';
 
 /** One audit line: what happened, to which request, on which rail. */
 export interface AuditEvent {
@@ -40,9 +40,37 @@ export interface AuditEvent {
   productId: string;
   requestId: string;
   destinationCurrencyCode: string;
-  walletAddress: string;
-  sourceAmount: string;
+  /**
+   * The delivery address, on a buy.
+   *
+   * Optional as of the sell release, and this is a deliberate change to a contract that ships
+   * off-box: a consumer of this stream that read `walletAddress` as always-present now has to
+   * handle its absence. A sell has no caller-supplied address at all (the provider issues the
+   * deposit address later), so the alternative was emitting an empty string, which is a claim
+   * about a destination that was never pinned, on the one record a dispute is answered from.
+   */
+  walletAddress?: string;
+  /**
+   * The fiat committed, on a buy. Absent on a sell, which commits crypto and only estimates the
+   * fiat, so a number here would be an estimate presented as a term.
+   */
+  sourceAmount?: string;
+  /** The crypto committed, on a sell. Absent on a buy. Exactly as sent, never rounded. */
+  cryptoAmount?: string;
   fiat: string;
+  /**
+   * Which way the value moved. **Absent means `buy`**, matching `DEFAULT_DIRECTION` on the wire.
+   *
+   * Optional, and omitted rather than written as `'buy'`, which is the opposite of how `rail` is
+   * treated and is deliberate. This stream ships off-box into consumers this repo cannot see,
+   * and a consumer validating against a fixed schema (`additionalProperties: false`, a fixed
+   * BigQuery or Athena column set) breaks on an unexpected key exactly as it breaks on a missing
+   * one. Requiring the field would change the shape of every buy line ever emitted to buy
+   * nothing; omitting it means an existing consumer sees no change at all, and only the sell
+   * lines it has never seen before carry the new keys. The `walletAddress` narrowing above
+   * follows the same rule from the other side.
+   */
+  direction?: Direction;
   /**
    * The jurisdiction the request transacted under. It selects the provider set, the fee schedule
    * and the KYC path at the rail, so a dispute cannot be answered without it.

@@ -19,6 +19,21 @@ import { MeldHttpError } from './client.js';
  * The amount pattern is an amount, not "digits and dots": `[\d.]+` matched `1.2.3` and put it on
  * the wire under a field the contract types as a decimal, for a client to try to render. Dropping
  * an unreadable number is already the correct fallback.
+ *
+ * **It yields nothing on a sell, and that is not a wording risk but a certainty.** Observed
+ * against the sandbox: a sell's limit rejection puts no number in the top-level message at all.
+ * It reads "[TRANSAK] Source amount is below the minimum allowed", and the threshold sits in
+ * `serviceProviderDetails.message` as prose that differs between the minimum and maximum cases
+ * ("Minimum sell amount should be more than or equal to 0.00011648 BTC" against "Please place an
+ * order of less than 0.2812547 BTC"). `MeldHttpError.detail` does not carry that field, the
+ * `which is` anchor is absent, and the symbol may be `DOT_ASSETHUB`, which the three-letter
+ * currency group would not match either.
+ *
+ * Left as it is deliberately: the tag still resolves (the below/above phrases are present in the
+ * top-level message in both directions), so a sell refusal reaches the caller correctly, without
+ * a threshold. What must not happen is a later step assuming a number arrives here. A sell
+ * threshold is also **crypto-denominated**, so feeding one into anything that reads it as fiat
+ * minor units is a wrong number at the boundary, not a missing one.
  */
 function threshold(detail: string): { value: { amount: string; currency: string } } | undefined {
   const m = detail.match(/which is\s+(\d+(?:\.\d{1,2})?)\s+([A-Za-z]{3})/i);

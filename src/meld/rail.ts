@@ -9,6 +9,7 @@
  * `ProviderTimeout` degrade all survive the seam.
  */
 
+import { directionUnsupported } from '../contract.js';
 import type { MeldClient } from './client.js';
 import type { RailObservation, TransactionMapper } from '../funding/worker.js';
 import type { FundingRail, MeldTransactionReader, RailQuote, RailSession, RailSessionInput, RailTransaction } from '../rail.js';
@@ -33,19 +34,38 @@ const MELD_STATUS_TO_STATE: TransactionMapper = (status) => {
   return 'transaction_seen';
 };
 
+/**
+ * Both legs refuse a sell, for now, and say which leg refused.
+ *
+ * Meld itself serves sells: the sandbox answers a `sessionType: "SELL"` session and prices a
+ * crypto-denominated quote on the same two endpoints. What does not exist yet is this side of it
+ * — the inverted legs Meld's wire wants, a sell's crypto-denominated limit gate (the corridor
+ * catalog's limits are fiat, so the existing gate would compare DOT against GBP), and the worker
+ * that observes the seller's deposit. Half of that is not a sell; it is a seller sending value
+ * into a flow nothing watches.
+ *
+ * So the refusal is local, before any upstream call, and carries the real reason. Reaching Meld
+ * with a half-mapped sell would answer with a currency or corridor error about the caller's
+ * request, when the truth is that this service has not built the path.
+ */
+const sellNotBuilt = (leg: 'quote' | 'session') =>
+  directionUnsupported(`Meld ${leg}: the sell path is not built on this rail yet.`);
+
 export class MeldRail implements FundingRail, MeldTransactionReader {
   readonly provider = 'meld' as const;
 
   constructor(private readonly client: MeldClient) {}
 
-  // `RailQuote` and Meld's `QuoteParams` are the same five fields under the same names, so the
+  // `RailBuyQuote` and Meld's `QuoteParams` are the same five fields under the same names, so the
   // port needs no translation here. `createSession` genuinely renames `fiat` to `sourceCurrency`
   // and does map field by field.
   async quote(input: RailQuote): Promise<unknown[]> {
+    if (input.direction === 'sell') throw sellNotBuilt('quote');
     return this.client.quote(input);
   }
 
   async createSession(input: RailSessionInput): Promise<RailSession> {
+    if (input.direction === 'sell') throw sellNotBuilt('session');
     const session = await this.client.createWidgetSession({
       destinationCode: input.destinationCode,
       walletAddress: input.walletAddress,
