@@ -19,6 +19,16 @@ export interface TimelineEntry {
 }
 
 /**
+ * Why a disclosed deposit address was not accepted as an update to the one already stored.
+ *
+ * A closed vocabulary, enforced by `funding_deposit_conflict_reason_known` in `schema.ts`, so a
+ * support query can group on it. `address_changed` is a well-formed address that disagrees with
+ * the one already stored; `address_malformed` is a value that does not decode as an account at
+ * all. See `mergeDeposit` in `funding/merge.ts`, the one place either is produced.
+ */
+export type DepositConflictReason = 'address_changed' | 'address_malformed';
+
+/**
  * The durable record of one funding request.
  *
  * The pinned terms are stored as-sent (the address normalised, the code resolved) so the status
@@ -104,16 +114,30 @@ export interface FundingRecord {
    * The sell deposit leg: where the seller sends the crypto, how much, in what, with what memo,
    * and when this service first read it off the rail.
    *
-   * Carried on the record because the columns exist (v5 -> v6), and every one of them is
-   * `undefined` on every row this build writes. Nothing populates them yet: the worker that
-   * observes a provider-issued deposit address is a later step, and a half-filled deposit leg is
-   * an address a seller might send real value to. They are here so the shape changed once.
+   * Written once, by `mergeDeposit` (`funding/merge.ts`), from the first disclosure the worker
+   * observes, and never silently revised after that: a later poll fills in a field still
+   * `undefined` but does not overwrite one already set. `undefined` on every buy, always, and on
+   * a sell until the provider discloses one.
    */
   deposit_address?: string | undefined;
   deposit_amount?: string | undefined;
   deposit_currency?: string | undefined;
   deposit_memo?: string | undefined;
   deposit_observed_at?: number | undefined;
+  /**
+   * A deposit-address disclosure this service refused to accept, recorded rather than only
+   * thrown: a rail reporting a different address than the one already stored (or one that does
+   * not decode as an account at all) is an integrity problem `mergeDeposit` never lets overwrite
+   * `deposit_address`, so the rejected value lives here instead, queryable by an operator without
+   * anyone needing to grep logs. Deliberately absent from `FundingRequestDto`: exactly as
+   * `reason` is recorded but not surfaced (see below), whether a caller sees that a rail
+   * disagreed with itself is a product decision this column does not pre-empt, and the seller has
+   * nothing to act on from it in any case -- the address they were shown has not changed.
+   */
+  deposit_conflict_address?: string | undefined;
+  deposit_conflict_reason?: DepositConflictReason | undefined;
+  /** When the conflict was last observed. Re-stamped on every recurrence, not only the first. */
+  deposit_conflict_at?: number | undefined;
   status_history: TimelineEntry[];
   created_at: number;
   updated_at: number;
@@ -216,9 +240,31 @@ export interface FundingRequestDto {
    * the observation is not. It can still settle, and a client showing it must not claim otherwise.
    */
   cancelledAt?: number;
+  /**
+   * Where the seller must send the crypto, once Meld has disclosed it. Present only while the
+   * request is `live` (see `serviceProviderWidgetUrl` above) -- handing out an address for a
+   * concluded or cancelled request is exactly the hazard that gate exists to prevent, and here the
+   * cost of getting it wrong is an irreversible on-chain send, not a stale capture page.
+   *
+   * All-or-nothing, deliberately. `address`, `amount` and `currency` are read together or not at
+   * all: a seller who is shown an address with no amount, or an amount with no currency to read it
+   * in, has been given something that looks complete and is not. See `toFundingRequestDto`.
+   */
+  deposit?: FundingRequestDeposit;
   createdAt: number;
   updatedAt: number;
   history: TimelineEntry[];
+}
+
+/** The nested shape of `FundingRequestDto.deposit`. See its doc comment for the disclosure rule. */
+export interface FundingRequestDeposit {
+  address: string;
+  amount: string;
+  currency: string;
+  /** Present only for an asset that needs one. Absent is the normal, permanent case for most. */
+  memo?: string;
+  /** When this service first read the disclosure off the rail, not when Meld itself issued it. */
+  observedAt: number;
 }
 
 /**
@@ -256,8 +302,40 @@ export function toFundingRequestDto(record: FundingRecord, now: number): Funding
     ...(live && record.hosted_widget_url !== undefined ? { widgetUrl: record.hosted_widget_url } : {}),
     ...(live && record.expires_at !== undefined ? { expiresAt: record.expires_at } : {}),
     ...(record.cancelled_at === undefined ? {} : { cancelledAt: record.cancelled_at }),
+    ...(live ? depositDisclosure(record, now) : {}),
     createdAt: record.created_at,
     updatedAt: record.updated_at,
     history: record.status_history,
+  };
+}
+
+/**
+ * The `{ deposit }` wrapper for `toFundingRequestDto`, or `{}` when there is nothing safe to show.
+ *
+ * Gated on the caller passing `live` first (see `toFundingRequestDto`), and, independently, on
+ * `address`, `amount` and `currency` all being present. The three are read together deliberately:
+ * `mergeAdvance` can, in principle, leave a row with an address and no amount yet (a provider that
+ * discloses one before the other, which is unverified either way -- see `funding/merge.ts`), and a
+ * half-disclosure is worse than none. An address with no amount looks like a destination with
+ * nothing wrong with it; a seller cannot tell "not disclosed" from "disclosed, but this service
+ * dropped a field" from the wire alone, so neither is sent until all three exist.
+ */
+function depositDisclosure(record: FundingRecord, now: number): { deposit?: FundingRequestDeposit } {
+  const { deposit_address: address, deposit_amount: amount, deposit_currency: currency } = record;
+  if (address === undefined || amount === undefined || currency === undefined) return {};
+  return {
+    deposit: {
+      address,
+      amount,
+      currency,
+      ...(record.deposit_memo === undefined ? {} : { memo: record.deposit_memo }),
+      // `deposit_observed_at` is written in the same merge as `deposit_address` (see
+      // `mergeAdvance`), so in practice it is never absent here; still guarded rather than
+      // asserted, because a DTO builder asserting a database's internal consistency is the wrong
+      // place to discover it is wrong. `now` is the caller's own clock (see `toFundingRequestDto`),
+      // never `Date.now()`, so this stays exactly as pure and as testable as the function it falls
+      // back inside of.
+      observedAt: record.deposit_observed_at ?? now,
+    },
   };
 }

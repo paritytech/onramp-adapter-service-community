@@ -25,9 +25,18 @@
  * cannot avoid, because the bound is not known locally.
  */
 
-import type { MeldClient } from './client.js';
+import type { MeldClient, MeldTransaction } from './client.js';
+import type { FundingRecord } from '../funding/types.js';
 import type { RailObservation, TransactionMapper } from '../funding/worker.js';
-import type { FundingRail, MeldTransactionReader, RailQuote, RailSession, RailSessionInput, RailTransaction } from '../rail.js';
+import type {
+  FundingRail,
+  MeldTransactionReader,
+  RailDeposit,
+  RailQuote,
+  RailSession,
+  RailSessionInput,
+  RailTransaction,
+} from '../rail.js';
 
 /**
  * Meld's transaction status onto the funding lifecycle, by Meld's documented TERMINAL/TEMPORARY
@@ -150,9 +159,53 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
         // The record's own id, which is what was filed with Meld (not `client_reference`, the
         // caller's key). See `RailSessionInput.clientReference` for why.
         const txn = await this.client.transactionByReference(record.id);
-        return txn === undefined ? undefined : { id: txn.id, status: txn.status ?? null };
+        if (txn === undefined) return undefined;
+        const deposit = depositFrom(record, txn);
+        return { id: txn.id, status: txn.status ?? null, ...(deposit === undefined ? {} : { deposit }) };
       },
       mapper: MELD_STATUS_TO_STATE,
     };
   }
+}
+
+/**
+ * The off-ramp deposit fact, read off Meld's transaction record. `undefined` on a buy, always,
+ * and on a sell until the provider discloses one.
+ *
+ * **The address**: `cryptoDetails.offrampDestinationWalletAddress`, confirmed to exist on the
+ * schema and confirmed `null` on every buy record this account has produced. It has never been
+ * observed populated -- no sell has been driven through this account's one onboarded provider far
+ * enough to produce a transaction at all (DOT_ASSETHUB is not sellable on it; see the probe). That
+ * gap is why this reads the field defensively (nullish, not asserted) rather than trusting it.
+ *
+ * **The amount**: the top-level `sourceAmount`, not `serviceProviderDetails.details.cryptoAmount`.
+ * Two reasons, not one. First, `sourceAmount` is already this service's name for the crypto leg of
+ * a sell everywhere else in this file (`SellQuoteParams`, `SellWidgetSessionParams`) -- it is the
+ * exact amount the seller committed, typed and schema-validated, where
+ * `serviceProviderDetails.details` is untyped, per-provider passthrough this service has never
+ * had reason to trust. Second, and more directly: this service already knows what the seller
+ * committed, from its own row (`FundingRecord.crypto_amount`), and if the two ever disagree the
+ * question is not "which field do I read" but "why did the amount change after commitment" -- a
+ * question this step does not answer, because no sell has reached this line to raise it. Reusing a
+ * field this codebase already reads for the same leg is what makes the wrong guess cheap to
+ * correct: if a real sell shows the figure belongs elsewhere, this is the one line that moves,
+ * and nothing in `merge.ts`, `store.ts` or the DTO depends on which field feeds it.
+ *
+ * **The currency**: never read off Meld. It is `record.destination_currency_code`, pinned before
+ * the rail was ever called and incapable of legitimately differing from what a sell's deposit
+ * address receives, so there is nothing to cross-check by asking the provider to repeat it.
+ *
+ * **The memo**: always `undefined`. No candidate field exists anywhere in the probed schema (see
+ * the probe's §4); Asset Hub does not need one, and a guessed field name would be worse than an
+ * honest absence.
+ */
+function depositFrom(record: FundingRecord, txn: MeldTransaction): RailDeposit | undefined {
+  if (record.direction !== 'sell') return undefined;
+  const address = txn.cryptoDetails?.offrampDestinationWalletAddress ?? undefined;
+  if (address === undefined) return undefined;
+  return {
+    address,
+    ...(txn.sourceAmount === undefined || txn.sourceAmount === null ? {} : { amount: txn.sourceAmount }),
+    currency: record.destination_currency_code,
+  };
 }

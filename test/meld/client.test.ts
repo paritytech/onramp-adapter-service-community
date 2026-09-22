@@ -965,6 +965,34 @@ describe('transaction', () => {
 
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('a%2Fb%20%3Fx');
   });
+
+  it('reads the off-ramp deposit address off cryptoDetails, when Meld discloses one', async () => {
+    // The one field `meld/rail.ts`'s `depositFrom` reads. Confirmed here at the schema boundary,
+    // not only through a stubbed client in `rail.test.ts`: this is what actually proves
+    // `transactionResponse` parses the field rather than dropping it under `.loose()`.
+    stub(200, {
+      id: 'tx-1',
+      status: 'PENDING',
+      cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress', walletAddress: null },
+    });
+
+    const txn = await client().transaction('tx-1');
+    expect(txn.cryptoDetails?.offrampDestinationWalletAddress).toBe('1DepositAddress');
+  });
+
+  it('reads a null deposit address as not yet disclosed, which is every buy this account has produced', async () => {
+    stub(200, { id: 'tx-1', status: 'SETTLED', cryptoDetails: { offrampDestinationWalletAddress: null } });
+
+    const txn = await client().transaction('tx-1');
+    expect(txn.cryptoDetails?.offrampDestinationWalletAddress).toBeNull();
+  });
+
+  it('tolerates a transaction record with no cryptoDetails at all', async () => {
+    stub(200, { id: 'tx-1', status: 'PENDING' });
+
+    const txn = await client().transaction('tx-1');
+    expect(txn.cryptoDetails).toBeUndefined();
+  });
 });
 
 describe('verifyCredentials', () => {

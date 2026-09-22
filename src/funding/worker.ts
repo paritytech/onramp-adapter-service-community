@@ -24,8 +24,9 @@
 
 import { randomUUID } from "node:crypto";
 
+import { canonicalizeDisclosedAddress } from "../address.js";
 import type { Clock } from "../onramp.js";
-import type { RailName } from "../rail.js";
+import type { RailDeposit, RailName } from "../rail.js";
 import type { FundingState } from "./state.js";
 import type { FundingStore } from "./store.js";
 import type { FundingRecord } from "./types.js";
@@ -46,6 +47,15 @@ export interface TransactionObservation {
   id: string;
   /** A rail may report a status, or leave it absent/unknown; the id is the join key that matters. */
   status: string | null | undefined;
+  /**
+   * A provider-issued fact disclosed alongside this observation, rather than at session creation.
+   *
+   * `undefined` on every buy observation, forever: a buy's wallet address is the caller's own,
+   * sent before the session opened, so there is nothing for a provider to disclose. On a sell it
+   * starts `undefined` and may become populated on any later poll, once the provider issues a
+   * deposit address -- see `RailDeposit`.
+   */
+  deposit?: RailDeposit;
 }
 
 /**
@@ -57,6 +67,17 @@ export interface TransactionObservation {
 export type TransactionMapper = (
   providerStatus: string | undefined,
 ) => FundingState;
+
+/**
+ * The worker's one log sink, everywhere in this module.
+ *
+ * `level` is optional and defaults to `'warn'` at the call site the process binds (`startup.ts`),
+ * which is what every pre-existing single-argument call keeps doing without change. `'error'`
+ * exists for exactly one caller today: a deposit-address disclosure conflict (see `tick`), which
+ * needs to read differently in an aggregator from "a rail hiccuped, this will clear itself" --
+ * the two were previously indistinguishable except by parsing the message text.
+ */
+export type WorkerLog = (message: string, level?: 'warn' | 'error') => void;
 
 /** Per-rail finder + mapper. A rail with no entry here is not wired for observation. */
 export interface RailObservation {
@@ -87,7 +108,7 @@ export async function tick(
   now: number,
   observations: Readonly<Partial<Record<RailName, RailObservation>>>,
   sessionMaxAgeMs: number,
-  log: (message: string) => void,
+  log: WorkerLog,
   // Not defaulted: a wrong default here would be a wrong deployment.
   lease: Lease,
   /** How long a refused row is kept, and when this worker last swept. Omitted, nothing is pruned. */
@@ -146,7 +167,12 @@ export async function tick(
         // request) or a completed write. Resetting merely because `advanceOne` did not throw would
         // sit ahead of `store.update`, so a systemic store fault could oscillate the counter
         // between 0 and 1 and never reach the ceiling.
-        if (done === undefined || done.state === record.status) {
+        //
+        // The state staying put is not, on its own, "nothing to do": a sell's deposit address can
+        // be disclosed while the row sits in `transaction_seen` unmoved, and that fact still has
+        // to reach the row. So the skip condition is "no move AND nothing newly discovered",
+        // not "no move" alone -- the one case this whole step exists to open a channel for.
+        if (done === undefined || (done.state === record.status && done.discovered?.deposit === undefined)) {
           consecutiveFailures = 0;
           continue;
         }
@@ -160,6 +186,23 @@ export async function tick(
           // else's advance as this worker's own would double-count and hide the overlap.
           claimedBy: lease.workerId,
         });
+        // A deposit-address disclosure conflict does not throw any more (`mergeDeposit` records
+        // it and lets an unrelated, legitimate transition through beside it, see `merge.ts`), so
+        // it needs its own alarm here or it would be invisible: no error, no failed write, just a
+        // row that quietly stopped accepting new disclosures. `deposit_conflict_at` changing is
+        // the signal -- re-stamped by `mergeDeposit` on every recurrence, not only the first, so
+        // this fires again each time the same disagreement is seen, which is what "loud" means
+        // for a fact an operator has not yet acted on. Its own line, and its own level: an
+        // aggregator must be able to tell this apart from the generic per-record failure below,
+        // which a rail hiccup produces just as easily and clears on its own.
+        if (refreshed !== undefined && refreshed.deposit_conflict_at !== record.deposit_conflict_at) {
+          log(
+            `funding worker: request ${record.id} received a conflicting deposit disclosure ` +
+              `(${refreshed.deposit_conflict_reason ?? 'unknown reason'}: "${refreshed.deposit_conflict_address ?? 'unknown value'}"); ` +
+              `the previously disclosed address is unchanged and was kept. This needs a person, not a retry.`,
+            'error',
+          );
+        }
         consecutiveFailures = 0;
         if (refreshed !== undefined) advanced += 1;
       } catch (error) {
@@ -242,7 +285,7 @@ async function prune(
   store: Pick<FundingStore, 'pruneRefusals'>,
   now: number,
   retention: Retention | undefined,
-  log: (message: string) => void,
+  log: WorkerLog,
 ): Promise<void> {
   if (retention === undefined) return;
   // Before the interval check, not after it. A backward clock jump makes `now - lastSweptAt`
@@ -297,8 +340,13 @@ interface Advance {
   /**
    * Present only once a transaction is observed. `undefined` keeps the stored provider facts
    * untouched; the state move alone is what the other advances need.
+   *
+   * `deposit` rides along independently of whether `state` actually moves: a sell's deposit
+   * address can be disclosed while a row sits in `transaction_seen` unmoved, still waiting for
+   * the seller's on-chain transfer, which is neither a settlement nor a failure. `tick` reads
+   * this field precisely so that case still reaches a write.
    */
-  discovered?: { providerTransactionId: string; providerStatus: string | null };
+  discovered?: { providerTransactionId: string; providerStatus: string | null; deposit?: RailDeposit };
 }
 
 /**
@@ -341,7 +389,7 @@ async function advanceOne(
    */
   obs: RailObservation | undefined,
   /** Where a conclusion drawn from a failure explains itself. See the `catch` below. */
-  log: (message: string) => void,
+  log: WorkerLog,
   /**
    * Do not ask the rail this tick: enough consecutive failures have already been seen to
    * conclude the fault is not per-row.
@@ -414,12 +462,16 @@ async function advanceOne(
       throw cause;
     }
     if (txn !== undefined) {
-      // A payment was observed: capture the transaction and its status for a later conclusion.
+      // A payment was observed: capture the transaction and its status for a later conclusion,
+      // and any provider-issued fact disclosed the same moment. On a sell, Meld's own deposit
+      // address lives on the transaction record (see `meld/rail.ts`), so it can already be
+      // populated the very first time a transaction is seen at all.
       return {
         state: "transaction_seen",
         discovered: {
           providerTransactionId: txn.id,
           providerStatus: txn.status ?? null,
+          ...(txn.deposit !== undefined && depositIsNew(record, txn.deposit) ? { deposit: txn.deposit } : {}),
         },
       };
     }
@@ -452,7 +504,24 @@ async function advanceOne(
   // The window runs from `updated_at`, the instant this row reached `transaction_seen`, which does
   // not move again while it stays there. Measuring from `created_at` would leave a payment seen
   // late in a request's life only the remainder of that life to conclude in.
-  if (now > record.updated_at + sessionMaxAgeMs) return { state: "unobserved" };
+  //
+  // Logged, unlike the `session_opened` timeout above it: a request that never got as far as a
+  // transaction ageing out is the ordinary shape of an abandoned purchase, but one that DID reach
+  // a transaction and then aged out anyway means either an unrecognised terminal status (the
+  // mapper's fall-through is what makes that possible at all -- see `MELD_STATUS_TO_STATE`) or,
+  // worse on a sell, a deposit address the seller was shown with no settlement ever observed
+  // against it. Neither should conclude without a trace an operator can find.
+  if (now > record.updated_at + sessionMaxAgeMs) {
+    const detail =
+      record.deposit_address === undefined
+        ? `its status stayed "${record.provider_status ?? 'unknown'}"`
+        : 'a deposit address was disclosed to the seller but no settlement was ever observed';
+    log(
+      `funding worker concluded ${record.id} as unobserved: ${detail}, past the observation ` +
+        'window without reaching a recognised ending',
+    );
+    return { state: "unobserved" };
+  }
 
   // Re-observe, rather than re-mapping the status frozen at discovery. `provider_status` is
   // written once, on the `session_opened -> transaction_seen` edge, so mapping that stored value
@@ -470,9 +539,11 @@ async function advanceOne(
   const status = txn?.status ?? record.provider_status;
   const state = obs.mapper(status ?? undefined);
   // The refreshed facts ride along with the state move, so a conclusion records the status it
-  // concluded on. They are written only when the state actually changes (`tick` skips the write
-  // otherwise), which is why the re-observation above, not the stored value, is what keeps a
-  // still-pending transaction mapping against the newest fact.
+  // concluded on. The id/status pair is written only when the state actually changes (`tick`
+  // skips the write otherwise), which is why the re-observation above, not the stored value, is
+  // what keeps a still-pending transaction mapping against the newest fact. `deposit` is the one
+  // exception: `tick` writes it even when `state` does not move, because a sell's deposit address
+  // is exactly the fact that arrives while a row sits here unmoved.
   return txn === undefined
     ? { state }
     : {
@@ -480,8 +551,59 @@ async function advanceOne(
         discovered: {
           providerTransactionId: txn.id,
           providerStatus: txn.status ?? null,
+          ...(txn.deposit !== undefined && depositIsNew(record, txn.deposit) ? { deposit: txn.deposit } : {}),
         },
       };
+}
+
+/**
+ * Whether `deposit` tells the store something it does not already have.
+ *
+ * Without this, `tick` would write every tick for the life of a disclosed sell: `depositFrom`
+ * (`meld/rail.ts`) reports the same address on every poll once the provider has populated the
+ * field on the transaction record, not only the first time it appears, so a naive "a deposit is
+ * present" check never goes back to "nothing to do" once one exists. Every such write bumps
+ * `updated_at`, which is exactly the column `deadlineFor`'s `transaction_seen` branch measures
+ * its window from -- so a clean, settled disclosure would otherwise keep this row's deadline
+ * sliding forward for ever, and the `session_max_age_ms` safety valve (and the claim slot it
+ * frees on ageing out) would never fire for a sell that never settles.
+ *
+ * Two things count as "not new", both compared against the record as it stood before this poll:
+ *
+ * 1. It matches what is already accepted. **Canonicalised on both sides**, not a raw comparison:
+ *    `record.deposit_address` is always canonical (`mergeDeposit` never stores anything else),
+ *    while `deposit.address` is the rail's raw string, and the two encodings are not the same
+ *    string for the same account whenever a rail's own default prefix differs from Polkadot's
+ *    canonical one (0) -- which, per `address.ts`, is the *default* SS58 behaviour (42), not an
+ *    exotic case. Comparing the raw forms directly would make the ordinary case look "new" on
+ *    every single poll for ever, undoing the entire point of this function for the common
+ *    disclosure rather than only an unusual one. Amount/currency/memo are compared as reported,
+ *    for whichever of them the rail bothered to include this time.
+ * 2. It matches the address already on file as a *known conflict* (`deposit_conflict_address`).
+ *    Without this second case, a rail that keeps disclosing the same wrong address would look
+ *    "new" on every single tick for ever, and each of those writes would re-run
+ *    `mergeDeposit`'s conflict path -- correct in isolation, but reintroducing the exact
+ *    perpetual-write problem this function exists to close, just for the conflicted case instead
+ *    of the clean one. This one stays a **raw** comparison, deliberately: `mergeDeposit` stores
+ *    `deposit_conflict_address` as the rail's own unmodified string (see its doc comment), exactly
+ *    so this dedup can stay cheap and does not need to re-derive a canonical form of a value that
+ *    may not even canonicalise at all (a malformed disclosure has no canonical form to compare).
+ *
+ * A `deposit.address` that does not canonicalise never matches (1) -- there is nothing valid to
+ * compare it against -- so it correctly falls through to be recorded as a conflict by
+ * `mergeDeposit` rather than being silently absorbed here as "no different from what we have".
+ */
+function depositIsNew(record: FundingRecord, deposit: RailDeposit): boolean {
+  const canonical = canonicalizeDisclosedAddress(deposit.address);
+  const matchesAccepted =
+    canonical !== undefined &&
+    record.deposit_address === canonical &&
+    // `currency` is required on `RailDeposit` (see its doc comment), unlike `amount` and `memo`.
+    record.deposit_currency === deposit.currency &&
+    (deposit.amount === undefined || record.deposit_amount === deposit.amount) &&
+    (deposit.memo === undefined || record.deposit_memo === deposit.memo);
+  const matchesKnownConflict = record.deposit_conflict_address === deposit.address;
+  return !matchesAccepted && !matchesKnownConflict;
 }
 
 /**
@@ -500,7 +622,7 @@ export function startWorker(
   intervalMs: number,
   observations: Readonly<Partial<Record<RailName, RailObservation>>>,
   sessionMaxAgeMs: number,
-  log: (message: string) => void,
+  log: WorkerLog,
   clock: Clock = Date.now,
   // One lease for the life of this worker, so every tick claims under the same name and a row
   // this worker already holds is not contested by its own next tick.

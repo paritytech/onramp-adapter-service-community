@@ -215,8 +215,13 @@ export async function start(
           // it only survives at `silent`, which is what the tests use. The worker's error handler
           // calls this sink, so an unbound one turned any tick error into an unhandled rejection
           // and took the process down, the exact outcome the handler exists to prevent.
-          (message) => {
-            server.log.warn(message);
+          //
+          // `level` defaults to `'warn'`, which is every call this worker made before it could
+          // also ask for `'error'`. The one caller that does (a deposit-address disclosure
+          // conflict) needs to read differently in an aggregator from the routine per-record
+          // failure beside it, which this same sink also carries.
+          (message, level = 'warn') => {
+            server.log[level](message);
           },
           undefined,
           undefined,

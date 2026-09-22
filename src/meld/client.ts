@@ -368,6 +368,16 @@ const transactionResponse = z
     sourceAmount: scalarAmount.nullish(),
     destinationAmount: scalarAmount.nullish(),
     serviceProvider: z.string().nullish(),
+    /**
+     * The off-ramp deposit address, when Meld has issued one. Confirmed, live: the key exists on
+     * every transaction record probed (buy and sell alike), spelled exactly as here, and is
+     * `null` on every one of them, because every probed record was a buy -- a buy's wallet address
+     * is the caller's own, sent before the session opened, so there is nothing here for it. It has
+     * never been observed populated: no sell has been driven through this account's one onboarded
+     * provider far enough to produce a transaction (see the probe note). `.loose()` on the nested
+     * object rather than a bare string, so a field Meld adds beside it does not break this.
+     */
+    cryptoDetails: z.object({ offrampDestinationWalletAddress: z.string().nullish() }).loose().nullish(),
   })
   .loose();
 

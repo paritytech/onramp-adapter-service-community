@@ -37,7 +37,7 @@ import {
   type Migration,
 } from './schema.js';
 import { mergeAdvance, type UpdateExtra } from './merge.js';
-import type { FundingRecord, TimelineEntry } from './types.js';
+import type { DepositConflictReason, FundingRecord, TimelineEntry } from './types.js';
 
 /**
  * Read `BIGINT` as a number, not a string.
@@ -147,15 +147,21 @@ export const COLUMN_LIST = [
   'status',
   'reason',
   'cancelled_at',
-  // The sell deposit leg. Written as NULL by every path this build has: the worker that observes
-  // a provider-issued deposit address is a later step, so these are named by the INSERT (which
-  // must name every column it binds) and by nothing else. `UPDATE_QUERY` deliberately does not
-  // list them, because nothing may mutate a column no code fills.
+  // The sell deposit leg. Named by the INSERT (which must name every column it binds), which is
+  // why every row still starts out NULL here, and by `UPDATE_QUERY` too: the worker's observation
+  // finder is what fills these once a provider discloses, through `UpdateExtra.deposit` and
+  // `mergeAdvance`/`mergeDeposit` (`funding/merge.ts`), which is also where a conflicting
+  // disclosure is recorded rather than accepted. Nothing else writes them.
   'deposit_address',
   'deposit_amount',
   'deposit_currency',
   'deposit_memo',
   'deposit_observed_at',
+  // Where a deposit-address disclosure conflict is recorded. See `mergeDeposit` and the v6 -> v7
+  // migration in `schema.ts`.
+  'deposit_conflict_address',
+  'deposit_conflict_reason',
+  'deposit_conflict_at',
   'status_history',
   'created_at',
   'updated_at',
@@ -188,7 +194,13 @@ const RESERVE_QUERY =
  * are re-bound from the merged record inside `update`, which is why the list is long. Driven by the
  * worker and by `Onramp`, which uses it to release a reservation and to open a session.
  *
- * `$13` is the claim guard. When the caller holds a lease the update matches only while that lease
+ * The eight deposit-shaped columns ($12-$19) are here for exactly one writer: the worker's
+ * observation finder, through `mergeAdvance`/`mergeDeposit`. Every other caller's merged record
+ * carries the previous row's deposit and conflict fields untouched (`mergeDeposit` coalesces
+ * them), so binding them unconditionally on every update is not a new way for them to be written,
+ * only the one place they finally can be.
+ *
+ * `$21` is the claim guard. When the caller holds a lease the update matches only while that lease
  * is still theirs; `Onramp` passes null and matches on the id alone, because a request path is not
  * leased and is the only writer of the row it just reserved.
  */
@@ -196,8 +208,11 @@ const UPDATE_QUERY =
   'UPDATE funding_requests ' +
   'SET status = $1, status_history = $2, provider_transaction_id = $3, provider_session_id = $4, ' +
   '    provider_status = $5, widget_url = $6, hosted_widget_url = $7, expires_at = $8, ' +
-  '    client_reference = $9, reason = $10, updated_at = $11 ' +
-  'WHERE id = $12 AND ($13::text IS NULL OR claimed_by = $13)';
+  '    client_reference = $9, reason = $10, updated_at = $11, ' +
+  '    deposit_address = $12, deposit_amount = $13, deposit_currency = $14, deposit_memo = $15, ' +
+  '    deposit_observed_at = $16, deposit_conflict_address = $17, deposit_conflict_reason = $18, ' +
+  '    deposit_conflict_at = $19 ' +
+  'WHERE id = $20 AND ($21::text IS NULL OR claimed_by = $21)';
 
 
 /**
@@ -462,19 +477,31 @@ export class FundingStore {
    *   it, and telling that buyer their top-up is cancelled while their money is in flight is the
    *   claim this service exists not to make. Terminal rows are already over.
    * - `cancelled_at IS NULL`: cancelling twice must not move the timestamp.
+   * - `deposit_address IS NULL`: a sell's analogue of "the money is in flight" is the seller
+   *   broadcasting on-chain, which this service cannot see and does not cause -- there is no
+   *   observation to wait for the way `transaction_seen` waits for one. Once a deposit address has
+   *   been shown to a seller, they may already have sent to it, and this service has no way to
+   *   know either way. Telling them the request is cancelled would be exactly the lie the
+   *   `transaction_seen` guard exists to prevent, just from the other side of the same address.
+   *   Checked directly on the column rather than inferred from `status`, deliberately: the status
+   *   at which Meld first discloses a sell's address is unverified (the probe found no sandbox
+   *   sell to observe it against), and a rule tied to a status this service is not sure of yet
+   *   would stop protecting the moment that status turned out to be wrong. The column is the one
+   *   fact this service is certain of either way.
    *
    * The status is left alone on purpose. See `FundingRecord.cancelled_at`. The worker goes on
    * watching, so a payment already on its way is still observed and still settles.
    *
    * Returns the row as it now stands, or `undefined` when nothing matched, which the caller turns
-   * into a refusal it can explain, since "not yours", "already paid" and "already cancelled" are
-   * three different answers and only the row can tell them apart.
+   * into a refusal it can explain, since "not yours", "already paid", "already disclosed" and
+   * "already cancelled" are four different answers and only the row can tell them apart.
    */
   async cancel(alias: string, productId: string, id: string, now: number): Promise<FundingRecord | undefined> {
     const updated = await this.one(
       'UPDATE funding_requests SET cancelled_at = $1, updated_at = $1 ' +
         'WHERE id = $2 AND subject_alias = $3 AND product_id = $4 ' +
         "AND status IN ('created', 'session_opened') AND cancelled_at IS NULL " +
+        'AND deposit_address IS NULL ' +
         `RETURNING ${COLUMNS}`,
       [now, id, alias, productId],
     );
@@ -660,6 +687,14 @@ export class FundingStore {
           updated.client_reference ?? null,
           updated.reason ?? null,
           updated.updated_at,
+          updated.deposit_address ?? null,
+          updated.deposit_amount ?? null,
+          updated.deposit_currency ?? null,
+          updated.deposit_memo ?? null,
+          updated.deposit_observed_at ?? null,
+          updated.deposit_conflict_address ?? null,
+          updated.deposit_conflict_reason ?? null,
+          updated.deposit_conflict_at ?? null,
           id,
           extra?.claimedBy ?? null,
         ]);
@@ -757,6 +792,9 @@ interface Row {
   deposit_currency: string | null;
   deposit_memo: string | null;
   deposit_observed_at: number | null;
+  deposit_conflict_address: string | null;
+  deposit_conflict_reason: DepositConflictReason | null;
+  deposit_conflict_at: number | null;
   status_history: string;
   created_at: number;
   updated_at: number;
@@ -784,6 +822,9 @@ function rowToRecord(row: Row): FundingRecord {
     deposit_currency: row.deposit_currency ?? undefined,
     deposit_memo: row.deposit_memo ?? undefined,
     deposit_observed_at: row.deposit_observed_at ?? undefined,
+    deposit_conflict_address: row.deposit_conflict_address ?? undefined,
+    deposit_conflict_reason: row.deposit_conflict_reason ?? undefined,
+    deposit_conflict_at: row.deposit_conflict_at ?? undefined,
     status_history: JSON.parse(row.status_history) as TimelineEntry[],
   } satisfies FundingRecord;
 }
@@ -825,6 +866,9 @@ function recordToRow(r: FundingRecord): unknown[] {
     deposit_currency: r.deposit_currency ?? null,
     deposit_memo: r.deposit_memo ?? null,
     deposit_observed_at: r.deposit_observed_at ?? null,
+    deposit_conflict_address: r.deposit_conflict_address ?? null,
+    deposit_conflict_reason: r.deposit_conflict_reason ?? null,
+    deposit_conflict_at: r.deposit_conflict_at ?? null,
     status_history: JSON.stringify(r.status_history),
     created_at: r.created_at,
     updated_at: r.updated_at,

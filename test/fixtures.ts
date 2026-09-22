@@ -347,7 +347,11 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
         row.subject_alias !== alias ||
         row.product_id !== productId ||
         !['created', 'session_opened'].includes(row.status) ||
-        row.cancelled_at !== undefined
+        row.cancelled_at !== undefined ||
+        // Mirrors the real statement's `deposit_address IS NULL`: once a seller has been shown
+        // where to send, a fake that let the cancel through would pass a test asserting the one
+        // outcome that guard exists to make impossible.
+        row.deposit_address !== undefined
       ) {
         return undefined;
       }

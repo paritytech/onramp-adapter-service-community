@@ -20,7 +20,7 @@ import { DIRECTIONS } from '../rail.js';
 import { FUNDING_STATES } from './state.js';
 
 /** The current schema version. Bump with each migration added here. */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /** A migration: bring the previous version's rows to this version's shape. */
 export interface Migration {
@@ -105,14 +105,12 @@ const DIRECTION_CONSTRAINTS = [
 ];
 
 /**
- * The columns the deposit leg of a sell will be observed into, and the reason they are here
- * before anything writes them.
+ * The columns the deposit leg of a sell is observed into.
  *
- * Nothing populates these in this release: the worker path that reads a provider-issued deposit
- * address off the rail is a later step. They are added now so the shape changes once rather than
- * twice, because a second `ALTER TABLE` over a populated `funding_requests` is a second migration
- * window for no schema benefit. Every one is nullable, and null is the overwhelming majority: a
- * buy has no deposit leg at all.
+ * Filled by the worker's observation finder, through `UpdateExtra.deposit` and `mergeDeposit`
+ * (`funding/merge.ts`), once a provider discloses an address -- not by this migration, which only
+ * adds the shape. Every one is nullable, and null is the overwhelming majority: a buy has no
+ * deposit leg at all, and a sell has none until disclosure.
  *
  * `deposit_memo` exists despite Polkadot Asset Hub needing no destination tag, and despite the
  * sandbox probe finding no candidate field on Meld's transaction record. It is there because an
@@ -126,6 +124,38 @@ const DEPOSIT_COLUMNS = [
   ' deposit_memo TEXT',
   ' deposit_observed_at BIGINT',
 ];
+
+/**
+ * Where a deposit-address disclosure conflict is recorded, rather than only thrown and forgotten.
+ *
+ * `mergeDeposit` (`funding/merge.ts`) never lets a conflicting report overwrite a `deposit_address`
+ * already stored -- the seller may already have sent to the one shown, and there is no safe way to
+ * pick a winner from here. Refusing the write silently would still hide the fact that a rail
+ * disagreed with itself, so the disagreement is written down instead of only logged: which value
+ * was rejected, why (`funding_deposit_conflict_reason_known` below), and when it was last seen.
+ * `deposit_conflict_at IS NOT NULL` is then a query, not a log grep.
+ *
+ * Separate columns from the `deposit_*` ones rather than overloading them, because a conflict is
+ * a fact about the *disclosure*, not a revision of the *deposit*: the accepted address must stay
+ * exactly what it was, in the same columns, while the conflicting report lives beside it.
+ *
+ * Every one is nullable, and null is the overwhelming majority: nothing has conflicted on any row
+ * this build has produced.
+ */
+const DEPOSIT_CONFLICT_COLUMNS = [
+  ' deposit_conflict_address TEXT',
+  ' deposit_conflict_reason TEXT',
+  ' deposit_conflict_at BIGINT',
+];
+
+/**
+ * The vocabulary `deposit_conflict_reason` may hold, enforced by the database for the same reason
+ * `funding_direction_known` is: a write path that has not read `DepositConflictReason` in
+ * `merge.ts` must still be refused rather than silently widening what this column can mean.
+ */
+const DEPOSIT_CONFLICT_CONSTRAINT =
+  'CONSTRAINT funding_deposit_conflict_reason_known CHECK (' +
+  "deposit_conflict_reason IS NULL OR deposit_conflict_reason IN ('address_changed', 'address_malformed'))";
 
 /**
  * The ordered migration list.
@@ -273,6 +303,11 @@ export const MIGRATIONS: readonly Migration[] = [
      * rather than merely slowing down. At that point split the harness to allow a step to declare
      * post-commit statements, and add these constraints `NOT VALID` with a `VALIDATE` behind it.
      * Below it, a second of queueing on a deploy is cheaper than the harness change.
+     *
+     * The v6 -> v7 step below adds a fourth constraint of the same class (`ACCESS EXCLUSIVE`,
+     * full-table scan, sized to row count rather than to how many rows a predicate matches). It is
+     * priced against this same measurement and this same threshold there, rather than restated,
+     * so the two are sized together: by the time either needs `NOT VALID` + `VALIDATE`, both do.
      */
     sql: [
       `ALTER TABLE funding_requests ADD COLUMN${DIRECTION_COLUMN}`,
@@ -282,6 +317,37 @@ export const MIGRATIONS: readonly Migration[] = [
       ...DEPOSIT_COLUMNS.map((column) => `ALTER TABLE funding_requests ADD COLUMN${column}`),
       // Last, so every column each one names already exists.
       ...DIRECTION_CONSTRAINTS.map((constraint) => `ALTER TABLE funding_requests ADD ${constraint}`),
+    ],
+  },
+  {
+    from: 6,
+    to: 7,
+    /**
+     * v6 -> v7: record a deposit-address disclosure conflict, rather than only refusing it.
+     *
+     * The first version of the sell deposit leg (v5 -> v6) threw and rolled back an entire advance
+     * whenever a rail reported a different address than one already stored -- correct about never
+     * overwriting the address, wrong about taking an unrelated, legitimate state move down with
+     * it every time the same disagreement recurred. This step adds nowhere for the conflicting
+     * value to overwrite; it adds somewhere for it to be *recorded* instead, so a provider that
+     * keeps disclosing a wrong address can no longer also freeze a row that would otherwise
+     * correctly settle or fail. See `mergeAdvance` and `mergeDeposit` in `funding/merge.ts`.
+     *
+     * Three nullable columns, catalog-only like every `ADD COLUMN` in this chain since v5 -> v6
+     * (no default, no rewrite), plus one `CHECK` that costs the same way the three v5 -> v6 ones
+     * do (see that migration's "What this step costs a live service" section): a full-table scan
+     * under the same `ACCESS EXCLUSIVE` lock, sized to the *table's* row count, not to how many
+     * rows happen to have a non-null `deposit_conflict_reason`. It is tempting to read "this build
+     * has zero rows with a conflict, by construction" as "the scan has nothing to read" -- it does
+     * not: `CHECK (col IS NULL OR col IN (...))` still visits every row to confirm the `IS NULL`
+     * branch, exactly as `funding_sell_terms` does for the buy rows it never rejects. So this
+     * constraint is sized with the same 2M-row measurement and the same ~10M-row threshold as the
+     * v5 -> v6 ones, not separately: at the scale where those three needed `NOT VALID` +
+     * `VALIDATE`, this one does too, in the same pass.
+     */
+    sql: [
+      ...DEPOSIT_CONFLICT_COLUMNS.map((column) => `ALTER TABLE funding_requests ADD COLUMN${column}`),
+      `ALTER TABLE funding_requests ADD ${DEPOSIT_CONFLICT_CONSTRAINT}`,
     ],
   },
 ];
@@ -336,8 +402,11 @@ export function freshSchema(): string[] {
       // v5 -> v6 migration appends them, so the two paths build the same table.
       `${DIRECTION_COLUMN},` +
       `${CRYPTO_AMOUNT_COLUMN},` +
-      // The sell deposit leg, unpopulated until the worker that observes it exists.
+      // The sell deposit leg, and where a disclosure conflict on it is recorded. Both in the
+      // order the v5 -> v6 and v6 -> v7 migrations append them, so the two paths build the same
+      // table.
       DEPOSIT_COLUMNS.map((column) => `${column},`).join('') +
+      DEPOSIT_CONFLICT_COLUMNS.map((column) => `${column},`).join('') +
       // The vocabulary, enforced by the database rather than only by the state machine.
       // `update()` validates transitions inside its transaction, but `create()` writes whatever
       // status it is handed; both production callers are correct and nothing at the storage layer
@@ -347,6 +416,7 @@ export function freshSchema(): string[] {
       // The direction alphabet, and the per-direction term constraints the v6 migration adds to
       // an existing table. Same text on both paths, so the two tables are the same table.
       DIRECTION_CONSTRAINTS.map((constraint) => ` ${constraint}`).join(',') +
+      `, ${DEPOSIT_CONFLICT_CONSTRAINT}` +
       ')',
     'CREATE INDEX funding_by_alias ON funding_requests (subject_alias, product_id, created_at DESC, id DESC)',
     // Partial, matching the `WHERE client_reference IS NOT NULL` predicate exactly: a refused row

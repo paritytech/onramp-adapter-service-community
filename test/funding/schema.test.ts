@@ -13,7 +13,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { fakeStore, fundingRecord, sellRecord } from '../fixtures.js';
+import { ALICE, BOB, fakeStore, fundingRecord, sellRecord } from '../fixtures.js';
 import { createSchema, dropSchema, openIn, rawQuery as query, withStore } from '../pg.js';
 
 import { MIGRATION_LOCK_TIMEOUT_MS, SCHEMA_VERSION, freshSchema, type Migration } from '../../src/funding/schema.js';
@@ -309,12 +309,12 @@ describe('creating a fresh schema', () => {
 });
 
 /**
- * `freshSchema()` minus everything the v5 -> v6 migration adds: a v5 funding table.
+ * `freshSchema()` minus everything the v5 -> v6 and v6 -> v7 migrations add: a v5 funding table.
  *
  * Derived from the current shape rather than written out, so the two cannot drift in the parts
- * v6 does not touch, and a v6 addition that is not stripped here fails loudly when the migration
- * tries to add a column that already exists. That is the intended failure: it says the fixture
- * was not kept up, rather than passing while proving less.
+ * neither migration touches, and an addition that is not stripped here fails loudly when the
+ * migration chain tries to add a column that already exists. That is the intended failure: it
+ * says the fixture was not kept up, rather than passing while proving less.
  */
 const atV5 = (sql: string): string =>
   sql
@@ -325,8 +325,12 @@ const atV5 = (sql: string): string =>
     .replace(' deposit_currency TEXT,', '')
     .replace(' deposit_memo TEXT,', '')
     .replace(' deposit_observed_at BIGINT,', '')
-    // The three v6 constraints are contiguous and last, so one cut removes all of them and
-    // closes the statement.
+    // v6 -> v7: where a deposit-address disclosure conflict is recorded.
+    .replace(' deposit_conflict_address TEXT,', '')
+    .replace(' deposit_conflict_reason TEXT,', '')
+    .replace(' deposit_conflict_at BIGINT,', '')
+    // Every constraint from v6 onward is contiguous and last, so one cut removes all of them
+    // (the v7 one included) and closes the statement.
     .replace(/, CONSTRAINT funding_direction_known .*$/, ')')
     // v5 had no direction, so both were mandatory: a request was always a buy.
     .replace(' wallet_address TEXT,', ' wallet_address TEXT NOT NULL,')
@@ -364,7 +368,9 @@ describe('the v5 -> v6 migration', () => {
       await store.close();
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
-      expect(applied.map((r) => Number(r.version))).toEqual([5, 6]);
+      // Not just [5, 6]: `openIn` always walks to `SCHEMA_VERSION`, so a database stamped at 5
+      // takes both the v6 and the v7 step in one boot.
+      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7]);
     } finally {
       await dropSchema(schema);
     }
@@ -595,12 +601,20 @@ describe('the real migration chain', () => {
       expect(sold?.wallet_address).toBeUndefined();
       expect(sold?.source_amount).toBeUndefined();
       expect(sold?.crypto_amount).toBe('12.3456789012');
+      // v7: a deposit-address disclosure conflict is reachable through `store.update`, not just
+      // present in the table, and the accepted address is left exactly as it was.
+      await store.update('sold', 'transaction_seen', 2, { deposit: { address: ALICE, currency: 'DOT_ASSETHUB' } });
+      await store.update('sold', 'transaction_seen', 3, { deposit: { address: BOB, currency: 'DOT_ASSETHUB' } });
+      const disputed = await store.byId('sold');
+      expect(disputed?.deposit_address).toBe(ALICE);
+      expect(disputed?.deposit_conflict_address).toBe(BOB);
+      expect(disputed?.deposit_conflict_reason).toBe('address_changed');
       await store.close();
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7]);
     } finally {
       await dropSchema(schema);
     }
@@ -644,6 +658,7 @@ describe('applying a migration', () => {
         ' reason TEXT, cancelled_at BIGINT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,' +
         " direction TEXT NOT NULL DEFAULT 'buy', crypto_amount TEXT, deposit_address TEXT," +
         ' deposit_amount TEXT, deposit_currency TEXT, deposit_memo TEXT, deposit_observed_at BIGINT,' +
+        ' deposit_conflict_address TEXT, deposit_conflict_reason TEXT, deposit_conflict_at BIGINT,' +
         ' claimed_by TEXT, claimed_until BIGINT)',
     );
     return schema;

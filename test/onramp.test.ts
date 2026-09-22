@@ -1692,6 +1692,43 @@ describe('cancelling a request', () => {
     expect(toFundingRequestDto(must(row, 'the paid row'), NOW + 5).serviceProviderWidgetUrl).toBeDefined();
   });
 
+  it('refuses to cancel a sell once a deposit address has been disclosed, and says why', async () => {
+    // The sell analogue of "a payment is already on its way": once the seller has been shown
+    // where to send, this service cannot see or prevent an on-chain transfer, so cancelling would
+    // be exactly the lie the `transaction_seen` guard exists to prevent, from the other side of
+    // the same address. Worded differently from that guard rather than reusing it, per the brief.
+    const meld = new FakeMeld();
+    const { service, funding } = build(meld);
+    const opened = await service.createSession(
+      SUBJECT,
+      sellRequest({ idempotencyKey: 'idem-cancel-sell-1' }) as unknown as Parameters<Onramp['createSession']>[1],
+      REQUEST_ID,
+    );
+    // A self-loop update: the row need not have reached `transaction_seen` for the disclosure to
+    // matter, which is the point (see `FundingStore.cancel`).
+    await funding.update(opened.fundingRequestId, 'session_opened', NOW + 1, {
+      deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+    });
+
+    const failure = await failureOf(() => service.cancel(SUBJECT, opened.fundingRequestId, REQUEST_ID, NOW + 5));
+
+    expect(failure).toMatchObject({
+      value: {
+        code: 'REQUEST_NOT_CANCELLABLE',
+        fundingRequestId: opened.fundingRequestId,
+      },
+    });
+    if (failure.tag !== 'Other') throw new Error('expected an Other failure');
+    const message = failure.value.message;
+    // Its own wording, not the `transaction_seen` sentence: the row is still `session_opened`
+    // here, so reusing that sentence would claim a state the row has not reached.
+    expect(message).not.toBe('A payment is already on its way for that request. It cannot be cancelled.');
+    expect(message).toMatch(/deposit address/i);
+
+    const row = await funding.byId(opened.fundingRequestId);
+    expect(row?.cancelled_at).toBeUndefined();
+  });
+
   it('lets a cancelled request still settle, because the buyer may already have paid', async () => {
     // The whole reason cancelling is a column and not a ninth state. A transfer sent seconds
     // before the cancel arrives afterwards, and it must be recorded against this row rather than

@@ -826,8 +826,10 @@ export class Onramp {
    *
    * - unknown, or another caller's -> `404`, the same answer as `get`, so the route is not an
    *   existence oracle.
-   * - already paid, or already over -> `409`, and that is not a failure of the cancel so much as
-   *   the one case where cancelling would be a lie. The buyer's money is in flight or spent.
+   * - a deposit address has been disclosed, already paid, or already over -> `409`, and that is
+   *   not a failure of the cancel so much as the one case where cancelling would be a lie. The
+   *   buyer's money is in flight or spent, or the seller has been shown where to send and this
+   *   service cannot see or prevent an on-chain transfer already underway.
    * - already cancelled -> the row as it stands. Cancelling twice is the same request twice, and
    *   answering the second one with an error would make a retried tap look like a fault.
    */
@@ -851,10 +853,21 @@ export class Onramp {
     // Already cancelled. No second audit line: nothing changed, and a retried tap is not an event.
     if (existing.cancelled_at !== undefined) return existing;
 
+    // Checked before `status`, and worded differently from it rather than folded into the
+    // `transaction_seen` sentence below: the two are refused for related but distinct reasons. A
+    // payment already in flight is this service's own observation; a disclosed deposit address is
+    // the opposite -- a hazard this service created by showing the seller somewhere to send, and
+    // one it has no way to observe or undo. Reusing "a payment is already on its way" here would
+    // claim a transfer that may not exist yet, and would be wrong on the far more common case: a
+    // seller who has not sent anything yet, but could at any moment.
     const refusal =
-      existing.status === 'transaction_seen'
-        ? 'A payment is already on its way for that request. It cannot be cancelled.'
-        : 'That request has already concluded. There is nothing to cancel.';
+      existing.deposit_address !== undefined
+        ? 'A deposit address has already been shown for that request. It cannot be cancelled: the ' +
+          'seller may already be sending crypto to it, and this service has no way to see or stop ' +
+          'an on-chain transfer once it starts.'
+        : existing.status === 'transaction_seen'
+          ? 'A payment is already on its way for that request. It cannot be cancelled.'
+          : 'That request has already concluded. There is nothing to cancel.';
     this.audit.info(
       { ...this.cancelEvent('session.cancel_refused', subject, requestId, existing), reason: existing.status },
       `funding request ${existing.id} could not be withdrawn from ${existing.status}`,

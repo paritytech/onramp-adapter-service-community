@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { fundingRecord } from '../fixtures.js';
+import { ALICE, BOB, fundingRecord, sellRecord } from '../fixtures.js';
 import {
   createSchema,
   dropSchema,
@@ -17,6 +17,8 @@ import { sslOptions, type FundingStore } from '../../src/funding/store.js';
 import type { FundingRecord } from '../../src/funding/types.js';
 
 const record = (overrides: Partial<FundingRecord> = {}): FundingRecord => fundingRecord(overrides);
+/** The sell counterpart, for the deposit-disclosure tests: no wallet address, a committed crypto amount. */
+const sell = (overrides: Partial<FundingRecord> = {}): FundingRecord => sellRecord(overrides);
 
 /** A claim wide enough to see everything a test inserted, for the assertions that only want order. */
 const claimAll = (store: FundingStore) => store.claim('test-worker', 1_700_000_000_000, 60_000, 1_000);
@@ -86,6 +88,38 @@ describe('FundingStore', () => {
         expect((await store.cancel('alias-abc', 'app.dot', 'funding-1', 1_700_000_000_200))?.cancelled_at).toBe(
           1_700_000_000_200,
         );
+      });
+    });
+
+    it('refuses to withdraw a sell once a deposit address has been disclosed', async () => {
+      // The sell analogue of `transaction_seen`: once the provider has shown the seller where to
+      // send, this service cannot see or prevent an on-chain transfer, so cancelling would be a
+      // lie of exactly the kind the `transaction_seen` guard exists to prevent. Written as a
+      // self-loop update (`session_opened -> session_opened`) precisely because that is the
+      // structural gap this step closes: the row need not have moved to `transaction_seen` for the
+      // disclosure to matter.
+      await withStore(async (store) => {
+        await store.create(sell({ status: 'session_opened' }));
+        await store.update('funding-1', 'session_opened', 1_700_000_000_100, {
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        });
+
+        expect(await store.cancel('alias-abc', 'app.dot', 'funding-1', 1_700_000_000_200)).toBeUndefined();
+        const row = await store.byId('funding-1');
+        expect(row?.cancelled_at).toBeUndefined();
+        // Still `session_opened`: the guard fires on the column, not on having reached
+        // `transaction_seen`, which is the whole point (see `FundingStore.cancel`).
+        expect(row?.status).toBe('session_opened');
+      });
+    });
+
+    it('still lets a sell with no disclosed address be withdrawn', async () => {
+      // The negative case for the test above: a sell that has not yet had an address disclosed is
+      // an ordinary cancellable row, same as a buy.
+      await withStore(async (store) => {
+        await store.create(sell({ status: 'session_opened' }));
+        const cancelled = await store.cancel('alias-abc', 'app.dot', 'funding-1', 1_700_000_000_100);
+        expect(cancelled?.cancelled_at).toBe(1_700_000_000_100);
       });
     });
 
@@ -888,6 +922,78 @@ describe('FundingStore', () => {
         expect((await store.byId('funding-1'))?.client_reference).toBeUndefined();
         // And the key really is free: a fresh row can take it.
         await expect(store.create(record({ id: 'funding-2', client_reference: 'key-1' }))).resolves.toBeUndefined();
+      });
+    });
+
+    it('writes a disclosed deposit while the state does not move, and stamps when', async () => {
+      // The self-loop this step opens a channel for: a sell's deposit address can arrive while
+      // the row sits in `transaction_seen`, unmoved. `UPDATE_QUERY` now binds the deposit columns
+      // unconditionally, so this is the one path proving they actually reach Postgres rather than
+      // only the in-memory `mergeAdvance` return value.
+      const inFlight = sell({
+        status: 'transaction_seen',
+        provider_transaction_id: 'tx-1',
+        status_history: [{ status: 'transaction_seen', at: 1_700_000_000_000 }],
+      });
+      await withStore(async (store) => {
+        await store.create(inFlight);
+        const updated = await store.update('funding-1', 'transaction_seen', 1_700_000_000_150, {
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        });
+
+        expect(updated?.status).toBe('transaction_seen');
+        // No duplicate timeline entry: the row did not move.
+        expect(updated?.status_history).toEqual(inFlight.status_history);
+
+        const persisted = await store.byId('funding-1');
+        expect(persisted?.deposit_address).toBe(ALICE);
+        expect(persisted?.deposit_amount).toBe('12.3456789012');
+        expect(persisted?.deposit_currency).toBe('DOT_ASSETHUB');
+        expect(persisted?.deposit_observed_at).toBe(1_700_000_000_150);
+      });
+    });
+
+    it('never rewrites a deposit address once one exists, but records the conflict rather than throwing', async () => {
+      // The integrity rule this whole step is built around, and the fix over its first version: a
+      // different address for a row that already has one is not an update this function is
+      // willing to make, but it is also not a reason to roll back the entire write any more (a
+      // real state move riding alongside it must still apply). See `mergeDeposit`.
+      await withStore(async (store) => {
+        await store.create(sell({ status: 'transaction_seen' }));
+        await store.update('funding-1', 'transaction_seen', 1_700_000_000_100, {
+          deposit: { address: ALICE, amount: '1.0', currency: 'DOT_ASSETHUB' },
+        });
+
+        const conflicted = await store.update('funding-1', 'settled', 1_700_000_000_200, {
+          deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' },
+        });
+
+        // The unrelated, legitimate transition still applied.
+        expect(conflicted?.status).toBe('settled');
+        const persisted = await store.byId('funding-1');
+        expect(persisted?.deposit_address).toBe(ALICE);
+        expect(persisted?.deposit_conflict_address).toBe(BOB);
+        expect(persisted?.deposit_conflict_reason).toBe('address_changed');
+        expect(persisted?.deposit_conflict_at).toBe(1_700_000_000_200);
+      });
+    });
+
+    it('fills in a deposit amount that arrives after the address, without disturbing the address', async () => {
+      await withStore(async (store) => {
+        await store.create(sell({ status: 'transaction_seen' }));
+        await store.update('funding-1', 'transaction_seen', 1_700_000_000_100, {
+          deposit: { address: ALICE, currency: 'DOT_ASSETHUB' },
+        });
+        await store.update('funding-1', 'transaction_seen', 1_700_000_000_200, {
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        });
+
+        const persisted = await store.byId('funding-1');
+        expect(persisted?.deposit_address).toBe(ALICE);
+        expect(persisted?.deposit_amount).toBe('12.3456789012');
+        // `deposit_observed_at` marks the first sighting of the fact, not the last: it must not
+        // jump to the second update's timestamp.
+        expect(persisted?.deposit_observed_at).toBe(1_700_000_000_100);
       });
     });
 

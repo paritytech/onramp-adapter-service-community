@@ -217,6 +217,50 @@ export interface MeldTransactionReader {
 }
 
 /**
+ * A provider-issued fact that reaches this service on a later poll, not at session creation.
+ *
+ * Today this is exactly one thing: the off-ramp deposit address (and the amount and currency it
+ * expects) that Meld's sell issues once the seller clears KYC, minutes to hours after the session
+ * opened -- see `meld/rail.ts`. It is its own type, carried as one optional field on
+ * `TransactionObservation` (`funding/worker.ts`), rather than a fact folded into the status
+ * string or a new top-level field per fact: a buy's finder never produces one and its shape does
+ * not change at all, and a future rail's own late-arriving disclosure (a different shape
+ * entirely -- Chainflip's, say) is a second optional field placed beside this one, not a
+ * widening of it. Nothing downstream (`TransactionObservation`, `UpdateExtra`, `mergeAdvance`,
+ * the store write, the DTO) has to change shape again to carry a second kind of late fact; each
+ * one just adds its own sibling field.
+ */
+export interface RailDeposit {
+  /**
+   * Where the seller must send the crypto. The single most safety-critical value this service
+   * ever hands out: see the address-never-changes rule enforced in `funding/merge.ts`.
+   */
+  address: string;
+  /**
+   * The exact amount expected, in the row's own committed crypto. Optional because the provider
+   * may disclose the address before the amount, or not disclose an amount at all -- unverified
+   * either way (no sandbox sell has ever reached this point; see the probe). Absent must be
+   * treated as absent, never coerced to a guess.
+   */
+  amount?: string;
+  /**
+   * The asset the address expects. Always the funding record's own `destination_currency_code`,
+   * derived by the rail rather than read off the provider: it was pinned before the rail was ever
+   * called and cannot legitimately differ from what a sell's deposit address receives, so asking
+   * the provider to repeat it back would only be one more value to cross-check against one
+   * already known, for no benefit.
+   */
+  currency: string;
+  /**
+   * A destination tag / memo, for a chain that needs one to credit a shared address. No candidate
+   * field has been found anywhere in Meld's transaction schema for any asset (see the probe), so
+   * this stays `undefined` in every build so far. Polkadot Asset Hub needs none; absence here is
+   * the expected, permanent case for it and must not be read as a gap for it specifically.
+   */
+  memo?: string;
+}
+
+/**
  * Registered rails by name. An unregistered rail is the "not wired" case. `Onramp.rail()` refuses
  * a request for it locally before any upstream call, rather than fabricating a call. Both rails
  * are registered today: Chainflip is present precisely so its refusal names the real reason (no
