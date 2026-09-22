@@ -98,9 +98,19 @@ export interface StoreConfig {
 /** A stored corridor method: the client-facing subset of `MethodLimit`, no provider roster. */
 export type StoredMethod = CorridorDto['methods'][number];
 
-/** One supported-corridor row: a deliverable (crypto, country) with its fiat and methods. */
+/**
+ * One supported-corridor row: a deliverable-or-sellable (crypto, direction, country) with its
+ * fiat and methods.
+ *
+ * `direction` is part of what the row means, not merely a filter on it: a buy corridor and a sell
+ * corridor for the same (crypto, country) are two different questions to Meld (different category,
+ * different route argument order; see `meld/discovery.ts`) and can carry different `fiat` and
+ * `methods`. See the v7 -> v8 migration in `schema.ts` for why it had to join the primary key
+ * rather than merely widen the row.
+ */
 export interface SupportedCorridorRow {
   destination_currency_code: string;
+  direction: Direction;
   country: string;
   name: string;
   fiat: string;
@@ -711,23 +721,34 @@ export class FundingStore {
     }
   }
 
-  // Upsert one supported-corridor row (crypto, country); `updated_at` stamped here.
+  // Upsert one supported-corridor row (crypto, direction, country); `updated_at` stamped here.
+  //
+  // The conflict target names all three columns of the v7 -> v8 primary key. Two of them
+  // (`destination_currency_code`, `country`) were the whole key before that migration; naming only
+  // those two here after the key grew would upsert a sell corridor onto whatever row a buy
+  // corridor for the same (crypto, country) happened to hold, overwriting its `fiat` and `methods`
+  // silently, on every refresh pass -- the same failure the migration exists to make impossible at
+  // the table, reintroduced at the one write site if this list ever drifted from it.
   async upsertCorridor(row: Omit<SupportedCorridorRow, 'updated_at'>): Promise<void> {
     await this.pool.query(
-      'INSERT INTO supported_corridors (destination_currency_code, country, name, fiat, methods, updated_at) ' +
-        'VALUES ($1, $2, $3, $4, $5, $6) ' +
-        'ON CONFLICT (destination_currency_code, country) DO UPDATE SET ' +
+      'INSERT INTO supported_corridors (destination_currency_code, direction, country, name, fiat, methods, updated_at) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7) ' +
+        'ON CONFLICT (destination_currency_code, direction, country) DO UPDATE SET ' +
         'name = EXCLUDED.name, fiat = EXCLUDED.fiat, methods = EXCLUDED.methods, updated_at = EXCLUDED.updated_at',
-      [row.destination_currency_code, row.country, row.name, row.fiat, JSON.stringify(row.methods), Date.now()],
+      [row.destination_currency_code, row.direction, row.country, row.name, row.fiat, JSON.stringify(row.methods), Date.now()],
     );
   }
 
-  // Fresh supported corridors for one crypto, name-sorted; `freshAfter` ages out rows the refresh stopped touching (0 = all).
-  async readCorridors(code: string, freshAfter = 0): Promise<SupportedCorridorRow[]> {
+  // Fresh supported corridors for one (crypto, direction), name-sorted; `freshAfter` ages out rows
+  // the refresh stopped touching (0 = all). `direction` is required, not defaulted to `buy` here:
+  // this is the storage layer, and a caller that means "buy" says so explicitly the way
+  // `upsertCorridor`'s caller already must (`Onramp.supportedCorridors` is where an omitted wire
+  // `direction` becomes `buy`; see `rail.ts`'s `DEFAULT_DIRECTION`).
+  async readCorridors(code: string, direction: Direction, freshAfter = 0): Promise<SupportedCorridorRow[]> {
     const result = await this.pool.query<SupportedCorridorRow>(
-      'SELECT destination_currency_code, country, name, fiat, methods, updated_at FROM supported_corridors ' +
-        'WHERE destination_currency_code = $1 AND updated_at >= $2 ORDER BY name ASC, country ASC',
-      [code, freshAfter],
+      'SELECT destination_currency_code, direction, country, name, fiat, methods, updated_at FROM supported_corridors ' +
+        'WHERE destination_currency_code = $1 AND direction = $2 AND updated_at >= $3 ORDER BY name ASC, country ASC',
+      [code, direction, freshAfter],
     );
     return result.rows;
   }

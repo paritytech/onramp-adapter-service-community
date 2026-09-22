@@ -13,7 +13,7 @@ import type {
   RailSessionInput,
   RailTransaction,
 } from '../src/rail.js';
-import { config, createRequest, fakeStore } from './fixtures.js';
+import { config, createRequest, fakeStore, sellQuoteBody, sellRequest } from './fixtures.js';
 
 /** An `insecure_dev`-shaped caller. The alias is shared per product, so `proven` is false. */
 const SUBJECT = { productId: 'app.dot', alias: 'dev:app.dot', proven: false };
@@ -65,20 +65,28 @@ function fakeDiscovery(opts: {
   /** Throws a `Refusal` rather than a transport error: a corridor discovery can see is not offered. */
   corridorRefuses?: boolean;
   rows?: CountryRow[];
+  /** Records every `direction` a call arrived with, so a test can assert it was threaded through. */
+  directions?: string[];
 } = {}): Discovery {
   return {
-    corridor: async (country, fiat, crypto): Promise<Corridor> => {
+    corridor: async (country, fiat, crypto, direction): Promise<Corridor> => {
+      opts.directions?.push(direction);
       if (opts.corridorRefuses) throw reject({ tag: 'RegionUnavailable' }, 'discovery refused the corridor');
       if (opts.corridorThrows) throw new Error('meld catalog unreachable');
       return { country, fiat, crypto, methods: opts.methods ?? [method()] };
     },
-    corridorForCountry: async (country, crypto): Promise<Corridor> => {
+    corridorForCountry: async (country, crypto, direction): Promise<Corridor> => {
+      opts.directions?.push(direction);
       if (opts.corridorThrows) throw new Error('meld catalog unreachable');
       return { country, fiat: 'CAD', crypto, methods: opts.methods ?? [method()] };
     },
-    countries: async (_crypto): Promise<CountryRow[]> => opts.rows ?? [{ country: 'US', name: 'United States' }],
+    countries: async (_crypto, direction): Promise<CountryRow[]> => {
+      opts.directions?.push(direction);
+      return opts.rows ?? [{ country: 'US', name: 'United States' }];
+    },
     // `corridorForCountry` above answers with a fixed fiat, so this agrees with it.
-    defaultFiat: async (_country): Promise<string> => {
+    defaultFiat: async (_country, direction): Promise<string> => {
+      opts.directions?.push(direction);
       if (opts.corridorThrows) throw new Error('meld catalog unreachable');
       return 'CAD';
     },
@@ -235,14 +243,31 @@ describe('Onramp.supported / supportedCountries', () => {
       code: 'DISCOVERY_UNAVAILABLE',
     });
   });
+
+  it('defaults an absent direction to buy, byte for byte with a caller written before sell existed', async () => {
+    const directions: string[] = [];
+    const svc = build(fakeDiscovery({ directions }));
+    await svc.supported('US', 'DOT_ASSETHUB');
+    await svc.supportedCountries('DOT_ASSETHUB');
+    expect(directions).toEqual(['buy', 'buy']);
+  });
+
+  it('threads an explicit sell direction through to discovery', async () => {
+    const directions: string[] = [];
+    const svc = build(fakeDiscovery({ directions }));
+    await svc.supported('US', 'DOT_ASSETHUB', 'sell');
+    await svc.supportedCountries('DOT_ASSETHUB', 'sell');
+    expect(directions).toEqual(['sell', 'sell']);
+  });
 });
 
 describe('Onramp.supportedCorridors', () => {
   const pix = { paymentMethodType: 'PIX', category: 'bank' as const, min: '10', max: '5000', currency: 'BRL' };
+  const payout = { paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' as const, min: '5', max: '1000', currency: 'BRL' };
 
   it('reads cached corridors from the store, off Meld, without needing discovery', async () => {
     const store = fakeStore();
-    await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+    await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
     // No discovery wired: the bulk read is DB-backed.
     const svc = new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'funding-1', undefined);
 
@@ -251,9 +276,19 @@ describe('Onramp.supportedCorridors', () => {
     ]);
   });
 
+  it('reads the sell row rather than the buy one when asked for direction sell', async () => {
+    const store = fakeStore();
+    await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+    await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'sell', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [payout] });
+    const svc = new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'funding-1', undefined);
+
+    expect(await svc.supportedCorridors('DOT_ASSETHUB')).toEqual([{ country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] }]);
+    expect(await svc.supportedCorridors('DOT_ASSETHUB', 'sell')).toEqual([{ country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [payout] }]);
+  });
+
   it('hides a stale corridor whose row predates the freshness window', async () => {
     const store = fakeStore();
-    await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+    await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
     // A clock far past the row's stamp (2e12) puts it outside `now - 3*interval`, so it is filtered.
     const svc = new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => 3_000_000_000_000, () => 'funding-1', undefined);
 
@@ -263,6 +298,76 @@ describe('Onramp.supportedCorridors', () => {
   it('refuses an unknown crypto before reading', async () => {
     const svc = build(undefined);
     expect((await refusalOf(() => svc.supportedCorridors('NOPE'))).tag).toBe('WrongAssetOrChain');
+  });
+});
+
+/** `sellQuoteBody`/`sellRequest` are built loosely (see `fixtures.ts`); cast at the call site,
+ *  matching the pattern `onramp.test.ts` already uses for `sellRequest`. */
+const asQuote = (body: Record<string, unknown>) => body as unknown as Parameters<Onramp['quote']>[0];
+const asSession = (body: Record<string, unknown>) => body as unknown as Parameters<Onramp['createSession']>[1];
+
+describe('Onramp limit gate on a sell: corridor/method checked, amount never gated', () => {
+  /**
+   * The decision this step made: `limitFor` runs for a sell too, so an unrouted corridor or an
+   * unoffered payout method is refused locally, before any rail call -- exactly as a buy is. What
+   * it does not do is compare the committed crypto amount against the corridor's (fiat) bound; see
+   * `limitFor`'s own doc comment in `onramp.ts` for the full reasoning.
+   */
+  it('refuses CURRENCY_UNSUPPORTED for a sell corridor no provider routes', async () => {
+    const svc = build(fakeDiscovery({ methods: [] }));
+    expect(await refusalOf(() => svc.quote(asQuote(sellQuoteBody())))).toEqual({ tag: 'Other', code: 'CURRENCY_UNSUPPORTED' });
+  });
+
+  it('refuses PAYMENT_METHOD_UNSUPPORTED for a sell payout method the corridor does not offer', async () => {
+    const svc = build(fakeDiscovery({ methods: [method({ paymentMethodType: 'PAYOUT_TO_CARD', category: 'card' })] }));
+    expect(await refusalOf(() => svc.quote(asQuote(sellQuoteBody())))).toEqual({
+      tag: 'Other',
+      code: 'PAYMENT_METHOD_UNSUPPORTED',
+    });
+  });
+
+  it('quotes a sell whose corridor and method both exist, at any amount, with no local bound applied', async () => {
+    const svc = build(fakeDiscovery({ methods: [method({ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank', min: '1', max: '2' })] }));
+    // An amount wildly outside the corridor's (fiat) min/max is still quoted: that bound does not
+    // apply to a crypto amount, and no crypto-denominated one exists locally to apply instead.
+    expect((await svc.quote(asQuote(sellQuoteBody({ cryptoAmount: '999999999.123456789012' })))).quotes).toHaveLength(1);
+  });
+
+  it('opens a sell session under the same corridor/method checks, still with no amount gate', async () => {
+    const svc = build(fakeDiscovery({ methods: [method({ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' })] }));
+    const opened = await svc.createSession(SUBJECT, asSession(sellRequest()), 'req-sell-1');
+    expect(opened.pinned.cryptoAmount).toBe('12.3456789012');
+  });
+
+  it('refuses a sell session locally for an unoffered method, before any rail call', async () => {
+    const svc = build(fakeDiscovery({ methods: [method({ paymentMethodType: 'PAYOUT_TO_CARD', category: 'card' })] }));
+    expect((await refusalOf(() => svc.createSession(SUBJECT, asSession(sellRequest()), 'req-sell-2'))).code).toBe(
+      'PAYMENT_METHOD_UNSUPPORTED',
+    );
+  });
+
+  it('passes the sell direction to discovery.corridor, not the buy corridor for the same crypto', async () => {
+    const directions: string[] = [];
+    const svc = build(fakeDiscovery({ methods: [method({ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' })], directions }));
+    await svc.quote(asQuote(sellQuoteBody()));
+    expect(directions).toEqual(['sell']);
+  });
+
+  it('reaches Meld ungated during a discovery outage on a sell quote, same as a buy quote does', async () => {
+    const svc = build(fakeDiscovery({ corridorThrows: true }));
+    expect((await svc.quote(asQuote(sellQuoteBody()))).quotes).toHaveLength(1);
+  });
+
+  /**
+   * Unlike a buy, a sell session also reaches Meld ungated during an outage: `config.limits` is a
+   * fiat business-floor list, not a corridor/method existence table, so there is nothing for a
+   * sell to fail closed against. This is the pre-existing posture (a sell skipped this whole gate
+   * before direction-aware discovery existed), not a new hole; see `limitFor`'s doc comment.
+   */
+  it('reaches Meld ungated during a discovery outage on a sell session too', async () => {
+    const svc = build(fakeDiscovery({ corridorThrows: true }));
+    const opened = await svc.createSession(SUBJECT, asSession(sellRequest()), 'req-sell-3');
+    expect(opened.pinned.cryptoAmount).toBe('12.3456789012');
   });
 });
 

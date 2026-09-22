@@ -12,9 +12,9 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | --- | --- | --- |
 | `POST /api/v1/auth/challenge` | none | Mints a fresh 56-byte blind challenge. No auth, rate-limited. |
 | `POST /api/v1/auth/redeem` | none | Exchanges a challenge + ring-VRF proof for a short-lived JWT. Verifies against the People-chain commitment. |
-| `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps, name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
-| `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first (`/network-partner/defaults/...`). Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
-| `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `destinationCurrencyCode` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
+| `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
+| `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
+| `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
 | `GET /transaction/:id` | `GET /payments/transactions/{id}` | Status, projected onto the five fields this service declares. |
@@ -28,6 +28,15 @@ The discovery pair is proxied rather than left to the client because a keyed rea
 providers this account has onboarded, which is the set `POST /quote` will price, so the catalog
 never advertises a corridor the quote would refuse. The country list is read unkeyed on purpose:
 keyed, a buyer whose country the account cannot serve gets no row and no explanation.
+
+All three `GET /supported*` routes take an optional `direction` (`"buy"` | `"sell"`), absent means
+`"buy"`, exactly as `direction` does on `POST /quote` and `POST /session`. Meld reads a sell
+corridor under a different upstream category (`CRYPTO_OFFRAMP` rather than `CRYPTO_ONRAMP`), with
+the crypto and fiat legs in swapped positions in *that* upstream call's path -- purely a Meld-side
+quirk this service absorbs; a caller only ever sees `?direction=sell` on the query string. A
+country's default fiat is resolved differently for a sell too, because Meld has no `defaults`
+endpoint for `CRYPTO_OFFRAMP` (it answers `404` for every country); the substitute is documented at
+"Off-ramp corridor discovery" below.
 
 ## Bounds a caller will meet
 
@@ -101,25 +110,50 @@ local `400 MALFORMED_REQUEST` before any upstream call.
 `400 Other{ DIRECTION_UNSUPPORTED }`, permanently: it has no fiat leg to pay a seller from, and no
 amount of waiting changes that.
 
-### What a sell does not get, and what stands in for it
+### What a sell does get locally, and what it does not
+
+**Corridor and payment-method existence, checked locally, exactly as a buy's are.** `POST /quote`
+and `POST /session` both ask the live sell corridor for `(country, fiat, destination)`: an
+unrouted corridor is refused `400 Other{ CURRENCY_UNSUPPORTED }` and an unoffered payout method is
+refused `400 Other{ PAYMENT_METHOD_UNSUPPORTED }`, before any Meld call. This is newly correct
+rather than newly present -- an earlier build either skipped this check for a sell entirely, or (had
+it reused the buy corridor's route path unswapped) would have silently read every sell corridor as
+`[]` and refused all of them as unsupported regardless of the truth. Sell corridor discovery reads
+the right upstream shape now: a different category (`CRYPTO_OFFRAMP`), the route path's crypto and
+fiat positions swapped from a buy's, and a country's default fiat resolved from a different
+endpoint (see the note at the top of this section).
 
 **No local amount gate.** A buy's minimum and maximum come from the live corridor catalog,
-tightened by a configured `limits` row, and both are **fiat**. A sell commits crypto, so there is
-no local bound to compare it against that would mean anything — comparing a DOT figure to a GBP
-bound in minor units is a number, not a check. So a sell's amount meets exactly two local checks:
-its shape, and that it is greater than zero.
+tightened by a configured `limits` row, and both are **fiat**. A sell commits crypto, and the live
+corridor's published bound is still fiat -- Meld was verified to publish an off-ramp route's limit
+in the *payout* currency, not the crypto sold -- so there is no local bound to compare a sell's
+amount against that would mean anything: comparing a DOT figure to a GBP bound in minor units is a
+number, not a check. Nor does `limits` carry a crypto-denominated variant to fall back to. So a
+sell's amount meets exactly two local checks: its shape, and that it is greater than zero. Corridor
+and method existence are a different question from the amount, and are answered locally as above;
+only the amount itself is not.
 
-The bound that does apply is the **provider's**, enforced when Meld is called, and it is
-crypto-denominated. It comes back as the same `BelowMinimum` / `AboveMaximum` tags a buy would get
-locally — but **without a `value`**. On a buy that tag carries `{ amount, currency }` in fiat; on a
-sell the provider states the threshold in crypto ("minimum sell amount ... 0.00011648 BTC") and the
-failure type has nowhere to say which kind of currency a threshold is in, so putting a crypto
+The bound that does apply to the amount is the **provider's**, enforced when Meld is called, and it
+is crypto-denominated. It comes back as the same `BelowMinimum` / `AboveMaximum` tags a buy would
+get locally — but **without a `value`**. On a buy that tag carries `{ amount, currency }` in fiat; on
+a sell the provider states the threshold in crypto ("minimum sell amount ... 0.00011648 BTC") and
+the failure type has nowhere to say which kind of currency a threshold is in, so putting a crypto
 figure in the field every other producer fills with fiat would be a specific false statement rather
 than a missing one. A sell that is out of bounds therefore gets the correct tag and no number. The
 figure is in the operator's log against the `request_id`.
 
 Two practical consequences: a sell is refused for being out of bounds **upstream, not locally**, so
-it costs one provider call to find out; and a client cannot render "the minimum is X" on a sell.
+it costs one provider call to find out; and a client cannot render "the minimum is X" on a sell. A
+sell *is* refused locally, at zero provider cost, for a corridor or a payment method this account
+does not serve at all.
+
+**During a discovery outage, a sell reaches Meld ungated, on both `/quote` and `/session`.** A buy's
+outage policy differs by route (`/quote` degrades to letting Meld decide; `/session` fails closed to
+`config.limits`) because `config.limits` is a real fallback for a buy. It is not one for a sell: it
+is a fiat business-floor list, not a corridor/method existence table, so there is nothing for a sell
+to widen or fail closed against during an outage. This is the pre-existing posture -- a sell skipped
+this whole gate before direction-aware discovery existed to check it -- not a new hole opened by
+this document's own corridor/method claim above.
 
 ### The deposit address
 
@@ -157,12 +191,45 @@ this service enables an off-ramp corridor for real money -- DOT_ASSETHUB or any 
 amount this endpoint discloses to a seller must be confirmed against at least one real, settled
 sandbox sell for that asset. Until that confirmation happens, going live is going live on a guess
 about which field carries the figure a seller is told to expect, for the single most
-safety-critical value this service hands out. This is a release gate, to be checked off before
-`GET /supported*` (or any other switch) is turned on for a sell corridor, not a fact that reading
-`meld/rail.ts` is sufficient to establish.
+safety-critical value this service hands out. This is a release gate, to be checked off before a
+sell corridor carries real money, not a fact that reading `meld/rail.ts` is sufficient to
+establish. It is a gate on *settlement*, not on *discovery*: `GET /supported*` answering a sell
+corridor (below) is a separate, already-complete step, and answering one honestly is exactly what
+lets an integrator see a corridor is offered without that being mistaken for a promise that a sale
+through it has ever been observed to complete.
 
-Off-ramp corridor discovery (`GET /supported*` answers on-ramp corridors only) remains a later
-step.
+### Off-ramp corridor discovery
+
+`GET /supported/countries`, `GET /supported` and `GET /supported/corridors` all serve
+`direction: "sell"`, reading Meld's off-ramp catalog directly rather than a hand-kept list. Three
+things about how it is read differ from the buy path enough to be worth stating plainly, all
+verified live against the sandbox:
+
+- **The upstream category is different** (`CRYPTO_OFFRAMP` vs `CRYPTO_ONRAMP`), and so is the
+  route path's argument order: a buy's fiat leg is the *source* in that path and the crypto is the
+  *destination*; a sell's crypto is the source and the fiat is the destination. Getting this backwards
+  answers `200` with an empty corridor for every sell corridor probed, indistinguishable from "not
+  offered" -- there is no error to notice. This service builds the two paths from one function keyed
+  only on `direction`, specifically so the two cannot be assembled from copy-pasted, subtly wrong
+  halves.
+- **A sell corridor's `min`/`max` are fiat**, the payout currency, exactly like a buy's -- Meld does
+  not publish a crypto-denominated bound anywhere in this catalog. See "What a sell does get
+  locally, and what it does not" above for what that means for the amount gate; it does not affect
+  what `GET /supported` and `GET /supported/corridors` display, which is honestly the payout bound
+  Meld publishes.
+- **A country's default fiat for `GET /supported?direction=sell` is not read from Meld's `defaults`
+  endpoint**, because that endpoint answers `404` for the off-ramp category, for every country
+  tried. The substitute is Meld's `fiat-limits` catalog for `CRYPTO_OFFRAMP`, which carries a
+  `currencyCode` per country and is read and cached the same way the country list is.
+
+**What discovery being live does not mean: that a sell corridor is actually deliverable.** The
+account this service was built against has exactly one onboarded provider, and that provider
+off-ramps no `*_ASSETHUB` asset at all -- a keyed sell-corridor read for DOT_ASSETHUB, USDC_ASSETHUB
+or USDT_ASSETHUB in any country returns `methods: []` on this account, correctly. That is Meld's
+account-level truth, surfaced honestly, not a defect in this service: `GET /supported` and
+`GET /supported/corridors` answering "not offered" for a corridor genuinely not offered is the
+whole point of asking live rather than hand-maintaining a list. The day a provider that off-ramps
+these assets is onboarded, the same code starts returning it, without a deploy.
 
 ## `POST /quote`
 
@@ -533,8 +600,8 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 400 | `BelowMinimum` / `AboveMaximum` | On a **buy**, outside the effective fiat bounds (Meld's live corridor bound, tightened by a `limits` row when one names that pair), carrying `value: { amount, currency }` in fiat. On a **sell**, the provider's own crypto-denominated bound, refused upstream and carrying **no** `value`; see `direction` above for why a crypto threshold is not put on the wire. |
 | 400 | `Other{ CORRIDOR_UNAVAILABLE }` | A configured `limits` row does not overlap the live corridor bound, so this deployment cannot serve the corridor within its own limits. Refused rather than widened to the upstream bound. |
 | 400 | `Other{ INVALID_ADDRESS }` | Address failed to decode, or is not a 32-byte account. |
-| 400 | `Other{ CURRENCY_UNSUPPORTED }` | Not the configured currency for that destination. |
-| 400 | `Other{ PAYMENT_METHOD_UNSUPPORTED }` | The live corridor for this `(country, fiat, destination)` does not offer the requested `paymentMethodType`. Ask `GET /supported` for the ones it does. Not retryable as sent. |
+| 400 | `Other{ CURRENCY_UNSUPPORTED }` | No provider routes this `(country, fiat, destination)` in the requested `direction` (buy or sell). Checked locally against the live corridor, before any provider call. |
+| 400 | `Other{ PAYMENT_METHOD_UNSUPPORTED }` | The live corridor for this `(country, fiat, destination, direction)` does not offer the requested `paymentMethodType`. Ask `GET /supported` for the ones it does. Not retryable as sent. |
 | 400 | `Other{ MALFORMED_REQUEST }` | Body did not parse, named an unexpected field, or a field failed its bounds. **Which field is in the log against this `request_id`, never in the body**, so an integrator debugging a 400 needs the server's log line and not just the response. |
 | 401 | `Other{ UNAUTHORIZED }` | Caller not verified. |
 | 400 | `RouteWithdrawn` | The operator has disabled session creation. |

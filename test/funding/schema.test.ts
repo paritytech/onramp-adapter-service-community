@@ -334,7 +334,16 @@ const atV5 = (sql: string): string =>
     .replace(/, CONSTRAINT funding_direction_known .*$/, ')')
     // v5 had no direction, so both were mandatory: a request was always a buy.
     .replace(' wallet_address TEXT,', ' wallet_address TEXT NOT NULL,')
-    .replace(' source_amount TEXT,', ' source_amount TEXT NOT NULL,');
+    .replace(' source_amount TEXT,', ' source_amount TEXT NOT NULL,')
+    // `supported_corridors`' v7 -> v8 addition: the direction *column* text is the same literal
+    // string as `funding_requests`' and is already stripped by the first replace above (this
+    // function runs over every statement in `freshSchema()`, not only the funding table's). What
+    // is left to strip is the composite primary key and the CHECK constraint, back to the v4 -> v5
+    // shape's two-column key.
+    .replace(
+      ", direction, country), CONSTRAINT supported_corridors_direction_known CHECK (direction IN ('buy', 'sell'))",
+      ', country)',
+    );
 
 describe('the v5 -> v6 migration', () => {
   /** A v5 database with one buy row in it, stamped at 5. Returns the schema name. */
@@ -369,8 +378,8 @@ describe('the v5 -> v6 migration', () => {
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Not just [5, 6]: `openIn` always walks to `SCHEMA_VERSION`, so a database stamped at 5
-      // takes both the v6 and the v7 step in one boot.
-      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7]);
+      // takes the v6, v7 and v8 steps in one boot.
+      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8]);
     } finally {
       await dropSchema(schema);
     }
@@ -413,6 +422,21 @@ describe('a fresh database and a migrated one are the same database', () => {
         "WHERE conrelid = 'funding_requests'::regclass ORDER BY conname",
     );
 
+  /** As `columnsOf`/`constraintsOf`, for `supported_corridors`: the v7 -> v8 pair grew this table too. */
+  const corridorColumnsOf = async (schema: string) =>
+    query(
+      schema,
+      'SELECT ordinal_position, column_name, data_type, is_nullable, column_default ' +
+        "FROM information_schema.columns WHERE table_name = 'supported_corridors' " +
+        'AND table_schema = current_schema() ORDER BY ordinal_position',
+    );
+  const corridorConstraintsOf = async (schema: string) =>
+    query(
+      schema,
+      'SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint ' +
+        "WHERE conrelid = 'supported_corridors'::regclass ORDER BY conname",
+    );
+
   it('agrees column for column and constraint for constraint', async () => {
     // This is the test that was missing, and the omission shipped a real divergence:
     // `crypto_amount` was hand-placed after `source_amount` in `freshSchema()` while the
@@ -439,6 +463,12 @@ describe('a fresh database and a migrated one are the same database', () => {
 
       expect(await columnsOf(migrated)).toEqual(await columnsOf(fresh));
       expect(await constraintsOf(migrated)).toEqual(await constraintsOf(fresh));
+      // `supported_corridors` grew the same way at v7 -> v8 (`SUPPORTED_CORRIDORS_DIRECTION_COLUMN`
+      // and `SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT`, shared between `freshSchema()` and the
+      // migration for the identical reason), so it is asserted here too rather than in a fixture
+      // that only proves the table exists.
+      expect(await corridorColumnsOf(migrated)).toEqual(await corridorColumnsOf(fresh));
+      expect(await corridorConstraintsOf(migrated)).toEqual(await corridorConstraintsOf(fresh));
     } finally {
       await dropSchema(fresh);
       await dropSchema(migrated);
@@ -583,12 +613,25 @@ describe('the real migration chain', () => {
       // migration landed somewhere the code can use.
       await store.upsertCorridor({
         destination_currency_code: 'DOT_ASSETHUB',
+        direction: 'buy',
         country: 'BR',
         name: 'Brazil',
         fiat: 'BRL',
         methods: [{ paymentMethodType: 'PIX', category: 'bank', min: '10', max: '5000', currency: 'BRL' }],
       });
-      expect((await store.readCorridors('DOT_ASSETHUB')).map((c) => c.country)).toEqual(['BR']);
+      expect((await store.readCorridors('DOT_ASSETHUB', 'buy')).map((c) => c.country)).toEqual(['BR']);
+      // v8: a sell corridor for the same (crypto, country) lands beside the buy row rather than
+      // over it -- the migration's whole point.
+      await store.upsertCorridor({
+        destination_currency_code: 'DOT_ASSETHUB',
+        direction: 'sell',
+        country: 'BR',
+        name: 'Brazil',
+        fiat: 'BRL',
+        methods: [{ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank', min: '5', max: '1000', currency: 'BRL' }],
+      });
+      expect((await store.readCorridors('DOT_ASSETHUB', 'buy')).map((c) => c.country)).toEqual(['BR']);
+      expect((await store.readCorridors('DOT_ASSETHUB', 'sell')).map((c) => c.country)).toEqual(['BR']);
       // v6: the pre-existing row is a buy, because it could not have been anything else, and the
       // column's DEFAULT is what says so without a backfill.
       expect(carried?.direction).toBe('buy');
@@ -614,7 +657,7 @@ describe('the real migration chain', () => {
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     } finally {
       await dropSchema(schema);
     }

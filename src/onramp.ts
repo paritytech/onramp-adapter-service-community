@@ -39,7 +39,7 @@ import type {
 import { DEFAULT_DIRECTION, DEFAULT_RAIL } from './rail.js';
 import { resolveDestination } from './meld/catalog.js';
 import { toMinorUnits } from './money.js';
-import type { Corridor, CountryRow, Discovery } from './meld/discovery.js';
+import type { Corridor, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
 
 /** Just the store surface onramp touches, injectable in a test. */
 export type FundingPort = Pick<
@@ -168,9 +168,10 @@ export class Onramp {
     private readonly discovery?: Discovery,
   ) {}
 
-  /** The methods + fiat min/max a corridor offers, for the buyer's amount screen. Refuses an
-   *  unknown crypto as `WrongAssetOrChain` before any probe. */
-  async supported(country: string, code: string): Promise<Corridor> {
+  /** The methods + fiat min/max a corridor offers, for the buyer's (or seller's) amount screen.
+   *  Refuses an unknown crypto as `WrongAssetOrChain` before any probe. `direction` is absent
+   *  means `buy`, exactly as `/quote` and `/session`; see `this.direction`. */
+  async supported(country: string, code: string, direction?: Direction): Promise<Corridor> {
     resolveDestination(code);
     if (this.discovery === undefined) {
       throw reject(
@@ -179,21 +180,24 @@ export class Onramp {
         503,
       );
     }
-    // Fiat is resolved from the country's default corridor, so the buyer picks only a country.
-    return this.discovery.corridorForCountry(country, code);
+    // Fiat is resolved from the country's default corridor, so the caller picks only a country.
+    return this.discovery.corridorForCountry(country, code, this.direction(direction));
   }
 
-  // Cached supported corridors for a crypto, read from the DB off Meld; only rows fresh within the last few passes.
-  async supportedCorridors(code: string): Promise<SupportedCorridorDto[]> {
+  // Cached supported corridors for a (crypto, direction), read from the DB off Meld; only rows
+  // fresh within the last few passes. `direction` absent means `buy`, as everywhere else on this
+  // surface.
+  async supportedCorridors(code: string, direction?: Direction): Promise<SupportedCorridorDto[]> {
     resolveDestination(code);
     // The rows are written by the routes pass, so that is the cadence staleness is measured in.
     const freshAfter = this.clock() - this.cfg.supported.routes_interval_ms * STALE_PASSES;
-    const rows = await this.funding.readCorridors(code, freshAfter);
+    const rows = await this.funding.readCorridors(code, this.direction(direction), freshAfter);
     return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: r.methods }));
   }
 
-  /** The countries this deployment can deliver a crypto to, for the region dropdown. */
-  async supportedCountries(code: string): Promise<CountryRow[]> {
+  /** The countries this deployment can deliver a crypto to (or take it from, on a sell), for the
+   *  region dropdown. `direction` absent means `buy`. */
+  async supportedCountries(code: string, direction?: Direction): Promise<CountryRow[]> {
     resolveDestination(code);
     if (this.discovery === undefined) {
       throw reject(
@@ -202,7 +206,7 @@ export class Onramp {
         503,
       );
     }
-    return this.discovery.countries(code);
+    return this.discovery.countries(code, this.direction(direction));
   }
 
   /**
@@ -250,29 +254,24 @@ export class Onramp {
     // (chainflip) has no fiat corridor and refuses at the rail with its own reason, so gating it
     // here would preempt that with a misleading currency error.
     //
-    // And only a buy, which is the second half of the same argument. A sell commits crypto while
-    // the corridor's published limits are fiat (observed: an off-ramp route's `limits.currencyCode`
-    // is the payout fiat), so running this gate on a sell would compare a DOT amount against a GBP
-    // bound in fiat minor units and refuse or admit by a number that means nothing.
-    //
-    // That condition used to be belt-and-braces over a rail that refused every sell anyway. It
-    // is load-bearing now: Meld serves a sell, so a sell really does reach this line and really
-    // does skip the gate. Skipping is the correct behaviour and not a hole — there is no
-    // crypto-denominated bound in the catalog or the config to apply, so the alternatives were a
-    // meaningless comparison or none. The bound that does exist is the provider's own, enforced
-    // at quote time, and it comes back as `INVALID_AMOUNT_TOO_LOW`/`_TOO_HIGH` -> the same
-    // `BelowMinimum`/`AboveMaximum` tags a buy would be refused with locally. Two limit systems
-    // in two currencies, and only the fiat one is ours; `docs/api.md` says so to callers.
-    if (rail.provider === 'meld' && direction === 'buy') {
-      await this.limitFor(
-        destination.code,
-        request.fiat.toUpperCase(),
-        request.country,
-        request.paymentMethodType,
-        // A quote charges nothing and Meld prices the amount itself, so a catalog outage is not a
-        // reason to refuse one. See `limitFor`.
-        'ungate',
-      );
+    // Both directions are checked now: `buyLimit` for a buy, `sellCorridorCheck` for a sell. See
+    // `sellCorridorCheck`'s own doc comment for the full reasoning behind the split. In short:
+    // whether the corridor is offered at all, and whether it offers the chosen method, are
+    // questions this service CAN answer for a sell exactly as for a buy (direction-aware discovery
+    // makes that correct rather than silently wrong; see `meld/discovery.ts`), so a sell for an
+    // unrouted corridor or an unoffered payout method is refused here, locally, before a rail
+    // call. What a sell does NOT get is an amount bound: the corridor's published limits are fiat
+    // (observed: an off-ramp route's `limits.currencyCode` is the payout fiat) while a sell
+    // commits crypto, so comparing the two in fiat minor units would be a DOT figure measured
+    // against a GBP bound -- a number, not a check.
+    if (rail.provider === 'meld') {
+      // Neither return value is used here: a quote charges nothing and Meld prices the amount
+      // itself, so a catalog outage is not a reason to refuse one, in either direction.
+      if (direction === 'buy') {
+        await this.buyLimit(destination.code, request.fiat.toUpperCase(), request.country, request.paymentMethodType, 'ungate');
+      } else {
+        await this.sellCorridorCheck(destination.code, request.fiat.toUpperCase(), request.country, request.paymentMethodType);
+      }
     }
     // The legs are the same in both directions and the amount is not: a buy prices the fiat it
     // will charge, a sell prices the crypto it will send. The rail port takes one or the other,
@@ -906,30 +905,76 @@ export class Onramp {
   }
 
   /**
-   * The configured bounds for one (destination, currency) pair, or the refusal that says why not.
+   * The live corridor's method, or the refusal that says why the corridor or the method is not
+   * offered. Shared by `buyLimit` and `sellCorridorCheck` so the two refusal messages (and the
+   * upstream call that produces them) cannot drift apart between directions.
    *
-   * Split out so `quote` asks the same question `validate` does. Nothing in the answer depends on
-   * what happens between the two calls, so an unsupported currency is worth refusing at the quote
-   * rather than at the moment of charge.
+   * `undefined` means a catalog outage, and only that: a corridor Meld can see is genuinely not
+   * offered always throws (`CURRENCY_UNSUPPORTED` for no route at all, `PAYMENT_METHOD_UNSUPPORTED`
+   * for a route with no matching method), never returns quietly. Callers that degrade on outage
+   * rely on that distinction.
    *
-   * Limits are keyed by (code, currency): the buyer's fiat picks which bounds apply, so a
-   * destination can be offered in USD (card) and EUR (SEPA) at once.
+   * Assumes `discovery` is wired; callers check `this.discovery !== undefined` themselves; see
+   * `buyLimit`.
    */
-  private async limitFor(
+  private async corridorMethod(
+    discovery: Discovery,
     code: string,
     currency: string,
     country: string,
     method: string,
-    onOutage?: 'refuse',
-  ): Promise<{ min: string; max: string }>;
-  private async limitFor(
-    code: string,
-    currency: string,
-    country: string,
-    method: string,
-    onOutage: 'ungate',
-  ): Promise<{ min: string; max: string } | undefined>;
+    direction: Direction,
+  ): Promise<MethodLimit | undefined> {
+    let corridor: Corridor | undefined;
+    try {
+      corridor = await discovery.corridor(country, currency, code, direction);
+    } catch (error) {
+      // A deliberate refusal is never a reason to fall back.
+      //
+      // A bare `catch` would turn everything the call can throw into "Meld is unreachable",
+      // swallowing a `Refusal` raised inside discovery (a corridor it can see is not offered)
+      // and answering from `config.limits`, the one source that cannot know. Parse failures do
+      // not reach here, because the schemas fail closed to an empty catalog which surfaces below
+      // as `CURRENCY_UNSUPPORTED`. What remains is transport, and only transport degrades.
+      if (error instanceof Refusal) throw error;
+      return undefined;
+    }
+    if (corridor.methods.length === 0) {
+      // No provider routes this crypto to this (country, fiat) in this direction: the pair
+      // cannot be bought, or sold, here.
+      throw reject(
+        { tag: 'Other', value: { code: 'CURRENCY_UNSUPPORTED', message: 'That currency is not available.' } },
+        `No ${direction} route for ${code} in ${country}/${currency}.`,
+      );
+    }
+    const offered = corridor.methods.find((m) => m.paymentMethodType === method);
+    if (offered === undefined) {
+      throw reject(
+        {
+          tag: 'Other',
+          value: { code: 'PAYMENT_METHOD_UNSUPPORTED', message: 'That payment method is not available for this region.' },
+        },
+        `Method ${method} not offered for ${direction} ${country}/${currency}/${code}.`,
+      );
+    }
+    return offered;
+  }
+
   /**
+   * The fiat amount bound for a buy: the live corridor's own `min`/`max`, tightened by a
+   * configured `limits` floor. Or the refusal that says why not. Split out so `quote` asks the
+   * same question `validate` does. Nothing in the answer depends on what happens between the two
+   * calls, so an unsupported currency is worth refusing at the quote rather than at the moment of
+   * charge.
+   *
+   * Limits are keyed by (code, currency): a caller's fiat picks which bounds apply, so a
+   * destination can be offered in USD (card) and EUR (SEPA) at once.
+   *
+   * Buy-only by construction (there is no `direction` parameter): the corridor's published bound
+   * is fiat, a buy's committed amount is fiat, and the two compare directly in minor units. See
+   * `sellCorridorCheck` for why a sell does not share this function -- the reasoning is long
+   * enough to live at that function instead of being repeated here.
+   *
    * `onOutage` is what the two callers disagree about, and the disagreement is correct.
    *
    * A catalog outage is not evidence about a corridor. `/session` treats it as a reason to refuse:
@@ -944,7 +989,21 @@ export class Onramp {
    * still validates the amount when it prices it, so the honest answer is to let the upstream
    * decide rather than to manufacture a local refusal.
    */
-  private async limitFor(
+  private async buyLimit(
+    code: string,
+    currency: string,
+    country: string,
+    method: string,
+    onOutage?: 'refuse',
+  ): Promise<{ min: string; max: string }>;
+  private async buyLimit(
+    code: string,
+    currency: string,
+    country: string,
+    method: string,
+    onOutage: 'ungate',
+  ): Promise<{ min: string; max: string } | undefined>;
+  private async buyLimit(
     code: string,
     currency: string,
     country: string,
@@ -961,41 +1020,8 @@ export class Onramp {
     // discovery outage fails closed (every code -> RegionUnavailable), the safe direction for a
     // charge gate.
     if (this.discovery !== undefined) {
-      let corridor: Corridor | undefined;
-      try {
-        corridor = await this.discovery.corridor(country, currency, code);
-      } catch (error) {
-        // A deliberate refusal is never a reason to fall back.
-        //
-        // A bare `catch` would turn everything the call can throw into "Meld is unreachable",
-        // swallowing a `Refusal` raised inside discovery (a corridor it can see is not offered)
-        // and answering from `config.limits`, the one source that cannot know. Parse failures do
-        // not reach here, because the schemas fail closed to an empty catalog which surfaces below
-        // as `CURRENCY_UNSUPPORTED`. What remains is transport, and only transport degrades.
-        if (error instanceof Refusal) throw error;
-        corridor = undefined;
-      }
-      if (corridor !== undefined) {
-        if (corridor.methods.length === 0) {
-          // No provider routes this crypto to this (country, fiat): the pair is not buyable here.
-          throw reject(
-            { tag: 'Other', value: { code: 'CURRENCY_UNSUPPORTED', message: 'That currency is not available.' } },
-            `No ${code} route for ${country}/${currency}.`,
-          );
-        }
-        const offered = corridor.methods.find((m) => m.paymentMethodType === method);
-        if (offered === undefined) {
-          throw reject(
-            {
-              tag: 'Other',
-              value: {
-                code: 'PAYMENT_METHOD_UNSUPPORTED',
-                message: 'That payment method is not available for this region.',
-              },
-            },
-            `Method ${method} not offered for ${country}/${currency}/${code}.`,
-          );
-        }
+      const offered = await this.corridorMethod(this.discovery, code, currency, country, method, 'buy');
+      if (offered !== undefined) {
         // A configured (code, currency) row is a business floor that tightens the live bound.
         const floor = this.cfg.limits.find((l) => l.code === code && l.currency === currency);
         if (floor === undefined) return { min: offered.min, max: offered.max };
@@ -1024,12 +1050,59 @@ export class Onramp {
         }
         return { min, max };
       }
-      // `corridor` is undefined only when the catalog call threw: discovery is wired, so this is an
+      // `offered` is undefined only when the catalog call threw: discovery is wired, so this is an
       // outage rather than a deployment without discovery. `/quote` declines to invent a refusal
       // from it; `/session` falls through to the fallback allow-list below.
       if (onOutage === 'ungate') return undefined;
     }
     return this.configLimitFor(code, currency);
+  }
+
+  /**
+   * The sell counterpart of `buyLimit`'s corridor/method check -- and only that check. No amount
+   * bound, on purpose.
+   *
+   * A buy commits fiat; the live corridor's published `min`/`max` are fiat; the two compare
+   * directly, in minor units, which is what `buyLimit` does. A sell commits crypto, and the
+   * corridor's published bound is still fiat -- Meld was verified live to publish an off-ramp
+   * route's limit in the *payout* currency, not the crypto sold. There is no crypto-denominated
+   * bound anywhere this service can read one from: not the catalog (which has no such field), not
+   * `config.limits` (fiat by construction, compared through `toMinorUnits`, which is itself a
+   * two-decimal-place fiat operation a ten-decimal DOT amount cannot pass through without
+   * truncation). Comparing a crypto amount against a fiat number would not be a looser check, it
+   * would be a meaningless one -- a seller refused or admitted by a figure that has nothing to do
+   * with what they are sending. So this function returns no bound, and neither caller compares one.
+   *
+   * That is not the same as "a sell meets no local check". Corridor and method existence are
+   * direction-independent facts -- "does this account route this crypto through this country at
+   * all" and "does it offer this payout method" do not need an amount to answer, and direction-aware
+   * discovery (this build) answers them correctly for a sell for the first time, where an earlier,
+   * direction-blind version of this module would have silently returned `methods: []` for every
+   * sell corridor and refused all of them as `CURRENCY_UNSUPPORTED` regardless of the truth. So a
+   * sell IS refused here, locally, for an unrouted corridor or an unoffered method -- it only skips
+   * the part of the gate that has no crypto-denominated version to run.
+   *
+   * The amount bound that does exist for a sell is the provider's own, enforced when Meld is
+   * called, crypto-denominated (verified live: the sandbox refused `0.0000001 BTC` with a BTC
+   * threshold in the message, not a GBP one). It comes back through the same
+   * `BelowMinimum`/`AboveMaximum` tags a buy is refused with locally -- but without a `value`: that
+   * field is `{ amount, currency }` with no way to say which *kind* of currency a threshold is in,
+   * and two existing producers already fill it with fiat, so putting a crypto figure there would
+   * read as a false, specific fiat claim rather than a missing one. See `docs/api.md` for what a
+   * client is told. So a seller is never refused locally for a bound that does not apply to them,
+   * and is never let through to commit an amount this service could have known would be refused --
+   * "could have known" is exactly the corridor/method check above; the amount itself is Meld's
+   * question alone, asked once, at the point real money would move.
+   *
+   * No `onOutage`, unlike `buyLimit`: a sell has no config-based corridor/method fact to fall back
+   * to during an outage -- `config.limits` is fiat business floors, not an existence list -- so an
+   * absent or unreachable discovery leaves a sell ungated on both `/quote` and `/session`, which is
+   * the pre-existing behaviour (a sell skipped this whole gate before direction-aware discovery
+   * existed to check it) rather than a new hole opened by this function.
+   */
+  private async sellCorridorCheck(code: string, currency: string, country: string, method: string): Promise<void> {
+    if (this.discovery === undefined) return;
+    await this.corridorMethod(this.discovery, code, currency, country, method, 'sell');
   }
 
   /**
@@ -1073,44 +1146,49 @@ export class Onramp {
         ? undefined
         : normalizeAddress(committedTerm(request.walletAddress, 'walletAddress', direction));
 
-    // The fiat amount gate is Meld's corridor question; only the fiat rail has one. A non-fiat rail
+    // The fiat corridor gate is Meld's own question; only the fiat rail has one. A non-fiat rail
     // (chainflip) has no fiat corridor and refuses at the rail with its own reason (`RAIL_REFUSED`),
-    // so running a Meld corridor/limit check here would preempt that with a misleading currency
-    // error. Bounds come from the live (crypto, country, fiat, method) corridor, tightened by any
-    // configured business floor; the chosen method picks which bound applies.
+    // so running a Meld corridor/method check here would preempt that with a misleading currency
+    // error.
     //
-    // And only a buy, for the reason spelled out in `quote`: the corridor's limits are fiat while
-    // a sell commits crypto, so this comparison would be DOT against GBP in fiat minor units.
+    // Both directions are checked now: `buyLimit` for a buy, `sellCorridorCheck` for a sell. A
+    // sell is refused here, locally, for an unrouted corridor or an unoffered payout method --
+    // corridor and method existence do not depend on an amount, and direction-aware discovery
+    // answers them correctly for a sell now, where before every sell either skipped this check
+    // entirely or (with an unswapped route path) would have silently seen `methods: []` for a
+    // corridor Meld genuinely serves. What a sell does NOT get is the fiat amount bound: the
+    // corridor's limits are fiat while a sell commits crypto, so comparing them would be DOT
+    // against GBP in fiat minor units, and `sellCorridorCheck` never returns a bound for exactly
+    // that reason -- see its own doc comment for the full argument.
     //
-    // A sell now reaches this line and skips the gate, where before Meld refused it earlier. So
-    // a sell's amount meets exactly two checks locally: the schema's shape, and its "greater
+    // So a sell's amount meets exactly two local checks: the schema's shape, and its "greater
     // than zero" refinement. `contract.ts` says at `cryptoAmount` that that refinement is the
     // only thing between a caller and a zero-amount sale, and this is the line that makes it
-    // true. The corridor-derived floor and ceiling a buy gets have no crypto counterpart to
-    // apply; the provider applies its own at session time and refuses with the same two tags.
-    if (rail.provider === 'meld' && direction === 'buy') {
-      const limit = await this.limitFor(
-        destination.code,
-        currency,
-        request.country,
-        request.paymentMethodType,
-      );
-      // The threshold rides on the failure, as it does on the Meld-derived form of the same two
-      // tags (`server.ts`'s `meld400`). The type has always carried `value`; only the rail's
-      // version filled it, so a config-derived refusal reached the buyer as a bare "that amount is
-      // below the minimum" with no number in it. A client cannot correct an amount unseen.
-      const amount = toMinorUnits(committedTerm(request.sourceAmount, 'sourceAmount', direction));
-      if (amount < toMinorUnits(limit.min)) {
-        throw reject(
-          { tag: 'BelowMinimum', value: { amount: limit.min, currency } },
-          `${String(request.sourceAmount)} is below the ${limit.min} minimum.`,
-        );
-      }
-      if (amount > toMinorUnits(limit.max)) {
-        throw reject(
-          { tag: 'AboveMaximum', value: { amount: limit.max, currency } },
-          `${String(request.sourceAmount)} is above the ${limit.max} maximum.`,
-        );
+    // true. The bound that does apply to the amount itself is the provider's own, crypto-
+    // denominated, enforced when Meld is called; see `sellCorridorCheck`'s doc comment and
+    // `docs/api.md`.
+    if (rail.provider === 'meld') {
+      if (direction === 'buy') {
+        const limit = await this.buyLimit(destination.code, currency, request.country, request.paymentMethodType);
+        // The threshold rides on the failure, as it does on the Meld-derived form of the same two
+        // tags (`server.ts`'s `meld400`). The type has always carried `value`; only the rail's
+        // version filled it, so a config-derived refusal reached the buyer as a bare "that amount is
+        // below the minimum" with no number in it. A client cannot correct an amount unseen.
+        const amount = toMinorUnits(committedTerm(request.sourceAmount, 'sourceAmount', direction));
+        if (amount < toMinorUnits(limit.min)) {
+          throw reject(
+            { tag: 'BelowMinimum', value: { amount: limit.min, currency } },
+            `${String(request.sourceAmount)} is below the ${limit.min} minimum.`,
+          );
+        }
+        if (amount > toMinorUnits(limit.max)) {
+          throw reject(
+            { tag: 'AboveMaximum', value: { amount: limit.max, currency } },
+            `${String(request.sourceAmount)} is above the ${limit.max} maximum.`,
+          );
+        }
+      } else {
+        await this.sellCorridorCheck(destination.code, currency, request.country, request.paymentMethodType);
       }
     }
 

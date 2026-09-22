@@ -1172,7 +1172,7 @@ describe('Onramp.create', () => {
         byReference: (alias, product, ref) => funding.byReference(alias, product, ref),
         cancel: (alias, product, id, now) => funding.cancel(alias, product, id, now),
         list: (alias, product, limit) => funding.list(alias, product, limit),
-        readCorridors: (code) => funding.readCorridors(code),
+        readCorridors: (code, direction) => funding.readCorridors(code, direction),
         // Rejects, not throws: a synchronous throw is caught whether or not the call is
         // awaited, so it would go green against a missing `await`.
         update: () => Promise.reject(new Error('database is locked')),

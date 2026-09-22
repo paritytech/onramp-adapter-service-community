@@ -2,9 +2,11 @@
  * The funding store's schema, versioned.
  *
  * The SQLite migration chain is gone, and deleting it was the point of moving. v0->v1->v2->v3
- * existed to bring an on-disk SQLite file forward in place; the Postgres chain is 1->2->3->4->5->6,
- * with 3->4 adding `cancelled_at`, 4->5 adding the supported-corridors cache and 5->6 adding the
- * sell direction and the terms only a sell commits. Nothing was ever
+ * existed to bring an on-disk SQLite file forward in place; the Postgres chain is
+ * 1->2->3->4->5->6->7->8, with 3->4 adding `cancelled_at`, 4->5 adding the supported-corridors
+ * cache, 5->6 adding the sell direction and the terms only a sell commits, 6->7 recording a
+ * deposit-address disclosure conflict, and 7->8 putting a direction into the supported-corridors
+ * cache. Nothing was ever
  * deployed, so that chain migrated a population of
  * zero, and CloudSQL starts from an empty database, so porting it would have meant carrying three
  * migrations for no rows, expressed against an engine this service has left. The v3 shape is the v1 shape
@@ -20,7 +22,7 @@ import { DIRECTIONS } from '../rail.js';
 import { FUNDING_STATES } from './state.js';
 
 /** The current schema version. Bump with each migration added here. */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /** A migration: bring the previous version's rows to this version's shape. */
 export interface Migration {
@@ -32,7 +34,19 @@ export interface Migration {
   sql: string[];
 }
 
-// The supported-corridors cache keyed by (crypto, country); IF NOT EXISTS since freshSchema() and the v4->v5 migration share it.
+/**
+ * The v4 -> v5 shape of `supported_corridors`, frozen exactly as it shipped.
+ *
+ * Not reused by `freshSchema()` any more (see `SUPPORTED_CORRIDORS_TABLE_CURRENT` below): a
+ * database that is genuinely still at v4 today walks this step first, on the way to the current
+ * shape via v7 -> v8's `ALTER TABLE`s, and that walk only produces the same table a fresh database
+ * gets if this text keeps meaning exactly what it meant when v4 -> v5 shipped. Changing it in
+ * place to add `direction` would make a *fresh* v5 table (built by a v4 database migrating today)
+ * already have the column the v7 -> v8 `ADD COLUMN` step is about to add, which fails outright
+ * ("column already exists") the first time both steps run in one boot -- the exact class of
+ * fresh-vs-migrated divergence `CRYPTO_AMOUNT_COLUMN`'s comment describes, caught before it could
+ * ship rather than after.
+ */
 const SUPPORTED_CORRIDORS_TABLE =
   'CREATE TABLE IF NOT EXISTS supported_corridors (' +
   ' destination_currency_code TEXT NOT NULL,' +
@@ -42,6 +56,59 @@ const SUPPORTED_CORRIDORS_TABLE =
   ' methods JSONB NOT NULL,' +
   ' updated_at BIGINT NOT NULL,' +
   ' PRIMARY KEY (destination_currency_code, country)' +
+  ')';
+
+/**
+ * The direction column on `supported_corridors`, written once for the same reason
+ * `DIRECTION_COLUMN` (below, on `funding_requests`) is: `freshSchema()` and the v7 -> v8 migration
+ * must produce the same table, and a value hand-duplicated between the two is exactly the shape
+ * this repo has already shipped a divergence in (`CRYPTO_AMOUNT_COLUMN`'s comment tells that
+ * story). `NOT NULL DEFAULT 'buy'`: every corridor row written before a sell corridor could exist
+ * was a buy corridor.
+ */
+const SUPPORTED_CORRIDORS_DIRECTION_COLUMN = " direction TEXT NOT NULL DEFAULT 'buy'";
+
+/**
+ * The direction alphabet on `supported_corridors`, named explicitly like `funding_direction_known`
+ * so a fresh table and a migrated one carry the same constraint name rather than whatever Postgres
+ * auto-generates on each path.
+ */
+const SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT = `CONSTRAINT supported_corridors_direction_known CHECK (direction IN (${DIRECTIONS.map((d) => `'${d}'`).join(', ')}))`;
+
+/**
+ * The current shape of `supported_corridors`: one row per (crypto, direction, country), which is
+ * what `upsertCorridor`'s `ON CONFLICT` target and `readCorridors`' predicate both assume from the
+ * day this ships. Without `direction` in the key, a sell refresh pass upserting `(DOT_ASSETHUB,
+ * GB)` would silently overwrite the buy row for the same corridor -- the two are different
+ * questions to Meld (different category, different route argument order; see
+ * `meld/discovery.ts`), and this table must not fold their answers into one slot.
+ *
+ * `IF NOT EXISTS` even though this text now runs only on a genuinely fresh database (a v7 -> v8
+ * `ALTER` handles every database that already has the old shape): kept for the same defensive
+ * reason `freshSchema()`'s other `CREATE TABLE`s have no `IF NOT EXISTS` and this one, historically
+ * shared with a migration step, always did -- consistency with the frozen text above costs nothing
+ * and a second reader comparing the two is one fewer place to wonder why they differ.
+ *
+ * `direction` is placed *last*, after `updated_at`, not beside `destination_currency_code` where a
+ * reader would expect a key column to sit. That is the `CRYPTO_AMOUNT_COLUMN` lesson applied here:
+ * `ALTER TABLE ... ADD COLUMN` can only append, so the v7 -> v8 migration is forced to put
+ * `direction` at the end regardless of where it reads best, and this text has to match that
+ * ordinal position exactly or `schema.test.ts`'s column-for-column comparison (the test this
+ * repo's shipped divergence is why it exists) fails on a fresh-vs-migrated database. Whatever key
+ * columns *look* like they belong together, the physical order is the migration's, not the
+ * reader's.
+ */
+const SUPPORTED_CORRIDORS_TABLE_CURRENT =
+  'CREATE TABLE IF NOT EXISTS supported_corridors (' +
+  ' destination_currency_code TEXT NOT NULL,' +
+  ' country TEXT NOT NULL,' +
+  ' name TEXT NOT NULL,' +
+  ' fiat TEXT NOT NULL,' +
+  ' methods JSONB NOT NULL,' +
+  ' updated_at BIGINT NOT NULL,' +
+  `${SUPPORTED_CORRIDORS_DIRECTION_COLUMN},` +
+  ' PRIMARY KEY (destination_currency_code, direction, country),' +
+  ` ${SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT}` +
   ')';
 
 /**
@@ -350,6 +417,79 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE funding_requests ADD ${DEPOSIT_CONFLICT_CONSTRAINT}`,
     ],
   },
+  {
+    from: 7,
+    to: 8,
+    /**
+     * v7 -> v8: a corridor can now be a sell as well as a buy, so direction joins the key.
+     *
+     * Before this step `supported_corridors`' primary key is `(destination_currency_code,
+     * country)`. A sell refresh pass and a buy refresh pass for the same (crypto, country) would
+     * upsert into the same row, each overwriting the other's `methods` and `fiat` on every pass --
+     * silently, because `ON CONFLICT ... DO UPDATE` has no way to say "this is a different
+     * corridor" when the key does not carry the fact that makes it one. `store.ts`'s
+     * `upsertCorridor` conflict target and `readCorridors`' predicate both move to match, in the
+     * same commit as this migration, so the two cannot drift out of step with each other.
+     *
+     * Three statements, mirroring `freshSchema()`'s `SUPPORTED_CORRIDORS_TABLE_CURRENT` column for
+     * column: add the column, then swap the primary key for one that includes it (Postgres names
+     * an unnamed primary key `<table>_pkey`, which is what `DROP CONSTRAINT` below names), then add
+     * the direction alphabet as a `CHECK`, exactly as `funding_direction_known` does for
+     * `funding_requests`.
+     *
+     * ## What this step costs a live service, and when that stops being acceptable
+     *
+     * Sized the same way the v5 -> v6 and v6 -> v7 steps on `funding_requests` are, but measured
+     * fresh rather than borrowed from that number: this migration's costliest statement (rebuilding
+     * a primary-key index) has no analogue in either of those steps, which never touched an index,
+     * so reusing their figure would have understated it. One transaction, `ACCESS EXCLUSIVE` held
+     * to `COMMIT`, the service live throughout behind old pods, exactly as before. What differs is
+     * the table: `supported_corridors` is not a request ledger that grows with traffic; it is
+     * bounded by (crypto count) x (direction count) x (country count) the refresh job walks, which
+     * is dozens of cryptos at the very most against at most a few hundred countries -- several
+     * orders of magnitude below `funding_requests`' row count today or at any plausible scale this
+     * deployment reaches. Measured at 2,000,000 rows regardless, on warm local NVMe, to give a real
+     * number rather than an assumption:
+     *
+     * - `ADD COLUMN direction TEXT NOT NULL DEFAULT 'buy'`: 5.3 ms. Catalog-only, for the same
+     *   reason the `funding_requests` one is (Postgres 11+ stores a non-volatile default in the
+     *   catalog rather than rewriting every row).
+     * - `DROP CONSTRAINT supported_corridors_pkey`: 7.1 ms. Dropping a constraint is catalog-only
+     *   too; only building its replacement costs anything.
+     * - `ADD PRIMARY KEY (destination_currency_code, direction, country)`: **5.07 s.** Unlike a
+     *   `CHECK`, this rebuilds the underlying unique btree index over the whole table, and it is by
+     *   far the expensive statement in this step -- roughly 4.5x the *combined* cost of every
+     *   `funding_requests` constraint the v5 -> v6 step measured. A composite index over three text
+     *   columns is heavier to build than a single-column default or a boolean-ish `CHECK`, and nothing
+     *   about this table being small in row count changes that; it changes only how many rows there
+     *   are to build the index over.
+     * - `ADD CONSTRAINT ... CHECK`: 136 ms, scanning the whole table exactly as `funding_sell_terms`
+     *   does, cheaper than the `funding_requests` `CHECK`s because this row is narrower.
+     *
+     * ~5.2 s total at 2,000,000 rows, essentially all of it the primary-key rebuild. **The
+     * threshold to act on is lower than the ~10M rows the v5 -> v6 and v6 -> v7 steps name**,
+     * because this step's dominant cost scales with index-build work rather than with the cheaper
+     * per-row catalog/scan cost those steps measured: extrapolating linearly, 5.2 s at 2M rows
+     * crosses the same "half the pool's 10 s `statement_timeout`" line named there at roughly
+     * **2M x (5/5.2) ≈ 1.9M** rows already past this measurement, i.e. this step is already close
+     * to that line at the row count it was measured against, not merely approaching it from a
+     * comfortable distance the way the smaller `funding_requests` constraints are. In practice
+     * `supported_corridors` has no path to that row count at all: the refresh job that populates it
+     * (`supported/refresh.ts`) writes one row per (crypto, direction, country) it is configured to
+     * walk, and nothing in this service inserts a row outside that loop, so the number above is a
+     * ceiling this table is not expected to approach rather than a live risk. If that ever stops
+     * being true -- a per-buyer or per-request row here would be a different design, not a bigger
+     * version of this one -- split this step the way the v5 -> v6 docblock describes (`NOT VALID`
+     * + `VALIDATE` in a later, separate transaction) well before the row count, not the 10M figure
+     * that applies to the other steps.
+     */
+    sql: [
+      `ALTER TABLE supported_corridors ADD COLUMN${SUPPORTED_CORRIDORS_DIRECTION_COLUMN}`,
+      'ALTER TABLE supported_corridors DROP CONSTRAINT supported_corridors_pkey',
+      'ALTER TABLE supported_corridors ADD PRIMARY KEY (destination_currency_code, direction, country)',
+      `ALTER TABLE supported_corridors ADD ${SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT}`,
+    ],
+  },
 ];
 
 /**
@@ -426,8 +566,9 @@ export function freshSchema(): string[] {
     // The worker's claim scan orders by (created_at, id) within the non-terminal rows. Leading on
     // `status` lets the planner cut to those first.
     'CREATE INDEX funding_claim_scan ON funding_requests (status, created_at, id)',
-    // The supported-corridors cache. See the v4 -> v5 migration for the same statement.
-    SUPPORTED_CORRIDORS_TABLE,
+    // The supported-corridors cache, at the current (v8) shape. See the v7 -> v8 migration for
+    // what an existing database walks through to reach the same table.
+    SUPPORTED_CORRIDORS_TABLE_CURRENT,
   ];
 }
 

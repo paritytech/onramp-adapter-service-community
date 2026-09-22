@@ -161,30 +161,50 @@ async function fakeMeld(
         });
         return;
       }
+      // The real endpoint answers `404` for every country under `CRYPTO_OFFRAMP` (verified); a
+      // sell's `defaultFiat` does not call this path at all (see `fiat-limits` below), so the
+      // only caller that is *supposed* to reach this branch is a buy. Modelled here, not just
+      // asserted in the unit suite, because a regression that routed a sell's `defaultFiat` back
+      // through this endpoint would otherwise pass silently: `US`/`BR` resolve to the same
+      // currency codes on both this handler and `fiat-limits` below, so nothing here would have
+      // told the two apart.
       if (req.url?.startsWith('/network-partner/defaults/')) {
-        const country = req.url.split('/')[3] ?? '';
+        const [, , , rawCountry, category] = req.url.split('/');
+        const country = rawCountry ?? '';
+        if (category === 'CRYPTO_OFFRAMP') {
+          json({ code: 'NOT_FOUND', message: `No defaults are configured for country ${country} and category CRYPTO_OFFRAMP` }, 404);
+          return;
+        }
         const currencyCode = { US: 'USD', BR: 'BRL', ZZ: 'ZZZ' }[country];
         json(currencyCode === undefined ? { countryCode: country } : { countryCode: country, currencyCode });
         return;
       }
-      // `/network-partner/supported/routes/{CATEGORY}/{country}/{fiat}/{crypto}`
-      const [, , , , , country, fiat] = (req.url ?? '').split('/');
-      json(
-        country === 'ZZ'
-          ? []
-          : [
-              {
-                partner: 'TRANSAK',
-                paymentMethods: [
-                  {
-                    name: 'CREDIT_DEBIT_CARD',
-                    paymentType: 'CARD',
-                    limits: { currencyCode: fiat, min: '5', max: '3000' },
-                  },
-                ],
-              },
-            ],
-      );
+      // A sell's substitute for `defaults`, which does not exist for `CRYPTO_OFFRAMP` (see above):
+      // `MeldDiscovery.defaultFiat` reads a country's fiat off this catalog instead. `GB` is here
+      // for the sell test below; the rest mirror the on-ramp defaults for symmetry.
+      if (req.url?.startsWith('/network-partner/supported/fiat-limits')) {
+        json({
+          fiatLimits: [
+            { countryCode: 'US', currencyCode: 'USD' },
+            { countryCode: 'BR', currencyCode: 'BRL' },
+            { countryCode: 'ZZ', currencyCode: 'ZZZ' },
+            { countryCode: 'GB', currencyCode: 'GBP' },
+          ],
+        });
+        return;
+      }
+      // `/network-partner/supported/routes/{CATEGORY}/{country}/{SOURCE}/{DESTINATION}`. Source
+      // and destination swap with category, exactly as the real endpoint does (verified): a buy's
+      // fiat is the source and the crypto is the destination; a sell's crypto is the source and
+      // the fiat is the destination. Getting this backwards is the one thing `discovery.ts` is
+      // built never to do, so the fake has to model the swap or it cannot catch a regression here.
+      const [, , , , category, country, arg1, arg2] = (req.url ?? '').split('/');
+      const offramp = category === 'CRYPTO_OFFRAMP';
+      const fiat = offramp ? arg2 : arg1;
+      const method = offramp
+        ? { name: 'PAYOUT_TO_BANK', paymentType: 'BANK_TRANSFER', limits: { currencyCode: fiat, min: '5', max: '3000' } }
+        : { name: 'CREDIT_DEBIT_CARD', paymentType: 'CARD', limits: { currencyCode: fiat, min: '5', max: '3000' } };
+      json(country === 'ZZ' ? [] : [{ partner: 'TRANSAK', paymentMethods: [method] }]);
       return;
     }
     // Both POST bodies are needed to model the parts of Meld's contract that depend on them,
@@ -793,29 +813,43 @@ describe('the funding journey over real HTTP', () => {
     child = await startService(configPath, port);
     const base = `http://127.0.0.1:${String(port)}`;
 
-    // Boot passes run after the port opens, so the first read can legitimately be empty.
+    // Boot passes run after the port opens, so the first read can legitimately be empty. Both
+    // directions are refreshed for DOT_ASSETHUB (`SUPPORTED_REFRESH_JOBS` in `startup.ts`), so a
+    // filled cache is 4 rows: (BR, US) x (buy, sell).
     const deadline = Date.now() + 15_000;
     let rows: Record<string, unknown>[] = [];
     for (;;) {
-      rows = await rawQuery(schema, 'SELECT country, fiat, methods FROM supported_corridors ORDER BY country');
-      if (rows.length >= 2 || Date.now() > deadline) break;
+      rows = await rawQuery(schema, 'SELECT direction, country, fiat, methods FROM supported_corridors ORDER BY direction, country');
+      if (rows.length >= 4 || Date.now() > deadline) break;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
 
-    // BR and US only: NF dropped (no fiat), ZZ skipped (no route).
-    expect(rows.map((r) => r.country)).toEqual(['BR', 'US']);
-    expect(rows.map((r) => r.fiat)).toEqual(['BRL', 'USD']);
+    // BR and US only in each direction: NF dropped (no fiat, either direction), ZZ skipped (no
+    // route, either direction).
+    expect(rows.map((r) => [r.direction, r.country])).toEqual([
+      ['buy', 'BR'],
+      ['buy', 'US'],
+      ['sell', 'BR'],
+      ['sell', 'US'],
+    ]);
+    expect(rows.map((r) => r.fiat)).toEqual(['BRL', 'USD', 'BRL', 'USD']);
 
     // Catalog before routes, and routes asks per country with the catalog's fiat — never
-    // re-reading `defaults`, which is what makes its cadence affordable.
+    // re-reading `defaults`/`fiat-limits`, which is what makes its cadence affordable.
     const discovery = meldCalls.filter((url) => url.startsWith('/network-partner/'));
     expect(discovery[0]).toContain('/supported/countries');
+    // Only a buy reads `defaults/`; a sell reads `fiat-limits` instead (see `MeldDiscovery.defaultFiat`).
     expect(discovery.filter((url) => url.startsWith('/network-partner/defaults/'))).toHaveLength(4);
-    // Name-sorted, as `countries` returns and the catalog preserves.
+    expect(discovery.filter((url) => url.startsWith('/network-partner/supported/fiat-limits'))).toHaveLength(1);
+    // Name-sorted, as `countries` returns and the catalog preserves; buy's job runs before sell's
+    // (`SUPPORTED_REFRESH_JOBS`' order), and each direction's route path has its own argument order.
     expect(discovery.filter((url) => url.includes('/supported/routes/'))).toEqual([
       '/network-partner/supported/routes/CRYPTO_ONRAMP/BR/BRL/DOT_ASSETHUB',
       '/network-partner/supported/routes/CRYPTO_ONRAMP/ZZ/ZZZ/DOT_ASSETHUB',
       '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT_ASSETHUB',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/BR/DOT_ASSETHUB/BRL',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/ZZ/DOT_ASSETHUB/ZZZ',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/US/DOT_ASSETHUB/USD',
     ]);
 
     // And the endpoint serves those rows without going to Meld.
@@ -832,7 +866,20 @@ describe('the funding journey over real HTTP', () => {
     expect(body.corridors[0]?.methods[0]).toMatchObject({ paymentMethodType: 'CREDIT_DEBIT_CARD', min: '5', max: '3000' });
     // The provider roster never crosses the boundary.
     expect(body.corridors[0]?.methods[0]?.providers).toBeUndefined();
-    // Read entirely from Postgres: the request added no Meld call.
+
+    // `direction=sell` serves the sibling row, not the buy one: the whole point of the v7 -> v8
+    // migration is that these two never share a slot.
+    const sellResponse = await fetch(`${base}/supported/corridors?destinationCurrencyCode=DOT_ASSETHUB&direction=sell`, {
+      headers: { 'x-dev-product-id': PRODUCT },
+    });
+    expect(sellResponse.status).toBe(200);
+    const sellBody = (await sellResponse.json()) as {
+      corridors: { country: string; methods: { paymentMethodType: string }[] }[];
+    };
+    expect(sellBody.corridors.map((c) => c.country)).toEqual(['BR', 'US']);
+    expect(sellBody.corridors[0]?.methods[0]).toMatchObject({ paymentMethodType: 'PAYOUT_TO_BANK' });
+
+    // Read entirely from Postgres: neither request added a Meld call.
     expect(meldCalls.length).toBe(before);
   }, 30_000);
 

@@ -16,12 +16,12 @@ import { loadConfig, type Config } from './config.js';
 import { ChainflipRail } from './chainflip/rail.js';
 import { FundingStore } from './funding/store.js';
 import { startWorker, type RailObservation } from './funding/worker.js';
-import { startSupportedRefresh } from './supported/refresh.js';
+import { startSupportedRefresh, type RefreshJob } from './supported/refresh.js';
 import { MeldClient, MeldHttpError } from './meld/client.js';
 import { MeldDiscovery } from './meld/discovery.js';
 import { Onramp } from './onramp.js';
 import { MeldRail } from './meld/rail.js';
-import type { RailName, RailRegistry } from './rail.js';
+import { DIRECTIONS, type RailName, type RailRegistry } from './rail.js';
 import { PersonhoodService, type PersonhoodDeps } from './personhood.js';
 import { chainReader } from './personhood/chain.js';
 import { commitmentsFrom } from './personhood/source.js';
@@ -31,6 +31,21 @@ import { buildServer } from './server.js';
 
 // The cryptos the supported-corridors refresh enumerates; DOT only in v1, the table is crypto-keyed so more are additive.
 const SUPPORTED_REFRESH_CRYPTOS = ['DOT_ASSETHUB'];
+
+/**
+ * Every (crypto, direction) the refresh walks: both directions for each configured crypto.
+ *
+ * A crypto sellable here is not necessarily one Meld actually routes for this account -- the
+ * probe found no provider on the sandbox account off-ramps any `*_ASSETHUB` asset at all, so a
+ * `sell` job for `DOT_ASSETHUB` legitimately writes nothing until a provider that does exists.
+ * That is a fact about Meld's current onboarding, not a reason to leave the job unwired: the
+ * refresh's whole design (upsert-only, ages out on staleness) already treats "nothing to write"
+ * as an ordinary outcome, not a failure, and the day a provider does off-ramp the asset this job
+ * starts producing rows with no code change.
+ */
+const SUPPORTED_REFRESH_JOBS: readonly RefreshJob[] = SUPPORTED_REFRESH_CRYPTOS.flatMap((crypto) =>
+  DIRECTIONS.map((direction) => ({ crypto, direction })),
+);
 
 /** A listening service, and the one call that takes it down. */
 interface ServerHandle {
@@ -237,7 +252,7 @@ export async function start(
       ? startSupportedRefresh(
           discovery,
           funding,
-          SUPPORTED_REFRESH_CRYPTOS,
+          SUPPORTED_REFRESH_JOBS,
           { catalogMs: cfg.supported.catalog_interval_ms, routesMs: cfg.supported.routes_interval_ms },
           // warn, not info: a silently staling cache must reach an operator filtering to warn.
           (message) => {

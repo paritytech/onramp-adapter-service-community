@@ -5,7 +5,7 @@ import { TERMINAL_STATES, type FundingState } from '../src/funding/state.js';
 import { mergeAdvance } from '../src/funding/merge.js';
 import type { FundingStore, SupportedCorridorRow } from '../src/funding/store.js';
 import { directionTermsViolation, type FundingRecord } from '../src/funding/types.js';
-import type { RailBuySession, RailSellSession } from '../src/rail.js';
+import type { Direction, RailBuySession, RailSellSession } from '../src/rail.js';
 
 const ALICE_PUBKEY = new Uint8Array([
   0xd4, 0x35, 0x93, 0xc7, 0x15, 0xfd, 0xd3, 0x1c, 0x61, 0x14, 0x1a, 0xbd, 0x04, 0xa9, 0x9f, 0xd6,
@@ -280,7 +280,8 @@ export const sellRecord = (overrides: Partial<FundingRecord> = {}): FundingRecor
 export function fakeStore(initial: readonly FundingRecord[] = []) {
   const rows = new Map<string, FundingRecord>(initial.map((r) => [r.id, structuredClone(r)]));
   const leases = new Map<string, { by: string; until: number }>();
-  // In-memory supported-corridors cache, keyed `${code}|${country}`, mirroring the real table.
+  // In-memory supported-corridors cache, keyed `${code}|${direction}|${country}`, mirroring the
+  // real table's v7 -> v8 primary key.
   const corridors = new Map<string, SupportedCorridorRow>();
 
   /** The row already holding this record's (alias, product, reference), if any. */
@@ -429,11 +430,14 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
     }) satisfies FundingStore['update'],
     upsertCorridor: async (row: Omit<SupportedCorridorRow, 'updated_at'>) => {
       // A far-future stamp so a row is always "fresh" against any test clock's read window.
-      corridors.set(`${row.destination_currency_code}|${row.country}`, { ...structuredClone(row), updated_at: 2_000_000_000_000 });
+      corridors.set(`${row.destination_currency_code}|${row.direction}|${row.country}`, {
+        ...structuredClone(row),
+        updated_at: 2_000_000_000_000,
+      });
     },
-    readCorridors: async (code: string, freshAfter = 0) =>
+    readCorridors: async (code: string, direction: Direction, freshAfter = 0) =>
       [...corridors.values()]
-        .filter((r) => r.destination_currency_code === code && r.updated_at >= freshAfter)
+        .filter((r) => r.destination_currency_code === code && r.direction === direction && r.updated_at >= freshAfter)
         .map((r) => structuredClone(r)),
     close: async () => undefined,
   };

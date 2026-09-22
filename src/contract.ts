@@ -468,14 +468,18 @@ export type CreateSessionRequest = z.infer<typeof createSessionRequest>;
  * The live-capability query behind `GET /supported`: the methods + fiat min/max one corridor
  * offers for one delivered crypto. Read-only and metered by nothing upstream a buyer pays for;
  * it reads a cached view of Meld's public route catalog.
+ *
+ * `direction` is the same optional field `/quote` and `/session` carry, absent means `buy`, for
+ * the same compatibility reason: a caller written before sell existed asks nothing new and reads
+ * exactly the corridor it always read.
  */
-export const supportedQuery = z.object({ country, destinationCurrencyCode }).strict();
+export const supportedQuery = z.object({ country, destinationCurrencyCode, direction }).strict();
 
-/** The query behind `GET /supported/countries`: the region dropdown for one delivered crypto. */
-export const supportedCountriesQuery = z.object({ destinationCurrencyCode }).strict();
+/** The query behind `GET /supported/countries`: the region dropdown for one delivered crypto, buy or sell. */
+export const supportedCountriesQuery = z.object({ destinationCurrencyCode, direction }).strict();
 
-/** The query behind `GET /supported/corridors`: every cached corridor for one delivered crypto. */
-export const supportedCorridorsQuery = z.object({ destinationCurrencyCode }).strict();
+/** The query behind `GET /supported/corridors`: every cached corridor for one delivered crypto, buy or sell. */
+export const supportedCorridorsQuery = z.object({ destinationCurrencyCode, direction }).strict();
 
 
 // --- responses --------------------------------------------------------------
