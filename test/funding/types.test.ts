@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { fundingRecord } from '../fixtures.js';
+import { fundingRecord, sellRecord } from '../fixtures.js';
 import { toFundingRequestDto, type FundingRecord } from '../../src/funding/types.js';
 
 // Every droppable field is populated. Left `undefined`, both `toEqual` and
@@ -93,6 +93,9 @@ describe('toFundingRequestDto', () => {
     expect(dto).toEqual({
       id: 'funding-1',
       rail: 'meld',
+      // Always present, never inferred from an absence: a caller reading a row must not have to
+      // read "no direction" as "buy".
+      direction: 'buy',
       status: 'transaction_seen',
       providerStatus: 'SUCCEEDED',
       destinationCurrencyCode: 'USDC_ASSETHUB',
@@ -133,4 +136,82 @@ describe('toFundingRequestDto', () => {
     const dto = toFundingRequestDto(fundingRecord({ ...record, provider_status: undefined }), BEFORE);
     expect(dto).not.toHaveProperty('providerStatus');
   });
+});
+
+describe('toFundingRequestDto: the deposit disclosure', () => {
+  // A live sell whose provider has disclosed a complete deposit fact.
+  const disclosed = sellRecord({
+    status: 'transaction_seen',
+    status_history: [{ status: 'transaction_seen', at: 1_700_000_000_000 }],
+    deposit_address: '1DepositAddress',
+    deposit_amount: '12.3456789012',
+    deposit_currency: 'DOT_ASSETHUB',
+    deposit_observed_at: 1_700_000_000_150,
+  });
+
+  it('surfaces address, amount, currency and when it was observed, while live', () => {
+    const dto = toFundingRequestDto(disclosed, BEFORE);
+
+    expect(dto.deposit).toEqual({
+      address: '1DepositAddress',
+      amount: '12.3456789012',
+      currency: 'DOT_ASSETHUB',
+      observedAt: 1_700_000_000_150,
+    });
+  });
+
+  it('includes memo only for an asset that has one', () => {
+    const withMemo = toFundingRequestDto({ ...disclosed, deposit_memo: 'tag-42' }, BEFORE);
+    expect(withMemo.deposit?.memo).toBe('tag-42');
+
+    const withoutMemo = toFundingRequestDto(disclosed, BEFORE);
+    expect(withoutMemo.deposit).not.toHaveProperty('memo');
+  });
+
+  it.each(['settled', 'failed', 'expired', 'refused', 'unobserved'] as const)(
+    'withholds the deposit from a %s request, exactly as it withholds the settlement surface',
+    (status) => {
+      // Handing a seller a deposit address for a concluded request invites a send with nobody
+      // watching for it any more -- the same hazard `live` already guards the settlement surface
+      // against, gating the deposit exactly the same way.
+      const dto = toFundingRequestDto({ ...disclosed, status }, BEFORE);
+      expect(dto.deposit).toBeUndefined();
+    },
+  );
+
+  it('withholds the deposit once the caller has cancelled, even though the status is still live', () => {
+    const dto = toFundingRequestDto({ ...disclosed, cancelled_at: 1_700_000_000_050 }, BEFORE);
+    expect(dto.deposit).toBeUndefined();
+  });
+
+  it('withholds an address with no amount rather than disclosing half of it', () => {
+    const dto = toFundingRequestDto({ ...disclosed, deposit_amount: undefined }, BEFORE);
+    expect(dto.deposit).toBeUndefined();
+  });
+
+  it('withholds an amount with no currency to read it in', () => {
+    const dto = toFundingRequestDto({ ...disclosed, deposit_currency: undefined }, BEFORE);
+    expect(dto.deposit).toBeUndefined();
+  });
+
+  it('withholds an address, amount and currency with no timestamp to say when they were observed', () => {
+    // `observedAt` is what lets a client judge whether a disclosure is fresh, so stamping "now"
+    // over a missing one would fabricate the one fact that question depends on -- a wrong-but-
+    // plausible timestamp is worse than no disclosure, because it reads as current. Unreachable
+    // today (`mergeAdvance` writes it in the same merge as the address), but the gate treats it
+    // exactly like a missing amount or currency rather than falling back to a clock, defensively.
+    const dto = toFundingRequestDto({ ...disclosed, deposit_observed_at: undefined }, BEFORE);
+    expect(dto.deposit).toBeUndefined();
+  });
+
+  it('withholds everything when nothing has been disclosed yet', () => {
+    const dto = toFundingRequestDto(sellRecord({ status: 'transaction_seen' }), BEFORE);
+    expect(dto).not.toHaveProperty('deposit');
+  });
+
+  it('never surfaces a deposit on a buy row, which has none to disclose', () => {
+    const dto = toFundingRequestDto(record, BEFORE);
+    expect(dto).not.toHaveProperty('deposit');
+  });
+
 });

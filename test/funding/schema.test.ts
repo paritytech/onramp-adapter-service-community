@@ -13,7 +13,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { fundingRecord } from '../fixtures.js';
+import { ALICE, BOB, fakeStore, fundingRecord, sellRecord } from '../fixtures.js';
 import { createSchema, dropSchema, openIn, rawQuery as query, withStore } from '../pg.js';
 
 import { MIGRATION_LOCK_TIMEOUT_MS, SCHEMA_VERSION, freshSchema, type Migration } from '../../src/funding/schema.js';
@@ -308,6 +308,249 @@ describe('creating a fresh schema', () => {
   });
 });
 
+/**
+ * `freshSchema()` minus everything the v5 -> v6 and v6 -> v7 migrations add: a v5 funding table.
+ *
+ * Derived from the current shape rather than written out, so the two cannot drift in the parts
+ * neither migration touches, and an addition that is not stripped here fails loudly when the
+ * migration chain tries to add a column that already exists. That is the intended failure: it
+ * says the fixture was not kept up, rather than passing while proving less.
+ */
+const atV5 = (sql: string): string =>
+  sql
+    .replace(" direction TEXT NOT NULL DEFAULT 'buy',", '')
+    .replace(' crypto_amount TEXT,', '')
+    .replace(' deposit_address TEXT,', '')
+    .replace(' deposit_amount TEXT,', '')
+    .replace(' deposit_currency TEXT,', '')
+    .replace(' deposit_memo TEXT,', '')
+    .replace(' deposit_observed_at BIGINT,', '')
+    // v6 -> v7: where a deposit-address disclosure conflict is recorded.
+    .replace(' deposit_conflict_address TEXT,', '')
+    .replace(' deposit_conflict_reason TEXT,', '')
+    .replace(' deposit_conflict_at BIGINT,', '')
+    // Every constraint from v6 onward is contiguous and last, so one cut removes all of them
+    // (the v7 one included) and closes the statement.
+    .replace(/, CONSTRAINT funding_direction_known .*$/, ')')
+    // v5 had no direction, so both were mandatory: a request was always a buy.
+    .replace(' wallet_address TEXT,', ' wallet_address TEXT NOT NULL,')
+    .replace(' source_amount TEXT,', ' source_amount TEXT NOT NULL,')
+    // `supported_corridors`' v7 -> v8 addition: the direction *column* text is the same literal
+    // string as `funding_requests`' and is already stripped by the first replace above (this
+    // function runs over every statement in `freshSchema()`, not only the funding table's). What
+    // is left to strip is the composite primary key and the CHECK constraint, back to the v4 -> v5
+    // shape's two-column key.
+    .replace(
+      ", direction, country), CONSTRAINT supported_corridors_direction_known CHECK (direction IN ('buy', 'sell'))",
+      ', country)',
+    );
+
+describe('the v5 -> v6 migration', () => {
+  /** A v5 database with one buy row in it, stamped at 5. Returns the schema name. */
+  const atVersionFive = async (): Promise<string> => {
+    const schema = await createSchema();
+    for (const sql of freshSchema().map(atV5)) await raw(schema, sql);
+    await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
+    await raw(schema, 'INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)');
+    await raw(
+      schema,
+      'INSERT INTO funding_requests (id, subject_alias, product_id, destination_currency_code, ' +
+        'wallet_address, source_amount, fiat, payment_method_type, rail, status, status_history, ' +
+        "created_at, updated_at) VALUES ('bought', 'alias-abc', 'app.dot', 'USDC_ASSETHUB', " +
+        "'0x0', '25.00', 'USD', 'CREDIT_DEBIT_CARD', 'meld', 'settled', '[]', 1, 1)",
+    );
+    return schema;
+  };
+
+  it('calls every row that already exists a buy, and keeps its terms', async () => {
+    // The population this migration meets is entirely buys, because nothing else could be
+    // recorded. `DEFAULT 'buy'` is what says so, and it has to say so for rows written before the
+    // column existed, not only for rows written after.
+    const schema = await atVersionFive();
+    try {
+      const store = await openIn(schema);
+      const carried = await store.byId('bought');
+      expect(carried?.direction).toBe('buy');
+      expect(carried?.wallet_address).toBe('0x0');
+      expect(carried?.source_amount).toBe('25.00');
+      expect(carried?.crypto_amount).toBeUndefined();
+      await store.close();
+
+      const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
+      // Not just [5, 6]: `openIn` always walks to `SCHEMA_VERSION`, so a database stamped at 5
+      // takes the v6, v7 and v8 steps in one boot.
+      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8]);
+    } finally {
+      await dropSchema(schema);
+    }
+  });
+
+  it('takes a sell on the migrated shape, with no address and no fiat amount', async () => {
+    // The two NOT NULLs it drops are the point of the step: a sell has neither, and before this
+    // the insert was refused by the table.
+    const schema = await atVersionFive();
+    try {
+      const store = await openIn(schema);
+      await store.create(sellRecord({ id: 'sold', client_reference: undefined }));
+      const sold = await store.byId('sold');
+      expect(sold?.direction).toBe('sell');
+      expect(sold?.wallet_address).toBeUndefined();
+      expect(sold?.source_amount).toBeUndefined();
+      expect(sold?.crypto_amount).toBe('12.3456789012');
+      await store.close();
+    } finally {
+      await dropSchema(schema);
+    }
+  });
+});
+
+describe('a fresh database and a migrated one are the same database', () => {
+  /** Every column, in physical order, with the facts a dump or a `COPY` would care about. */
+  const columnsOf = async (schema: string) =>
+    query(
+      schema,
+      'SELECT ordinal_position, column_name, data_type, is_nullable, column_default ' +
+        "FROM information_schema.columns WHERE table_name = 'funding_requests' " +
+        'AND table_schema = current_schema() ORDER BY ordinal_position',
+    );
+
+  /** Every constraint, by name, as Postgres itself renders the definition. */
+  const constraintsOf = async (schema: string) =>
+    query(
+      schema,
+      'SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint ' +
+        "WHERE conrelid = 'funding_requests'::regclass ORDER BY conname",
+    );
+
+  /** As `columnsOf`/`constraintsOf`, for `supported_corridors`: the v7 -> v8 pair grew this table too. */
+  const corridorColumnsOf = async (schema: string) =>
+    query(
+      schema,
+      'SELECT ordinal_position, column_name, data_type, is_nullable, column_default ' +
+        "FROM information_schema.columns WHERE table_name = 'supported_corridors' " +
+        'AND table_schema = current_schema() ORDER BY ordinal_position',
+    );
+  const corridorConstraintsOf = async (schema: string) =>
+    query(
+      schema,
+      'SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint ' +
+        "WHERE conrelid = 'supported_corridors'::regclass ORDER BY conname",
+    );
+
+  it('agrees column for column and constraint for constraint', async () => {
+    // This is the test that was missing, and the omission shipped a real divergence:
+    // `crypto_amount` was hand-placed after `source_amount` in `freshSchema()` while the
+    // migration appends it at the end, so every column from `fiat` to `cancelled_at` held a
+    // different ordinal depending on which path built the database.
+    //
+    // Nothing in this service reads a column by position, so it broke nothing here. That is
+    // precisely the danger: CI builds fresh databases and production is migrated, so the
+    // difference is invisible until a `COPY` without a column list, a `pg_dump` shape diff
+    // between staging and production, or a `CREATE TABLE ... LIKE` behaves one way in every
+    // test and another in production.
+    //
+    // Asserting the shape rather than the contents is what makes the shared-constant argument
+    // in `schema.ts` enforceable instead of merely written down.
+    const fresh = await createSchema();
+    const migrated = await createSchema();
+    try {
+      await (await openIn(fresh)).close();
+
+      for (const sql of freshSchema().map(atV5)) await raw(migrated, sql);
+      await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
+      await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)');
+      await (await openIn(migrated)).close();
+
+      expect(await columnsOf(migrated)).toEqual(await columnsOf(fresh));
+      expect(await constraintsOf(migrated)).toEqual(await constraintsOf(fresh));
+      // `supported_corridors` grew the same way at v7 -> v8 (`SUPPORTED_CORRIDORS_DIRECTION_COLUMN`
+      // and `SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT`, shared between `freshSchema()` and the
+      // migration for the identical reason), so it is asserted here too rather than in a fixture
+      // that only proves the table exists.
+      expect(await corridorColumnsOf(migrated)).toEqual(await corridorColumnsOf(fresh));
+      expect(await corridorConstraintsOf(migrated)).toEqual(await corridorConstraintsOf(fresh));
+    } finally {
+      await dropSchema(fresh);
+      await dropSchema(migrated);
+    }
+  });
+});
+
+describe('the per-direction term constraints', () => {
+  it('refuses a sell row with no crypto amount, on a fresh database and a migrated one', async () => {
+    // The one a client's resume path depends on. Without a crypto amount, a resuming seller's
+    // "is this the same sale?" check has nothing to compare but the corridor, so it matches a
+    // different sale at a different amount and hands over its settlement surface. Enforced by
+    // the database rather than by a guard in the store, so a future write path cannot miss it.
+    await withStore(async (store) => {
+      await expect(
+        store.create(sellRecord({ id: 'no-amount', crypto_amount: undefined })),
+      ).rejects.toThrow(/funding_sell_terms/);
+    });
+  });
+
+  it('refuses a buy row that lost the terms the dropped NOT NULLs used to guarantee', async () => {
+    // `wallet_address` and `source_amount` became nullable for the sake of sells. These keep
+    // that from loosening a buy, which still requires both.
+    await withStore(async (store) => {
+      await expect(
+        store.create(fundingRecord({ id: 'no-address', wallet_address: undefined })),
+      ).rejects.toThrow(/funding_buy_terms/);
+      await expect(
+        store.create(fundingRecord({ id: 'no-amount', source_amount: undefined })),
+      ).rejects.toThrow(/funding_buy_terms/);
+    });
+  });
+
+  it('refuses a direction the vocabulary does not have', async () => {
+    // The alphabet, exactly as the status check is. `DIRECTIONS` generates both the type and this
+    // constraint, so a direction added in one place cannot be written without the other.
+    await withStore(async (store) => {
+      await expect(
+        store.create(fundingRecord({ id: 'sideways', direction: 'sideways' as never })),
+      ).rejects.toThrow(/funding_direction_known/);
+    });
+  });
+
+  it.each([
+    ['funding_sell_terms', () => sellRecord({ id: 'bad', crypto_amount: undefined })],
+    ['funding_buy_terms', () => fundingRecord({ id: 'bad', wallet_address: undefined })],
+    ['funding_buy_terms', () => fundingRecord({ id: 'bad', source_amount: undefined })],
+  ])('has the in-memory fake refuse a %s row exactly as Postgres does', async (constraint, row) => {
+    // The repo's rule is that a rule lives in one place: `mergeAdvance` is shared with the fake
+    // so the advance cannot drift. These constraints cannot be shared that way, because one side
+    // is SQL text and the other a predicate over a struct, so they are tied by this test instead.
+    //
+    // It matters because most of the suite writes through the fake. A fake more permissive than
+    // the database lets a test reason about a row production cannot hold, and the whole point of
+    // putting these in the database was that no future write path could produce one.
+    await withStore(async (store) => {
+      await expect(store.create(row())).rejects.toThrow(new RegExp(constraint));
+    });
+    await expect(fakeStore().create(row())).rejects.toThrow(new RegExp(constraint));
+  });
+
+  it('round-trips a sell through a database created fresh at the current version', async () => {
+    // The other half of the migration story: a database that never walked the chain must carry
+    // the same shape the chain produces, or the two paths disagree about what a row is.
+    await withStore(async (store) => {
+      await store.create(sellRecord({ id: 'sold', client_reference: 'idem-sell-1' }));
+      const sold = await store.byId('sold');
+      expect(sold).toMatchObject({
+        direction: 'sell',
+        destination_currency_code: 'DOT_ASSETHUB',
+        crypto_amount: '12.3456789012',
+        fiat: 'GBP',
+      });
+      expect(sold?.wallet_address).toBeUndefined();
+      expect(sold?.source_amount).toBeUndefined();
+      // The deposit leg exists as columns and is written by nothing in this build.
+      expect(sold?.deposit_address).toBeUndefined();
+      expect(sold?.deposit_observed_at).toBeUndefined();
+    });
+  });
+});
+
 describe('the real migration chain', () => {
   it('carries a v1 database through every shipped migration and keeps its rows', async () => {
     // The migrations this chain has actually had. Everything else here injects a synthetic one;
@@ -327,8 +570,13 @@ describe('the real migration chain', () => {
       const v1 = freshSchema()
         .filter((sql) => !sql.includes('supported_corridors'))
         .map((sql) =>
-          sql.replace(' country TEXT,', '').replace(' reason TEXT,', '').replace(' cancelled_at BIGINT,', ''),
-        );
+          sql
+            .replace(' country TEXT,', '')
+            .replace(' reason TEXT,', '')
+            .replace(' cancelled_at BIGINT,', ''),
+        )
+        // Everything v6 adds, stripped by the same helper the v5 fixture uses.
+        .map(atV5);
       for (const sql of v1) await raw(schema, sql);
       await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
       await raw(schema, 'INSERT INTO schema_migrations (version, applied_at) VALUES (1, 0)');
@@ -365,18 +613,51 @@ describe('the real migration chain', () => {
       // migration landed somewhere the code can use.
       await store.upsertCorridor({
         destination_currency_code: 'DOT_ASSETHUB',
+        direction: 'buy',
         country: 'BR',
         name: 'Brazil',
         fiat: 'BRL',
         methods: [{ paymentMethodType: 'PIX', category: 'bank', min: '10', max: '5000', currency: 'BRL' }],
       });
-      expect((await store.readCorridors('DOT_ASSETHUB')).map((c) => c.country)).toEqual(['BR']);
+      expect((await store.readCorridors('DOT_ASSETHUB', 'buy')).map((c) => c.country)).toEqual(['BR']);
+      // v8: a sell corridor for the same (crypto, country) lands beside the buy row rather than
+      // over it -- the migration's whole point.
+      await store.upsertCorridor({
+        destination_currency_code: 'DOT_ASSETHUB',
+        direction: 'sell',
+        country: 'BR',
+        name: 'Brazil',
+        fiat: 'BRL',
+        methods: [{ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank', min: '5', max: '1000', currency: 'BRL' }],
+      });
+      expect((await store.readCorridors('DOT_ASSETHUB', 'buy')).map((c) => c.country)).toEqual(['BR']);
+      expect((await store.readCorridors('DOT_ASSETHUB', 'sell')).map((c) => c.country)).toEqual(['BR']);
+      // v6: the pre-existing row is a buy, because it could not have been anything else, and the
+      // column's DEFAULT is what says so without a backfill.
+      expect(carried?.direction).toBe('buy');
+      expect(carried?.crypto_amount).toBeUndefined();
+      // And a sell round-trips through the store on the migrated shape: null address, null fiat
+      // amount, the crypto amount at a precision the fiat validator cannot express.
+      await store.create(sellRecord({ id: 'sold', client_reference: undefined }));
+      const sold = await store.byId('sold');
+      expect(sold?.direction).toBe('sell');
+      expect(sold?.wallet_address).toBeUndefined();
+      expect(sold?.source_amount).toBeUndefined();
+      expect(sold?.crypto_amount).toBe('12.3456789012');
+      // v7: a deposit-address disclosure conflict is reachable through `store.update`, not just
+      // present in the table, and the accepted address is left exactly as it was.
+      await store.update('sold', 'transaction_seen', 2, { deposit: { address: ALICE, currency: 'DOT_ASSETHUB' } });
+      await store.update('sold', 'transaction_seen', 3, { deposit: { address: BOB, currency: 'DOT_ASSETHUB' } });
+      const disputed = await store.byId('sold');
+      expect(disputed?.deposit_address).toBe(ALICE);
+      expect(disputed?.deposit_conflict_address).toBe(BOB);
+      expect(disputed?.deposit_conflict_reason).toBe('address_changed');
       await store.close();
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     } finally {
       await dropSchema(schema);
     }
@@ -418,6 +699,9 @@ describe('applying a migration', () => {
         ' provider_session_id TEXT, provider_transaction_id TEXT, provider_status TEXT,' +
         ' widget_url TEXT, hosted_widget_url TEXT, expires_at BIGINT, status TEXT NOT NULL,' +
         ' reason TEXT, cancelled_at BIGINT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,' +
+        " direction TEXT NOT NULL DEFAULT 'buy', crypto_amount TEXT, deposit_address TEXT," +
+        ' deposit_amount TEXT, deposit_currency TEXT, deposit_memo TEXT, deposit_observed_at BIGINT,' +
+        ' deposit_conflict_address TEXT, deposit_conflict_reason TEXT, deposit_conflict_at BIGINT,' +
         ' claimed_by TEXT, claimed_until BIGINT)',
     );
     return schema;

@@ -1,13 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { AuditEvent } from '../src/audit.js';
-import { Refusal, reject, upstreamUnavailable, type FundingFailure } from '../src/contract.js';
+import {
+  directionUnsupported,
+  Refusal,
+  reject,
+  upstreamUnavailable,
+  type FundingFailure,
+} from '../src/contract.js';
 import { MeldHttpError, type MeldTransaction } from '../src/meld/client.js';
 import { railRefusal } from '../src/meld/refusal.js';
 import { TERMINAL_STATES } from '../src/funding/state.js';
 import { toFundingRequestDto } from '../src/funding/types.js';
 import { Onramp, type FundingPort } from '../src/onramp.js';
-import type { FundingRail, MeldTransactionReader, RailQuote, RailName, RailRegistry, RailSession, RailSessionInput, RailTransaction } from '../src/rail.js';
+import type { FundingRail, MeldTransactionReader, RailBuySession, RailQuote, RailName, RailRegistry, RailSession, RailSessionInput, RailTransaction } from '../src/rail.js';
 import {
   ALICE,
   ALICE_PREFIX_42,
@@ -18,6 +24,7 @@ import {
   railSessionInput,
   fakeStore,
   fundingRecord,
+  sellRequest,
 } from './fixtures.js';
 
 const SUBJECT = { productId: 'app.dot', alias: 'alias-abc', proven: true };
@@ -60,6 +67,17 @@ class FakeMeld implements FundingRail, MeldTransactionReader {
     return this.transactions[id] ?? { id };
   }
 }
+
+/**
+ * The buy half of a recorded rail call.
+ *
+ * `RailSessionInput` is a union per direction, so a buy-only field has to be reached through the
+ * discriminant rather than optional-chained off the union. Narrowing here rather than casting:
+ * a cast would also pass if `Onramp` sent a sell where the case expects a buy, which is exactly
+ * the mistake worth failing on.
+ */
+const asBuy = (input: RailSessionInput | undefined): RailBuySession | undefined =>
+  input?.direction === 'buy' ? input : undefined;
 
 class FakeAudit {
   events: AuditEvent[] = [];
@@ -120,6 +138,9 @@ describe('Onramp.quote', () => {
     });
 
     expect(meld.quoteCalls[0]).toEqual({
+      // Absent on the wire, `buy` at the rail: the default is resolved before the port, so a rail
+      // never has to guess which direction an unlabelled request meant.
+      direction: 'buy',
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
       destinationCurrencyCode: 'USDC_ASSETHUB',
@@ -384,7 +405,7 @@ describe('Onramp.create', () => {
     );
 
     expect(result.pinned.walletAddress).toBe(ALICE);
-    expect(meld.calls[0]?.walletAddress).toBe(ALICE);
+    expect(asBuy(meld.calls[0])?.walletAddress).toBe(ALICE);
   });
 
   it('hands the rail every term of the request, translated', async () => {
@@ -960,6 +981,34 @@ describe('Onramp.create', () => {
     expect(row?.client_reference).toBe('idem-0000-0001');
   });
 
+  it("carries the sub-provider's own sentence into the operator detail, and only there", () => {
+    // The threshold on a sell exists in exactly one place: the provider's prose, crypto-
+    // denominated. It stays off the wire (see `server.test.ts`), which leaves the operator log
+    // as the only place it can usefully appear — and `Refusal.message` is never serialized to a
+    // client, so it is the right place for a number that cannot be safely typed onto the wire.
+    // Without this the figure is simply lost and nobody can tell a seller what to send.
+    const refusal = railRefusal(
+      new MeldHttpError(
+        400,
+        'INVALID_AMOUNT_TOO_LOW',
+        '[TRANSAK] Source amount is below the minimum allowed',
+        'Minimum sell amount should be more than or equal to 0.00011648 BTC',
+      ),
+    );
+
+    expect(refusal.failure).toEqual({ tag: 'BelowMinimum' });
+    expect(refusal.message).toContain('[TRANSAK] Source amount is below the minimum allowed');
+    expect(refusal.message).toContain('0.00011648 BTC');
+  });
+
+  it('says only what Meld said when there is no sub-provider sentence', () => {
+    // Both halves, or the one that exists: an absent provider detail must not leave a trailing
+    // "(provider: undefined)" in an operator's log line.
+    const refusal = railRefusal(new MeldHttpError(400, 'INVALID_AMOUNT_TOO_HIGH', 'above the maximum allowed'));
+
+    expect(refusal.message).toBe('above the maximum allowed');
+  });
+
   it.each([
     // The money-losing direction, and the one that was undefended. Mutating the `definitive` test
     // to `? true` (so a 5xx or a timeout counts as "the rail read this and said no") survived all
@@ -1010,6 +1059,99 @@ describe('Onramp.create', () => {
     expect((await funding.byId('funding-1'))?.client_reference).toBeUndefined();
   });
 
+  it('emits a buy replay line with exactly the keys it always had, and no more', async () => {
+    // The third site a projection refactor can quietly widen. The replay line has never carried
+    // a `country`, unlike the `session.created` line it shares an event name with, and that
+    // difference has to survive a change that touches both.
+    const meld = new FakeMeld();
+    const { service, audit } = build(meld);
+    await service.createSession(SUBJECT, createRequest(), REQUEST_ID);
+    audit.events.length = 0;
+
+    await service.createSession(SUBJECT, createRequest(), REQUEST_ID);
+
+    expect(audit.events).toEqual([
+      {
+        event: 'session.created',
+        alias: 'alias-abc',
+        productId: 'app.dot',
+        requestId: REQUEST_ID,
+        rail: 'meld',
+        providerSessionId: 'meld-1',
+        destinationCurrencyCode: 'USDC_ASSETHUB',
+        walletAddress: ALICE,
+        sourceAmount: '25.00',
+        fiat: 'USD',
+      },
+    ]);
+  });
+
+  it('emits a buy rail-refusal line with exactly the keys it always had, and no more', async () => {
+    // `toMatchObject` cannot see an added key, which is how `country` was added to this line by
+    // a refactor and nothing failed. The audit stream ships off-box into consumers this repo
+    // cannot see, and a consumer validating against a fixed schema breaks on an unexpected key
+    // exactly as it breaks on a missing one. So this one is pinned exhaustively: a buy's line is
+    // byte-identical to the line emitted before sell existed, down to the absent `direction`.
+    const meld = new FakeMeld(() => reject({ tag: 'BelowMinimum' }, '9.99 is below the minimum'));
+    const { service, audit } = build(meld);
+
+    await failureOf(() => service.createSession(SUBJECT, createRequest(), REQUEST_ID));
+
+    expect(audit.events.filter((e) => e.event === 'session.rail_refused')).toEqual([
+      {
+        event: 'session.rail_refused',
+        alias: 'alias-abc',
+        productId: 'app.dot',
+        requestId: REQUEST_ID,
+        rail: 'meld',
+        destinationCurrencyCode: 'USDC_ASSETHUB',
+        walletAddress: ALICE,
+        sourceAmount: '25.00',
+        fiat: 'USD',
+        reason: 'BelowMinimum',
+      },
+    ]);
+  });
+
+  it('adds the direction and the crypto amount to that line, and only on a sell', async () => {
+    // The other half of the same claim: the new keys exist, they appear only where they mean
+    // something, and the fiat terms a sell never committed are absent rather than empty.
+    // Refusing, so the line is emitted on a path that does not need a rail answer. The refusal
+    // is Chainflip's, which is still the permanent one; Meld serves a sell now.
+    const meld = new FakeMeld(() => directionUnsupported('no fiat leg, so there is no fiat payout to sell into'));
+    const audit = new FakeAudit();
+    const funding = fakeStore();
+    let n = 0;
+    const service = new Onramp(
+      config(),
+      registry(meld),
+      audit,
+      funding,
+      meld,
+      () => NOW,
+      () => `funding-${String((n += 1))}`,
+    );
+
+    await failureOf(() =>
+      service.createSession(SUBJECT, sellRequest() as unknown as Parameters<Onramp['createSession']>[1], REQUEST_ID),
+    );
+
+    expect(audit.events.filter((e) => e.event === 'session.rail_refused')).toEqual([
+      {
+        event: 'session.rail_refused',
+        alias: 'alias-abc',
+        productId: 'app.dot',
+        requestId: REQUEST_ID,
+        rail: 'meld',
+        direction: 'sell',
+        destinationCurrencyCode: 'DOT_ASSETHUB',
+        cryptoAmount: '12.3456789012',
+        fiat: 'GBP',
+        reason: 'Other',
+      },
+    ]);
+  });
+
   it('surfaces the rail\'s own error even when closing the reservation fails', async () => {
     // The compensating write is guarded, so a store failure cannot replace the error it is
     // compensating for. Unguarded, a caller owed `400 BelowMinimum` would get a bare `500`.
@@ -1030,7 +1172,7 @@ describe('Onramp.create', () => {
         byReference: (alias, product, ref) => funding.byReference(alias, product, ref),
         cancel: (alias, product, id, now) => funding.cancel(alias, product, id, now),
         list: (alias, product, limit) => funding.list(alias, product, limit),
-        readCorridors: (code) => funding.readCorridors(code),
+        readCorridors: (code, direction) => funding.readCorridors(code, direction),
         // Rejects, not throws: a synchronous throw is caught whether or not the call is
         // awaited, so it would go green against a missing `await`.
         update: () => Promise.reject(new Error('database is locked')),
@@ -1046,8 +1188,23 @@ describe('Onramp.create', () => {
     // And the store failure is not lost. It is audited, naming the reservation left open. The
     // reason is enumerated, not the driver's own words: SQLite messages carry the database file
     // path, and the audit stream is documented as carrying tags only.
+    // Pinned exhaustively, for the reason the rail-refusal line above is: this is the other
+    // site a refactor added `country` to, and a partial assertion could not see it.
+    expect(audit.events.filter((e) => e.event === 'session.orphaned')).toEqual([
+      {
+        event: 'session.orphaned',
+        alias: 'alias-abc',
+        productId: 'app.dot',
+        requestId: REQUEST_ID,
+        rail: 'meld',
+        destinationCurrencyCode: 'USDC_ASSETHUB',
+        walletAddress: ALICE,
+        sourceAmount: '25.00',
+        fiat: 'USD',
+        reason: 'reservation_close_failed',
+      },
+    ]);
     const orphaned = audit.events.find((e) => e.event === 'session.orphaned');
-    expect(orphaned?.reason).toBe('reservation_close_failed');
     expect(JSON.stringify(orphaned)).not.toContain('database is locked');
     await funding.close();
   });
@@ -1189,6 +1346,9 @@ describe('Onramp.create', () => {
           productId: 'app.dot',
           requestId: REQUEST_ID,
           rail: 'meld',
+          // No `direction` key at all. A buy's audit line is byte-identical to the one this
+          // service emitted before sell existed; only a sell carries the new keys. `toEqual`
+          // rather than `toMatchObject` is what makes that assertable: an added key fails here.
           providerSessionId: 'meld-1',
           destinationCurrencyCode: 'USDC_ASSETHUB',
           // The normalised address, because that is what the rail was actually given.
@@ -1532,6 +1692,43 @@ describe('cancelling a request', () => {
     expect(toFundingRequestDto(must(row, 'the paid row'), NOW + 5).serviceProviderWidgetUrl).toBeDefined();
   });
 
+  it('refuses to cancel a sell once a deposit address has been disclosed, and says why', async () => {
+    // The sell analogue of "a payment is already on its way": once the seller has been shown
+    // where to send, this service cannot see or prevent an on-chain transfer, so cancelling would
+    // be exactly the lie the `transaction_seen` guard exists to prevent, from the other side of
+    // the same address. Worded differently from that guard rather than reusing it, per the brief.
+    const meld = new FakeMeld();
+    const { service, funding } = build(meld);
+    const opened = await service.createSession(
+      SUBJECT,
+      sellRequest({ idempotencyKey: 'idem-cancel-sell-1' }) as unknown as Parameters<Onramp['createSession']>[1],
+      REQUEST_ID,
+    );
+    // A self-loop update: the row need not have reached `transaction_seen` for the disclosure to
+    // matter, which is the point (see `FundingStore.cancel`).
+    await funding.update(opened.fundingRequestId, 'session_opened', NOW + 1, {
+      deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+    });
+
+    const failure = await failureOf(() => service.cancel(SUBJECT, opened.fundingRequestId, REQUEST_ID, NOW + 5));
+
+    expect(failure).toMatchObject({
+      value: {
+        code: 'REQUEST_NOT_CANCELLABLE',
+        fundingRequestId: opened.fundingRequestId,
+      },
+    });
+    if (failure.tag !== 'Other') throw new Error('expected an Other failure');
+    const message = failure.value.message;
+    // Its own wording, not the `transaction_seen` sentence: the row is still `session_opened`
+    // here, so reusing that sentence would claim a state the row has not reached.
+    expect(message).not.toBe('A payment is already on its way for that request. It cannot be cancelled.');
+    expect(message).toMatch(/deposit address/i);
+
+    const row = await funding.byId(opened.fundingRequestId);
+    expect(row?.cancelled_at).toBeUndefined();
+  });
+
   it('lets a cancelled request still settle, because the buyer may already have paid', async () => {
     // The whole reason cancelling is a column and not a ninth state. A transfer sent seconds
     // before the cancel arrives afterwards, and it must be recorded against this row rather than
@@ -1782,6 +1979,270 @@ describe('a live request whose payment page has closed', () => {
 
     expect(replayed.fundingRequestId).toBe(opened.fundingRequestId);
     expect(replayed.serviceProviderWidgetUrl).toBe(opened.serviceProviderWidgetUrl);
+  });
+});
+
+describe('a sell request', () => {
+  /** The sell request as the schema hands it over: no address, no fiat amount, exact crypto. */
+  const sell = (overrides: Record<string, unknown> = {}) =>
+    sellRequest(overrides) as unknown as Parameters<Onramp['createSession']>[1];
+
+  it('reaches the rail carrying the crypto it committed, and no address', async () => {
+    // The whole of this step: a sell is parsed, validated, reserved and handed to a rail. What
+    // the rail then does with it is the rail's answer, not a parse failure dressed up as one.
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    await service.createSession(SUBJECT, sell(), REQUEST_ID).catch(() => undefined);
+
+    expect(meld.calls[0]).toEqual({
+      direction: 'sell',
+      destinationCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'GBP',
+      countryCode: 'GB',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+      serviceProvider: 'TRANSAK',
+      clientReference: 'funding-1',
+      redirectUrl: undefined,
+    });
+    // Nothing invents an address for the leg that has none.
+    expect(asBuy(meld.calls[0])).toBeUndefined();
+  });
+
+  it('does not run the fiat limit gate, which would compare crypto against fiat', async () => {
+    // The configured limits cover USDC_ASSETHUB in USD and nothing else, so a buy of
+    // DOT_ASSETHUB is `RegionUnavailable` before any rail call. A sell of the same corridor must
+    // not be refused by that gate: the bound is fiat, the committed amount is crypto, and the
+    // comparison is minor units of two different things. The sell's bound is the provider's,
+    // applied upstream at session time and returned as the same BelowMinimum/AboveMaximum tags.
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    const buyRefusal = await failureOf(() =>
+      service.createSession(SUBJECT, createRequest({ destinationCurrencyCode: 'DOT_ASSETHUB' }), REQUEST_ID),
+    );
+    expect(buyRefusal.tag).toBe('RegionUnavailable');
+    expect(meld.calls).toHaveLength(0);
+
+    await service.createSession(SUBJECT, sell(), REQUEST_ID);
+    expect(meld.calls).toHaveLength(1);
+  });
+
+  it('records the direction and the crypto amount on the row, and no fiat term', async () => {
+    const meld = new FakeMeld();
+    const { service, funding } = build(meld);
+
+    const created = await service.createSession(SUBJECT, sell(), REQUEST_ID);
+    const row = await funding.byId(created.fundingRequestId);
+
+    expect(row).toMatchObject({ direction: 'sell', crypto_amount: '12.3456789012', fiat: 'GBP' });
+    expect(row?.wallet_address).toBeUndefined();
+    expect(row?.source_amount).toBeUndefined();
+  });
+
+  it('echoes the committed crypto back, which is what a resuming client compares against', async () => {
+    // Load-bearing, not informational. On a buy the wallet address tells two purchases apart; a
+    // sell has none, so this is the only term between two sales in one corridor. A client that
+    // resumes on a corridor match alone gets someone else's surface at someone else's amount.
+    const meld = new FakeMeld();
+    const { service, funding } = build(meld);
+
+    const created = await service.createSession(SUBJECT, sell(), REQUEST_ID);
+    const row = await funding.byId(created.fundingRequestId);
+
+    expect(created.pinned).toEqual({
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'GBP',
+      country: 'GB',
+    });
+    const dto = toFundingRequestDto(must(row, 'the sell row'), NOW);
+    expect(dto.cryptoAmount).toBe('12.3456789012');
+    expect(dto.walletAddress).toBeUndefined();
+  });
+
+  it('audits the direction, with the crypto amount in place of a fiat one', async () => {
+    const meld = new FakeMeld();
+    const { service, audit } = build(meld);
+
+    await service.createSession(SUBJECT, sell(), REQUEST_ID);
+
+    const created = audit.events.find((e) => e.event === 'session.created');
+    expect(created).toMatchObject({ direction: 'sell', cryptoAmount: '12.3456789012' });
+    expect(created?.walletAddress).toBeUndefined();
+    expect(created?.sourceAmount).toBeUndefined();
+  });
+
+  it('records the rail refusal as a refused row and frees the key, exactly as a buy refusal does', async () => {
+    // A rail that does not serve the direction: Chainflip, permanently, having no fiat leg to
+    // pay a seller from. Meld serves a sell now, so this is no longer what every sell meets —
+    // but the handling it exercises is the general one, and it is the path a caller naming
+    // `rail: "chainflip"` still takes. The row says so and the key is released, so a retry on a
+    // rail that does serve the direction is not stuck replaying a dead row for ever.
+    const meld = new FakeMeld(() => directionUnsupported('no fiat leg, so there is no fiat payout to sell into'));
+    const { service, funding, audit } = build(meld);
+
+    const failure = await failureOf(() => service.createSession(SUBJECT, sell(), REQUEST_ID));
+
+    expect(failure).toEqual({
+      tag: 'Other',
+      value: { code: 'DIRECTION_UNSUPPORTED', message: 'That funding direction is not available on this rail.' },
+    });
+    const row = await funding.byId('funding-1');
+    expect(row?.status).toBe('refused');
+    expect(row?.direction).toBe('sell');
+    expect(row?.client_reference).toBeUndefined();
+    expect(audit.events.find((e) => e.event === 'session.rail_refused')).toMatchObject({ direction: 'sell' });
+  });
+
+  it('echoes the crypto a sell committed, under its own name and never under sourceAmount', async () => {
+    // This replaced a deliberate throw. While every rail refused every sell, returning offers
+    // for one meant the rail and this mapping disagreed, and the code said so rather than
+    // quietly echoing a crypto figure under `sourceAmount`. Meld serves a sell now, so the arm
+    // is real — and the thing the throw was defending is what this asserts instead.
+    //
+    // `sourceAmount` must be **absent**, not empty. `{ sourceAmount: "12.3456789012",
+    // fiat: "GBP" }` is a well-formed shape saying something false: a ten-decimal DOT figure in
+    // the field the rest of the surface uses for two-decimal fiat, beside a currency code
+    // naming what it is not denominated in.
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    const answer = await service.quote({
+      direction: 'sell',
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'GBP',
+      country: 'GB',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+
+    expect(answer.requested).toEqual({
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'GBP',
+    });
+    expect(answer.requested).not.toHaveProperty('sourceAmount');
+  });
+
+  it('prices a sell through the rail with the crypto amount, not a fiat one', async () => {
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    await service.quote({
+      direction: 'sell',
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'gbp',
+      country: 'GB',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+
+    // The legs are the port's, in the port's naming: `destinationCurrencyCode` is the crypto in
+    // both directions and the fiat is upper-cased here as it is on a buy. The rail is what
+    // crosses this onto Meld's inverted legs.
+    expect(meld.quoteCalls[0]).toEqual({
+      direction: 'sell',
+      countryCode: 'GB',
+      sourceCurrencyCode: 'GBP',
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+  });
+
+  it('does not run the fiat limit gate on a sell quote either', async () => {
+    // The mirror of the session-side case above, and it matters more now that a sell is served:
+    // the configured limits cover USDC_ASSETHUB in USD only, so this corridor has no fiat bound
+    // at all, and applying one would compare DOT against GBP in minor units. A sell's floor and
+    // ceiling are the provider's, at quote time.
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    const answer = await service.quote({
+      direction: 'sell',
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '0.0000000001',
+      fiat: 'GBP',
+      country: 'GB',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+
+    expect(answer.requested).toMatchObject({ cryptoAmount: '0.0000000001' });
+  });
+
+  it('is a fault, not a refusal, when a request reaches the rail mapping without its amount', async () => {
+    // The schema refuses a buy with no `sourceAmount` and a sell with no `cryptoAmount`, but zod
+    // cannot express that as a type, so the parsed request carries both as optional. Reaching
+    // the mapping without one means the schema and the mapping disagree, which is a defect here
+    // and not something the caller did. A `''` or a `'0'` would turn that defect into a
+    // committed amount, so it throws and surfaces as a 500.
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    await expect(
+      service.quote({
+        destinationCurrencyCode: 'USDC_ASSETHUB',
+        fiat: 'USD',
+        country: 'US',
+        paymentMethodType: 'CREDIT_DEBIT_CARD',
+      }),
+    ).rejects.toThrow(/without sourceAmount/);
+    expect(meld.quoteCalls).toHaveLength(0);
+  });
+
+  it('refuses a key reused across directions, rather than replaying the other one', async () => {
+    // A seller must not be handed a buyer's live settlement surface because they reused a key.
+    //
+    // The seeded row is a real buy, which is the only kind of buy row that exists: the
+    // per-direction CHECKs make `direction` co-vary with the amount columns, so a database-valid
+    // buy row and a sell request can never differ in direction *alone*. This refusal is
+    // therefore over-determined, and deliberately asserted anyway, because the alternative is a
+    // test built from a row production cannot hold. `direction` earns its place in the
+    // comparison by naming the difference rather than by being the only term that catches it.
+    const funding = fakeStore();
+    await funding.create(
+      fundingRecord({
+        id: 'twin',
+        client_reference: 'idem-sell-0001',
+        status: 'session_opened',
+        provider_session_id: 'meld-1',
+        widget_url: 'https://meldcrypto.com/session/meld-1',
+      }),
+    );
+    const meld = new FakeMeld();
+    const service = new Onramp(config(), registry(meld), new FakeAudit(), funding, meld, () => NOW);
+
+    const failure = await failureOf(() => service.createSession(SUBJECT, sell(), REQUEST_ID));
+
+    expect(failure).toMatchObject({ value: { code: 'IDEMPOTENCY_KEY_REUSED' } });
+    // The buyer's surface is not reopened, and no second one is created for the seller.
+    expect(meld.calls).toHaveLength(0);
+  });
+
+  it('refuses a key reused with a different crypto amount, which is a different sale', async () => {
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+    await service.createSession(SUBJECT, sell(), REQUEST_ID);
+
+    const failure = await failureOf(() =>
+      service.createSession(SUBJECT, sell({ cryptoAmount: '0.5' }), REQUEST_ID),
+    );
+
+    expect(failure).toMatchObject({ value: { code: 'IDEMPOTENCY_KEY_REUSED' } });
+  });
+
+  it('replays a sell from the row, echoing the crypto amount rather than an address', async () => {
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+    const first = await service.createSession(SUBJECT, sell(), REQUEST_ID);
+
+    const replayed = await service.createSession(SUBJECT, sell(), REQUEST_ID);
+
+    expect(replayed.fundingRequestId).toBe(first.fundingRequestId);
+    expect(replayed.pinned).toEqual(first.pinned);
+    expect(meld.calls).toHaveLength(1);
   });
 });
 

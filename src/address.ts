@@ -7,6 +7,11 @@
  *    a plausible address nobody controls. Passing the checksum is not being an account.
  *
  * An address that cannot be round-tripped is refused, never repaired.
+ *
+ * Two functions, not one, because "cannot be round-tripped" means something different depending
+ * on who supplied the address. `normalizeAddress` is for a caller's own input and refuses with a
+ * caller-facing `Refusal`; `canonicalizeDisclosedAddress` is for a value a rail hands back (a
+ * sell's deposit address) and never throws, because that value was never a caller's to get wrong.
  */
 
 import { decodeAddress, encodeAddress } from '@polkadot/util-crypto';
@@ -49,5 +54,37 @@ export function normalizeAddress(input: string): string {
     );
   }
 
+  return encodeAddress(publicKey, POLKADOT_SS58_PREFIX);
+}
+
+/**
+ * Canonicalise an address a RAIL disclosed (a sell's deposit address), or say it could not be.
+ *
+ * Deliberately not `normalizeAddress`. That function throws a `Refusal` shaped for a caller who
+ * typed a bad address into a request; the value here never came from a caller at all, it came
+ * back from a payment provider's API response, so a failure to decode it is this service's own
+ * integrity problem, not the kind of `400 INVALID_ADDRESS` a buyer or seller could act on. There
+ * is nothing for anyone downstream to correct, so nothing is thrown: `undefined` is the whole of
+ * the signal, and `funding/merge.ts` treats it exactly like a conflicting well-formed address --
+ * recorded, never disclosed, never fatal to an unrelated state move riding alongside it.
+ *
+ * Same rules otherwise, because the account it names lives on the same chain a buy's wallet
+ * address does: must decode as SS58, must be the 32-byte payload of a real account (not one of
+ * the shorter forms that checksum cleanly without being one), and is returned in the canonical
+ * Polkadot-prefix form so two disclosures of the same account under different prefixes compare
+ * equal rather than looking like a changed address.
+ */
+export function canonicalizeDisclosedAddress(input: string): string | undefined {
+  // `decodeAddress('')` throws, but spelling the empty case out here rather than relying on that
+  // is what stops a future, more permissive base58 decoder from ever making an empty string look
+  // like a valid, if peculiar, account.
+  if (input.length === 0) return undefined;
+  let publicKey: Uint8Array;
+  try {
+    publicKey = decodeAddress(input);
+  } catch {
+    return undefined;
+  }
+  if (publicKey.length !== PUBLIC_KEY_BYTES) return undefined;
   return encodeAddress(publicKey, POLKADOT_SS58_PREFIX);
 }

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { ChainflipRail } from '../../src/chainflip/rail.js';
 import { Refusal } from '../../src/contract.js';
-import { railSessionInput } from '../fixtures.js';
+import { railSellSessionInput, railSessionInput } from '../fixtures.js';
 
 const railInput = () => railSessionInput({ destinationCode: 'DOT_ASSETHUB' });
 
@@ -40,9 +40,39 @@ describe('ChainflipRail', () => {
     expect(refusal?.message).toContain('no fiat leg');
   });
 
+  it.each(['quote', 'session'] as const)('refuses a sell %s with the direction refusal, not its own', async (leg) => {
+    // Chainflip's missing fiat leg cuts both ways: no card charge in, and no fiat payout out. So
+    // a sell is refused for the direction rather than for the leg's own reason, and permanently:
+    // the quote leg's "priced on-chain at swap time" would send a caller looking for a price
+    // that buys them nothing here, and `NoQuotesAvailable` reads as "try another amount".
+    const rail = new ChainflipRail();
+    const refusal = await failureOf(() =>
+      leg === 'quote'
+        ? rail.quote({
+            direction: 'sell',
+            countryCode: 'GB',
+            sourceCurrencyCode: 'GBP',
+            destinationCurrencyCode: 'DOT_ASSETHUB',
+            cryptoAmount: '12.3456789012',
+            paymentMethodType: 'PAYOUT_TO_BANK',
+          })
+        : rail.createSession(railSellSessionInput()),
+    );
+
+    expect(refusal?.status).toBe(400);
+    expect(refusal?.failure).toEqual({
+      tag: 'Other',
+      value: { code: 'DIRECTION_UNSUPPORTED', message: 'That funding direction is not available on this rail.' },
+    });
+    // The operator-facing half says which of the two reasons it is, because "not built yet" and
+    // "never will be" are different answers to the same question.
+    expect(refusal?.message).toContain('Permanent, not unbuilt');
+  });
+
   it('refuses a quote: the price is set on-chain at swap time, not quotable here', async () => {
     const refusal = await failureOf(() =>
       new ChainflipRail().quote({
+        direction: 'buy',
         countryCode: 'US',
         sourceCurrencyCode: 'USD',
         destinationCurrencyCode: 'USDC_ASSETHUB',

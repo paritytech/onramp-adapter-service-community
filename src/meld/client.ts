@@ -15,7 +15,66 @@
 import { z } from 'zod';
 
 import { upstreamUnavailable } from '../contract.js';
+import type { Direction } from '../rail.js';
 import type { Secret } from '../secret.js';
+import { isDeliveredCrypto } from './catalog.js';
+
+/**
+ * Refuse to send a request whose legs contradict its direction.
+ *
+ * **This exists because Meld would not refuse it.** There is no direction field on a quote
+ * request: Meld derives the direction from whether `sourceCurrencyCode` holds a crypto. So a
+ * sell whose legs were crossed the wrong way is not a malformed request upstream — it is a
+ * perfectly valid *buy*, which Meld prices and answers `200`. A wrong number comes back looking
+ * exactly like a right one, and it is the number a seller decides on. Nothing downstream can
+ * tell the two apart, because the only thing distinguishing them was which field held which
+ * currency.
+ *
+ * The session endpoint does check (`sessionType` and the leg orientation are validated against
+ * each other), so a crossed sell session fails loudly at Meld. That asymmetry is exactly why
+ * this cannot be left to the upstream: the more dangerous of the two calls is the unchecked one.
+ * The guard runs on both anyway, so the failure is at this service's boundary and says what is
+ * actually wrong rather than arriving as a currency complaint about the caller's request.
+ *
+ * A plain `Error`, not a `Refusal`. Nothing a caller sends can reach it — both the direction and
+ * the legs are chosen by this service, from a request the schema has already validated — so it
+ * can only fire when this service's own mapping is wrong. That is a `500` and a fault to fix,
+ * not a `400` for someone to act on, and it is the same judgement `onramp.ts`'s `committedTerm`
+ * makes about a term the schema was supposed to have guaranteed.
+ *
+ * The test is "a crypto this deployment delivers", not "a crypto"; see `isDeliveredCrypto`.
+ */
+function assertLegs(direction: Direction, sourceCurrencyCode: string, destinationCurrencyCode: string): void {
+  const sourceIsCrypto = isDeliveredCrypto(sourceCurrencyCode);
+  if (sourceIsCrypto !== (direction === 'sell')) {
+    throw new Error(
+      `Meld ${direction}: sourceCurrencyCode "${sourceCurrencyCode}" ${sourceIsCrypto ? 'is' : 'is not'} a ` +
+        `delivered crypto, which is wrong for a ${direction}. The legs are crossed in this service's mapping.`,
+    );
+  }
+  // The other way to build a request Meld cannot read as intended, and one the check above
+  // cannot see, since it only looks at the source. Exactly one leg is crypto in either
+  // direction; two of a kind is a mapping that dropped a leg rather than crossing it.
+  if (isDeliveredCrypto(destinationCurrencyCode) === sourceIsCrypto) {
+    throw new Error(
+      `Meld ${direction}: both legs name the same kind of currency ` +
+        `("${sourceCurrencyCode}" -> "${destinationCurrencyCode}"). One leg is fiat in either direction.`,
+    );
+  }
+}
+
+/**
+ * Meld's `sessionType`, by this service's direction.
+ *
+ * A map rather than a ternary, and keyed by `Direction`, so the compiler adds the arm when the
+ * tuple in `rail.ts` grows. The enum has a third member Meld enumerates when you send a bad one
+ * (`BUY, SELL, TRANSFER`); `TRANSFER` is not a funding direction here and is deliberately absent
+ * rather than mapped to something.
+ */
+const SESSION_TYPE: Readonly<Record<Direction, 'BUY' | 'SELL'>> = Object.freeze({
+  buy: 'BUY',
+  sell: 'SELL',
+});
 
 /**
  * Endpoint paths.
@@ -41,9 +100,20 @@ const transactionPath = (id: string) => `/payments/transactions/${encodeURICompo
  *
  * The parameter is `externalSessionIds`, plural. The alternatives were probed against
  * `api-sb.meld.io` and reported `?externalSessionId=`, `?sessionId=` and `?offset=` all answering
- * `400`, with only the plural form filtering (`200`, one of one). Listing the collection instead
- * is not an option: it is paginated at ten with no usable offset, so a busy account hides the row
- * the wanted one behind other accounts' transactions.
+ * `400`, with only the plural form filtering (`200`, one of one).
+ *
+ * Two corrections to what this comment used to claim, both from a later probe of the same
+ * sandbox, and neither changing the code:
+ *
+ * - The collection is **not** "paginated at ten with no usable offset". Ten is the default page
+ *   size; `?limit=100` returned all 74 rows of the account in one page, and `after`/`before`
+ *   exist for cursoring. Listing is therefore possible — it is just a worse join than filtering.
+ * - `sessionIds` (plural) **is** an accepted filter parameter: the rejected-parameter error
+ *   enumerates the whole accepted set and it is in it. Only the singular `?sessionId=` answers
+ *   `400`. Whether it actually joins a session to its transaction is untested (no transaction
+ *   existed for the probe's sessions), so this stays on the reference, which is observed to
+ *   round-trip. If `sessionIds` does join, it removes the whole "the session id is not a join
+ *   key" awkwardness in both directions and is worth one follow-up probe.
  */
 const transactionSearchPath = (reference: string) =>
   `/payments/transactions?externalSessionIds=${encodeURIComponent(reference)}`;
@@ -60,15 +130,23 @@ const transactionSearchPath = (reference: string) =>
 export class MeldHttpError extends Error {
   /**
    * Meld's own error code and human message from the response body when it sent them (e.g. code
-   * `NO_VALID_QUOTES`, or a message "...below the minimum allowed, which is 18.00 EUR" that carries
-   * no code at all). The status alone cannot tell "no offer", "below minimum", and "malformed"
-   * apart (all three are `400`), so a caller that must distinguish them reads these. Never a
-   * secret: it is Meld's public error taxonomy, and the body is read without any header.
+   * `NO_VALID_QUOTES`, or a message "...below the minimum allowed, which is 18.00 EUR"). The
+   * status alone cannot tell "no offer", "below minimum", and "malformed" apart (all three are
+   * `400`), so a caller that must distinguish them reads these. Never a secret: it is Meld's
+   * public error taxonomy, and the body is read without any header.
+   *
+   * `providerDetail` is the sub-provider's own sentence, from `serviceProviderDetails.message`.
+   * It is carried separately rather than folded into `detail` because it is a different
+   * statement by a different party: `detail` is Meld's, and on a sell the provider's is the only
+   * place the actual threshold appears. **Operator-facing only.** It is prose that differs per
+   * provider and per case, and on a sell the number in it is crypto-denominated, so it must not
+   * become a wire value that a client reads as fiat. See `refusal.ts`.
    */
   constructor(
     readonly status: number,
     readonly code?: string,
     readonly detail?: string,
+    readonly providerDetail?: string,
   ) {
     super(`Meld answered HTTP ${String(status)}.`);
     this.name = 'MeldHttpError';
@@ -125,7 +203,7 @@ const quoteEnvelope = z.object({ quotes: z.array(z.unknown()).nullish() }).loose
 
 type MeldQuote = z.infer<typeof quoteSchema>;
 
-/** What Meld's quote endpoint is asked for. */
+/** What Meld's quote endpoint is asked for, on a buy. */
 export interface QuoteParams {
   countryCode: string;
   sourceCurrencyCode: string;
@@ -133,6 +211,37 @@ export interface QuoteParams {
   /** Meld's quote is source-denominated: the buyer names the fiat they will pay and Meld returns
    *  the crypto out. Verified against api-sb.meld.io, which rejects a null `sourceAmount`. */
   sourceAmount: string;
+  paymentMethodType: string;
+}
+
+/**
+ * What the same endpoint is asked for on a sell, named by what each value **is**.
+ *
+ * Deliberately not `QuoteParams` with the values swapped by the caller. Meld's quote request has
+ * no direction flag: it infers the direction purely from whether `sourceCurrencyCode` is a crypto
+ * (verified — passing fiat as source on a sell answers "Source currency is not a valid crypto
+ * currency"). So on a sell the crypto sits in `sourceCurrencyCode` and the fiat in
+ * `destinationCurrencyCode`, exactly inverted from a buy, and a shared struct would mean the same
+ * field name holding a different currency depending on a direction the struct does not carry.
+ * That is the one confusion this whole split exists to prevent, so the inversion happens here, in
+ * the module that owns the wire, once, against fields that say which leg they are.
+ */
+export interface SellQuoteParams {
+  countryCode: string;
+  /** The asset being sold. Meld's `sourceCurrencyCode` on a sell. */
+  cryptoCurrencyCode: string;
+  /** The currency paid out. Meld's `destinationCurrencyCode` on a sell. */
+  fiatCurrencyCode: string;
+  /**
+   * The exact crypto the seller commits. Meld's `sourceAmount` on a sell, and still mandatory:
+   * the endpoint rejects a null `sourceAmount` in both directions and ignores a
+   * `destinationAmount` sent beside it, so a sell quote answers "what does this much crypto
+   * fetch", never "how much must I sell to receive 500".
+   *
+   * Sent as the caller's exact string. Meld was observed echoing 18 fraction digits back
+   * verbatim, with no truncation, rounding or exponent.
+   */
+  cryptoAmount: string;
   paymentMethodType: string;
 }
 
@@ -146,16 +255,27 @@ const widgetSessionResponse = z
     /** Meld's own hosted widget for this session (meldcrypto.com). A product that wants to embed
      *  Meld's UI rather than the raw provider page opens this. Verified present in the response. */
     widgetUrl: z.url().nullish(),
+    /**
+     * Nullish because Meld omits it. On a SELL it is not merely often absent but always: the
+     * sell session response carries no `expiresAt` key at all (verified), so every sell row's
+     * `expires_at` is null and the worker's local ceiling is the whole of its deadline rather
+     * than a floor under a provider one. `funding/worker.ts`'s `deadlineFor` already says so.
+     */
     expiresAt: z.string().nullish(),
   })
   .loose();
 
-interface WidgetSessionParams {
-  destinationCode: string;
-  walletAddress: string;
-  sourceAmount: string;
-  sourceCurrency: string;
+/** What a session carries whichever way the value moves. */
+interface WidgetSessionCommon {
   countryCode: string;
+  /**
+   * How the buyer pays, or how the seller is paid out (`PAYOUT_TO_BANK`, `PAYOUT_TO_CARD`).
+   *
+   * Required here in both directions, though Meld only requires it on a buy: a SELL session with
+   * no `paymentMethodType` is accepted (verified). Sent anyway, because it is the one field that
+   * decides how the seller receives their money and letting the provider pick it inside the
+   * widget is a term of the sale this service did not commit.
+   */
   paymentMethodType: string;
   /**
    * Pins one onramp, e.g. `TRANSAK` or `KOYWE`.
@@ -178,6 +298,47 @@ interface WidgetSessionParams {
    */
   redirectUrl?: string | undefined;
 }
+
+/** Opening a buy: the buyer pays fiat and the crypto is delivered to an address they named. */
+export interface BuyWidgetSessionParams extends WidgetSessionCommon {
+  direction: 'buy';
+  /** The crypto delivered. Meld's `destinationCurrencyCode` on a buy. */
+  destinationCode: string;
+  /** Where it is delivered. Required by Meld on a buy ("must not be blank"), verified. */
+  walletAddress: string;
+  /** The fiat charged. Meld's `sourceAmount` on a buy. */
+  sourceAmount: string;
+  /** The currency charged. Meld's `sourceCurrencyCode` on a buy. */
+  sourceCurrency: string;
+}
+
+/**
+ * Opening a sell: the seller commits crypto and the provider pays fiat out.
+ *
+ * Named by leg rather than by Meld's field, for the reason `SellQuoteParams` gives: Meld infers
+ * the direction from the currency types and refuses a session whose source is not a crypto
+ * ("Source currency is not a valid crypto currency"), so a sell's `sourceCurrencyCode` is the
+ * asset and its `destinationCurrencyCode` is the payout currency.
+ *
+ * **No `walletAddress`, and that is not an omission.** Verified: Meld does not require one on a
+ * SELL (a BUY without one is refused, a SELL without one is `200`), and there is no request-side
+ * field for a deposit address under any name — Meld issues the address itself, on the transaction
+ * record, after the seller clears KYC. Sending one anyway would be worse than useless: the
+ * endpoint silently accepts unknown and meaningless fields (an invalid address, and an entirely
+ * invented key, both return `200`), so a `walletAddress` here would be read by nobody while
+ * looking, to anyone auditing the request, like a pinned destination.
+ */
+export interface SellWidgetSessionParams extends WidgetSessionCommon {
+  direction: 'sell';
+  /** The asset sold. Meld's `sourceCurrencyCode` on a sell. */
+  cryptoCurrencyCode: string;
+  /** The currency paid out. Meld's `destinationCurrencyCode` on a sell. */
+  fiatCurrencyCode: string;
+  /** The exact crypto committed. Meld's `sourceAmount` on a sell, and required. */
+  cryptoAmount: string;
+}
+
+type WidgetSessionParams = BuyWidgetSessionParams | SellWidgetSessionParams;
 
 interface WidgetSession {
   meldSessionId: string;
@@ -207,6 +368,16 @@ const transactionResponse = z
     sourceAmount: scalarAmount.nullish(),
     destinationAmount: scalarAmount.nullish(),
     serviceProvider: z.string().nullish(),
+    /**
+     * The off-ramp deposit address, when Meld has issued one. Confirmed, live: the key exists on
+     * every transaction record probed (buy and sell alike), spelled exactly as here, and is
+     * `null` on every one of them, because every probed record was a buy -- a buy's wallet address
+     * is the caller's own, sent before the session opened, so there is nothing here for it. It has
+     * never been observed populated: no sell has been driven through this account's one onboarded
+     * provider far enough to produce a transaction (see the probe note). `.loose()` on the nested
+     * object rather than a bare string, so a field Meld adds beside it does not break this.
+     */
+    cryptoDetails: z.object({ offrampDestinationWalletAddress: z.string().nullish() }).loose().nullish(),
   })
   .loose();
 
@@ -259,13 +430,55 @@ export class MeldClient {
    * the caller solving for the fiat against forward quotes, not by a reverse question.
    */
   async quote(params: QuoteParams): Promise<MeldQuote[]> {
-    const body = await this.send('POST', QUOTE, {
+    assertLegs('buy', params.sourceCurrencyCode, params.destinationCurrencyCode);
+    return this.postQuote({
       countryCode: params.countryCode,
       sourceCurrencyCode: params.sourceCurrencyCode,
       destinationCurrencyCode: params.destinationCurrencyCode,
       sourceAmount: params.sourceAmount,
       paymentMethodType: params.paymentMethodType,
     });
+  }
+
+  /**
+   * Offers for a seller: they name the crypto they will send and Meld returns the fiat out.
+   *
+   * The same path and the same five field names as `quote`, with the legs inverted (see
+   * `SellQuoteParams`). There is no `direction`, `category` or `sessionType` on this request and
+   * no sell-specific endpoint; verified against api-sb.meld.io, where a crypto `sourceCurrencyCode`
+   * is the whole of what makes the answer a sell (`quotes[].transactionType: "CRYPTO_SELL"`).
+   *
+   * The offers come back under the same schema and are forwarded untouched, but **the fee
+   * breakdown means something different** and nothing here converts it. On a buy the fees are
+   * fiat and come off the source (`100 - 5.99 = 94.01`); on a sell they are still fiat and come
+   * off the **destination** (`631.88 - 12.58 = 619.30`). `sourceAmountWithoutFees` is null on a
+   * sell and `destinationAmountWithoutFees` is populated, exactly inverted, and `exchangeRate`
+   * becomes fiat-per-crypto. A consumer that assumed "fees are denominated in the same currency
+   * as `sourceAmount`" is wrong on a sell; that assumption is not made here, because this
+   * forwards the breakdown rather than closing any sum over it.
+   */
+  async quoteSell(params: SellQuoteParams): Promise<MeldQuote[]> {
+    // The load-bearing one. A crossed sell here is a `200` from Meld carrying a buy's price.
+    assertLegs('sell', params.cryptoCurrencyCode, params.fiatCurrencyCode);
+    return this.postQuote({
+      countryCode: params.countryCode,
+      sourceCurrencyCode: params.cryptoCurrencyCode,
+      destinationCurrencyCode: params.fiatCurrencyCode,
+      sourceAmount: params.cryptoAmount,
+      paymentMethodType: params.paymentMethodType,
+    });
+  }
+
+  /**
+   * The one place a quote body is sent and its answer read.
+   *
+   * Shared by both directions because the endpoint is genuinely one endpoint: everything that
+   * differs between a buy and a sell is which value each field holds, and that is decided above
+   * this line. Duplicating the partial-offer handling per direction would give the sell path its
+   * own copy of the rule that one bad provider must not discard the others.
+   */
+  private async postQuote(request: Record<string, string>): Promise<MeldQuote[]> {
+    const body = await this.send('POST', QUOTE, request);
 
     const offers = this.read(quoteEnvelope, body, 'quote').quotes ?? [];
     const readable = offers.flatMap((offer) => {
@@ -286,18 +499,53 @@ export class MeldClient {
   }
 
   /**
-   * Create a session with the destination and address pinned server-side.
+   * Create a session with the legs, the amount and (on a buy) the address pinned server-side.
    *
-   * The amount too. Meld locks through a `lockFields` array on `sessionData`, not per-field
-   * `*Locked` booleans, which are accepted and silently ignored. Six fields are listed, so the configured
-   * `limits` bound the charge, not only the request. `country` is not among them: Meld exposes
-   * no lock for it, so the jurisdiction is pinned in this service's record but not enforced upstream.
+   * Meld locks through a `lockFields` array on `sessionData`, not per-field `*Locked` booleans,
+   * which are accepted and silently ignored. Six fields are listed, so the configured `limits`
+   * bound the charge, not only the request. `country` is not among them: Meld exposes no lock for
+   * it, so the jurisdiction is pinned in this service's record but not enforced upstream.
    *
-   * `walletAddress` arrives already normalised and `destinationCode` already validated, so
-   * neither is re-derived here and each rule lives in exactly one place. Both are sent locked,
+   * On a buy, `walletAddress` arrives already normalised and `destinationCode` already validated,
+   * so neither is re-derived here and each rule lives in exactly one place. Both are sent locked,
    * so a buyer cannot be walked onto a different asset or address inside Meld's own interface.
+   *
+   * On a sell the legs invert and one endpoint serves both: same path, same envelope, and
+   * `sessionType` carries the difference. See `SellWidgetSessionParams` for why there is no
+   * address on that side.
    */
   async createWidgetSession(params: WidgetSessionParams): Promise<WidgetSession> {
+    // The three fields whose meaning inverts with the direction, resolved once. Meld's names on
+    // the left, this service's legs on the right; a sell's source is the crypto and its
+    // destination is the fiat, which the server enforces rather than merely accepts (sending
+    // fiat as source on a SELL answers "Source currency is not a valid crypto currency").
+    //
+    // `walletAddress` is in this object rather than below it because it exists on exactly one
+    // side. Spreading it means a sell's body does not carry the key at all, as opposed to
+    // carrying it empty — and an empty one would be accepted, since this endpoint takes unknown
+    // and meaningless fields with a `200`.
+    const legs =
+      params.direction === 'sell'
+        ? {
+            sourceCurrencyCode: params.cryptoCurrencyCode,
+            destinationCurrencyCode: params.fiatCurrencyCode,
+            sourceAmount: params.cryptoAmount,
+            // Plain `undefined`, as `serviceProvider` and `redirectUrl` below are: this object
+            // is only ever JSON-serialised and `JSON.stringify` drops an undefined value, so the
+            // key is genuinely absent from the sell body. Written this way rather than as a
+            // conditional spread so both branches emit the same field in the same position, and
+            // the bytes a buy POSTs do not depend on which branch produced them.
+            walletAddress: undefined,
+          }
+        : {
+            sourceCurrencyCode: params.sourceCurrency,
+            destinationCurrencyCode: params.destinationCode,
+            sourceAmount: params.sourceAmount,
+            walletAddress: params.walletAddress,
+          };
+
+    assertLegs(params.direction, legs.sourceCurrencyCode, legs.destinationCurrencyCode);
+
     // Verified against api-sb.meld.io: the endpoint wants `{ sessionType, sessionData: {...} }`;
     // the flat shape returns "[sessionData] must not be null".
     //
@@ -305,13 +553,17 @@ export class MeldClient {
     // refuses an absent one with the same "must not be null" as an explicit null, so there is
     // nothing to be gained by telling the two apart here.
     const body = await this.send('POST', CREATE_WIDGET_SESSION, {
-      sessionType: 'BUY',
+      sessionType: SESSION_TYPE[params.direction],
       sessionData: {
+        // Field by field in the order a buy has always sent them, rather than spreading `legs`.
+        // `JSON.stringify` preserves insertion order, so spreading a branch-shaped object made
+        // the literal bytes of a buy depend on which branch built it — an invisible change that
+        // `toEqual` on a parsed body cannot see, under a claim that buy is byte-identical.
         serviceProvider: params.serviceProvider,
-        destinationCurrencyCode: params.destinationCode,
-        walletAddress: params.walletAddress,
-        sourceAmount: params.sourceAmount,
-        sourceCurrencyCode: params.sourceCurrency,
+        destinationCurrencyCode: legs.destinationCurrencyCode,
+        walletAddress: legs.walletAddress,
+        sourceAmount: legs.sourceAmount,
+        sourceCurrencyCode: legs.sourceCurrencyCode,
         countryCode: params.countryCode,
         paymentMethodType: params.paymentMethodType,
         // Meld's whole lockable vocabulary is six values, and it names them when you send a
@@ -331,6 +583,24 @@ export class MeldClient {
         // provider set, fee schedule and KYC path change with it. The remaining defence has to be
         // a comparison after the fact, not a lock. That comparison does not exist yet, so the
         // exposure is live, not closed.
+        //
+        // The same six on a sell, and the list is not direction-dependent. Verified: the enum is
+        // validated identically for both session types and the error naming it is byte-identical,
+        // so there is no seventh, sell-specific lockable field — nothing for a payout method
+        // beyond `paymentMethodType`, nothing for a crypto amount beyond `sourceAmount`, nothing
+        // for a bank account. The inversion works in this service's favour, since on a sell
+        // `sourceAmount` is the crypto sold and `paymentMethodType` is the payout method, so the
+        // two terms that most need pinning are the ones already named.
+        //
+        // **What is NOT known is whether any of them is honoured on a sell.** All six are
+        // accepted there, but so is `walletAddress` when the field it names is absent from the
+        // body entirely, so is a malformed address, and so is an invented key — this endpoint
+        // takes anything with a `200`, and Meld exposes no session read-back to check against
+        // (five paths probed; 404, 403 and 401). Acceptance is therefore no evidence at all. The
+        // buy guarantee was established behaviourally and has not been re-established here, and
+        // `docs/api.md` says exactly that rather than copying the buy's sentence across. Sent
+        // regardless: the asymmetry is the same one-sided one as `cryptoCurrency` above — an
+        // ignored lock costs nothing, an absent one costs the term.
         lockFields: [
           'cryptoCurrency',
           'destinationCurrencyCode',
@@ -482,20 +752,42 @@ export class MeldClient {
     }
 
     if (!response.ok) {
-      // Meld's error body is `{ error: "CODE", message: "..." }`, or sometimes only one of the two
-      // (a below-minimum rejection carries just the message). Read both best-effort so the caller
-      // can tell "no offer" (NO_VALID_QUOTES) and "below minimum" apart from a genuine outage. A
-      // missing or unparseable body just means no code, and the status still degrades.
+      // Meld's error body carries its code under `error` on some responses and under `code` on
+      // others. Both are read, `error` first, because reading only `error` discarded the code on
+      // every body that uses the other spelling — which is every limit rejection in **both**
+      // directions. An observed below-minimum body is
+      // `{"code":"INVALID_AMOUNT_TOO_LOW","message":"[TRANSAK] Source amount is below the minimum
+      // allowed","serviceProviderDetails":{"message":"Minimum sell amount should be more than or
+      // equal to 0.00011648 BTC"}}`: no `error` key at all. This comment used to say such a body
+      // "carries just the message", and that was a reading of the field this code happened to
+      // look at rather than of the body. `refusal.ts` had to match on the message's wording as a
+      // result; now it has the code, which is the stabler signal.
+      //
+      // `serviceProviderDetails.message` is read too, and kept apart from Meld's own message. On
+      // a sell it is the only place the threshold appears, and it is crypto-denominated prose, so
+      // it goes to the operator and never to the wire.
       let code: string | undefined;
       let detail: string | undefined;
+      let providerDetail: string | undefined;
       try {
-        const body = (await response.json()) as { error?: unknown; message?: unknown };
+        const body = (await response.json()) as {
+          error?: unknown;
+          code?: unknown;
+          message?: unknown;
+          serviceProviderDetails?: unknown;
+        };
         if (typeof body.error === 'string') code = body.error;
+        else if (typeof body.code === 'string') code = body.code;
         if (typeof body.message === 'string') detail = body.message;
+        const provider: unknown = body.serviceProviderDetails;
+        if (typeof provider === 'object' && provider !== null) {
+          const nested = (provider as { message?: unknown }).message;
+          if (typeof nested === 'string') providerDetail = nested;
+        }
       } catch {
         // no JSON body; the status carries the signal on its own
       }
-      throw new MeldHttpError(response.status, code, detail);
+      throw new MeldHttpError(response.status, code, detail, providerDetail);
     }
 
     try {

@@ -13,7 +13,7 @@
 import { z } from 'zod';
 import { MINOR_UNIT_DECIMAL } from './money.js';
 
-import { RAIL_NAMES } from './rail.js';
+import { DEFAULT_DIRECTION, DIRECTIONS, RAIL_NAMES } from './rail.js';
 
 // --- failures ---------------------------------------------------------------
 
@@ -126,6 +126,33 @@ export const notFound = (message: string) =>
 export const noQuotesAvailable = (detail: string) =>
   new Refusal(422, { tag: 'NoQuotesAvailable' }, detail);
 
+/**
+ * `400`: the rail understood the request and does not serve that direction.
+ *
+ * Modelled on Chainflip's `RAIL_REFUSED`, and separate from it for the same reason that one is
+ * separate from a currency error: the caller must be told the real reason. A rail with no sell
+ * path that refused with `NoQuotesAvailable` or `CURRENCY_UNSUPPORTED` would send a caller round
+ * a loop changing the amount, the method and the region, none of which is the problem.
+ *
+ * A factory rather than an inline `reject`. Only Chainflip raises it now — permanently, having
+ * no fiat leg to pay a seller from — since the Meld rail serves a sell. It stays a factory
+ * because the sentence is user-facing and a second rail refusing a direction is exactly the
+ * situation in which a second copy of it would drift, which is what happened while both rails
+ * raised it.
+ *
+ * Not retryable: the remedy is a different rail or a different direction, never the same request
+ * again.
+ */
+export const directionUnsupported = (detail: string) =>
+  new Refusal(
+    400,
+    {
+      tag: 'Other',
+      value: { code: 'DIRECTION_UNSUPPORTED', message: 'That funding direction is not available on this rail.' },
+    },
+    detail,
+  );
+
 // --- requests ---------------------------------------------------------------
 
 /**
@@ -146,6 +173,16 @@ const fiat = z.string().regex(/^[A-Za-z]{3}$/, 'Expected a three-letter ISO 4217
 /** Meld's payment-method vocabulary: CREDIT_DEBIT_CARD, SEPA, ACH, PIX. Opaque here. */
 const paymentMethodType = z.string().min(1).max(48);
 
+/**
+ * The crypto leg, in **both** directions.
+ *
+ * On a sell the crypto is what the seller sources, so this name reads backwards. It is kept
+ * anyway: the vocabulary is the consumer's and there is one convention across the whole surface
+ * (see the note above `country`). A second naming for the same leg would be a translation layer,
+ * and a translation layer is a place to be wrong about which currency an amount is in. `fiat`
+ * keeps naming the fiat leg for the same reason: the payout currency on a sell, the charge
+ * currency on a buy.
+ */
 const destinationCurrencyCode = z.string().min(1).max(64);
 
 /**
@@ -159,6 +196,46 @@ const destinationCurrencyCode = z.string().min(1).max(64);
 const sourceAmount = z
   .string()
   .regex(MINOR_UNIT_DECIMAL, 'Expected a decimal amount with at most two fraction digits.');
+
+/**
+ * The exact crypto a seller commits, on a sell. Its own field, never `sourceAmount`.
+ *
+ * Its own pattern, and deliberately not `MINOR_UNIT_DECIMAL` widened: that regex and
+ * `toMinorUnits`'s hard two digits are one fiat rule, the fiat limit comparison depends on
+ * exactly two, and widening it in place would silently truncate a buyer's amount where a card is
+ * charged. `money.ts` says as much at the constant.
+ *
+ * Its own module-local constant rather than a second export from `money.ts`, because `money.ts`
+ * is the minor-units module and a crypto amount never becomes minor units. A value that lived
+ * beside `toMinorUnits` would eventually be passed to it, and a ten-decimal DOT amount rounded to
+ * two is a wrong number at the boundary where a payout is computed.
+ *
+ * Generous precision, because the upstream has it: Meld was observed echoing 18 fraction digits
+ * verbatim, with no truncation, rounding or exponent. So the amount stays this exact string from
+ * the wire to the row to the rail, and is never parsed into a `number` anywhere; a `double`
+ * round-trip is not identity past 2^53 and turns `0.0000001` into `1e-7`.
+ */
+const CRYPTO_DECIMAL = /^\d{1,30}(\.\d{1,30})?$/;
+
+/**
+ * At least one non-zero digit, so `0`, `0.00000000` and any other spelling of nothing are
+ * refused.
+ *
+ * A separate check because the shape regex cannot express it without becoming unreadable, and a
+ * necessary one because nothing downstream would catch it. A buy is protected only incidentally:
+ * its limit gate refuses `0` for being below the configured minimum. A sell reaches no such
+ * gate, by design — the corridor's published limits are fiat and the committed amount is crypto
+ * — so on a sell this is the only thing standing between a caller and a zero-amount sale.
+ *
+ * It matters now rather than later. Today every rail refuses every sell, but the durable row is
+ * written before the rail is called, so a zero would already be persisted as a committed term;
+ * and the day the real sell path lands, a zero would reach the provider ungated. The release
+ * that introduces the field is the one that owns its validity.
+ */
+const cryptoAmount = z
+  .string()
+  .regex(CRYPTO_DECIMAL, 'Expected an exact decimal crypto amount.')
+  .refine((value) => /[1-9]/.test(value), { message: 'Expected a crypto amount greater than zero.' });
 
 /**
  * Supplied by the caller, and required.
@@ -253,18 +330,84 @@ export const redeemRequest = z
   })
   .strict();
 
-/** The body behind `POST /quote`: the corridor to price, and what the buyer will pay. */
+/**
+ * Which way the request moves value. Absent defaults to `DIRECTIONS[0]` (`buy`). See `src/rail.ts`.
+ *
+ * Optional, and that is the whole compatibility story: every caller written before sell existed
+ * sends no `direction` and gets byte-identical behaviour, request and response.
+ */
+const direction = z.enum(DIRECTIONS).optional();
+
+/**
+ * The per-direction required fields, enforced on both request schemas.
+ *
+ * Which amount a request carries is not a stylistic choice: a buy commits fiat and a sell commits
+ * crypto, and they are validated by different rules and stored in different columns. A schema
+ * with both optional and no cross-check would accept a sell carrying a two-decimal `sourceAmount`
+ * and quietly commit nothing, or a buy carrying both and commit whichever the code happened to
+ * read.
+ *
+ * So the wrong combination is refused rather than ignored, in both directions:
+ *
+ * - buy: `sourceAmount` required, `cryptoAmount` refused. On `/session`, `walletAddress` required.
+ * - sell: `cryptoAmount` required, `sourceAmount` refused, and `walletAddress` refused because
+ *   the provider issues the deposit address later; a caller-supplied one is read by nobody and
+ *   accepting it would let a seller believe they had pinned a destination.
+ *
+ * `requireSessionFields` is what the two schemas disagree about: `/quote` prices a corridor and
+ * has no address in either direction.
+ */
+function directionalFields(
+  value: {
+    direction?: (typeof DIRECTIONS)[number] | undefined;
+    sourceAmount?: string | undefined;
+    cryptoAmount?: string | undefined;
+    walletAddress?: string | undefined;
+  },
+  ctx: z.RefinementCtx,
+  requireSessionFields: boolean,
+): void {
+  const absent = (path: string, message: string) => {
+    ctx.addIssue({ code: 'custom', path: [path], message });
+  };
+  if ((value.direction ?? DEFAULT_DIRECTION) === 'sell') {
+    if (value.cryptoAmount === undefined) absent('cryptoAmount', 'A sell requires cryptoAmount.');
+    if (value.sourceAmount !== undefined) {
+      absent('sourceAmount', 'A sell commits crypto, not fiat: send cryptoAmount instead.');
+    }
+    if (value.walletAddress !== undefined) {
+      absent('walletAddress', 'A sell has no caller-supplied wallet address; the provider issues one.');
+    }
+    return;
+  }
+  if (value.sourceAmount === undefined) absent('sourceAmount', 'A buy requires sourceAmount.');
+  if (value.cryptoAmount !== undefined) {
+    absent('cryptoAmount', 'A buy commits fiat, not crypto: send sourceAmount instead.');
+  }
+  if (requireSessionFields && value.walletAddress === undefined) {
+    absent('walletAddress', 'A buy requires walletAddress.');
+  }
+}
+
+/** The body behind `POST /quote`: the corridor to price, and what the caller will commit. */
 export const quoteRequest = z
   .object({
     country,
     fiat,
     destinationCurrencyCode,
-    sourceAmount,
+    /** Required on a buy, refused on a sell; see `directionalFields`. */
+    sourceAmount: sourceAmount.optional(),
+    /** Required on a sell, refused on a buy; see `directionalFields`. */
+    cryptoAmount: cryptoAmount.optional(),
     paymentMethodType,
     /** Which funding rail to quote. Absent defaults to `RAIL_NAMES[0]` (meld today). See `src/rail.ts`. */
     rail: z.enum(RAIL_NAMES).optional(),
+    direction,
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    directionalFields(value, ctx, false);
+  });
 
 /** The body behind `POST /session`: everything needed to open one chargeable settlement surface. */
 export const createSessionRequest = z
@@ -273,9 +416,17 @@ export const createSessionRequest = z
     country,
     fiat,
     destinationCurrencyCode,
-    sourceAmount,
-    /** SS58 address that receives the tokens. Normalised and validated before use. */
-    walletAddress: z.string().min(1).max(128),
+    /** The fiat charged. Required on a buy, refused on a sell; see `directionalFields`. */
+    sourceAmount: sourceAmount.optional(),
+    /** The crypto sold. Required on a sell, refused on a buy; see `directionalFields`. */
+    cryptoAmount: cryptoAmount.optional(),
+    /**
+     * SS58 address that receives the tokens. Normalised and validated before use.
+     *
+     * Required on a buy and refused on a sell, where the crypto travels the other way and the
+     * provider issues the deposit address after the session exists.
+     */
+    walletAddress: z.string().min(1).max(128).optional(),
     paymentMethodType,
     /**
      * Which onramp to open the session on, e.g. `TRANSAK`.
@@ -296,13 +447,17 @@ export const createSessionRequest = z
     serviceProvider: z.string().min(1).max(48),
     /** Which funding rail to open the session on. Absent defaults to `RAIL_NAMES[0]` (meld today). See `src/rail.ts`. */
     rail: z.enum(RAIL_NAMES).optional(),
+    direction,
     /**
      * Where to land the buyer after the purchase. Absent leaves them on the rail's own page.
      * The scheme is checked here; the host is checked against `cors.allowed_origins` in `Onramp`.
      */
     redirectUrl: redirectUrl.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    directionalFields(value, ctx, true);
+  });
 
 /** A validated `POST /quote` body. */
 export type QuoteRequest = z.infer<typeof quoteRequest>;
@@ -313,14 +468,18 @@ export type CreateSessionRequest = z.infer<typeof createSessionRequest>;
  * The live-capability query behind `GET /supported`: the methods + fiat min/max one corridor
  * offers for one delivered crypto. Read-only and metered by nothing upstream a buyer pays for;
  * it reads a cached view of Meld's public route catalog.
+ *
+ * `direction` is the same optional field `/quote` and `/session` carry, absent means `buy`, for
+ * the same compatibility reason: a caller written before sell existed asks nothing new and reads
+ * exactly the corridor it always read.
  */
-export const supportedQuery = z.object({ country, destinationCurrencyCode }).strict();
+export const supportedQuery = z.object({ country, destinationCurrencyCode, direction }).strict();
 
-/** The query behind `GET /supported/countries`: the region dropdown for one delivered crypto. */
-export const supportedCountriesQuery = z.object({ destinationCurrencyCode }).strict();
+/** The query behind `GET /supported/countries`: the region dropdown for one delivered crypto, buy or sell. */
+export const supportedCountriesQuery = z.object({ destinationCurrencyCode, direction }).strict();
 
-/** The query behind `GET /supported/corridors`: every cached corridor for one delivered crypto. */
-export const supportedCorridorsQuery = z.object({ destinationCurrencyCode }).strict();
+/** The query behind `GET /supported/corridors`: every cached corridor for one delivered crypto, buy or sell. */
+export const supportedCorridorsQuery = z.object({ destinationCurrencyCode, direction }).strict();
 
 
 // --- responses --------------------------------------------------------------
@@ -336,8 +495,30 @@ export const supportedCorridorsQuery = z.object({ destinationCurrencyCode }).str
 export interface QuoteResponse {
   quotes: unknown[];
   /** Echoed in canonical form, so a caller confirms what was committed rather than assuming. */
-  requested: { destinationCurrencyCode: string; sourceAmount: string; fiat: string };
+  requested: QuoteEcho;
 }
+
+/**
+ * What the caller asked to be priced, echoed back canonically.
+ *
+ * A union on the amount, mirroring `RailQuote`, and for the same reason: a buy prices a fiat
+ * amount and a sell prices a crypto one, validated by different rules and denominated in
+ * different currencies. Echoing a crypto amount under `sourceAmount` would put a ten-decimal DOT
+ * figure into the field the whole surface uses for two-decimal fiat, beside a `fiat` key naming
+ * the currency it is **not** in — a caller reading
+ * `{ sourceAmount: "12.3456789012", fiat: "GBP" }` would be reading something false in a
+ * perfectly well-formed shape. That is the confusion the direction split exists to prevent, and
+ * the echo is the last place it could re-enter.
+ *
+ * A buy's echo is byte-identical to the one this service produced before sell existed: the same
+ * three keys in the same order, with no `direction` and no `cryptoAmount`. The sell arm is
+ * purely additive, and the key that is present is the discriminator — there is no `direction`
+ * field here, because the amount already says which one it is and a second statement of it
+ * could disagree with the first.
+ */
+export type QuoteEcho =
+  | { destinationCurrencyCode: string; sourceAmount: string; fiat: string }
+  | { destinationCurrencyCode: string; cryptoAmount: string; fiat: string };
 
 /** What a caller gets back from `POST /session`: the two ids, and where to send the buyer. */
 export interface CreateSessionResponse {
@@ -368,8 +549,19 @@ export interface CreateSessionResponse {
    */
   pinned: {
     destinationCurrencyCode: string;
-    walletAddress: string;
-    sourceAmount: string;
+    /**
+     * Present on a buy, absent on a sell.
+     *
+     * An approved narrowing of a shipped contract, so it is spelled out rather than left to be
+     * inferred: a sell has no caller-supplied address, the provider issues the deposit address
+     * after the session exists, and echoing an empty string would be a claim about a destination
+     * nobody pinned. A buy's response is byte-identical to what it was.
+     */
+    walletAddress?: string;
+    /** The fiat committed, on a buy. Absent on a sell, which commits no fiat, only an estimate. */
+    sourceAmount?: string;
+    /** The crypto committed, on a sell. Absent on a buy. */
+    cryptoAmount?: string;
     fiat: string;
     /**
      * Optional only because rows written before the country column exists do not carry one. Every

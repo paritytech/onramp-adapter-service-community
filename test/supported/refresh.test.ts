@@ -25,12 +25,16 @@ import {
   refreshRoutes,
   startSupportedRefresh,
   type CatalogEntry,
+  type RefreshJob,
   type SupportedDiscovery,
 } from '../../src/supported/refresh.js';
 import type { Corridor, CountryRow, MethodLimit } from '../../src/meld/discovery.js';
 import { fakeStore } from '../fixtures.js';
 
 const CRYPTO = 'DOT_ASSETHUB';
+/** Every test in this file predates direction and is written against a buy job, unless noted. */
+const JOB: RefreshJob = { crypto: CRYPTO, direction: 'buy' };
+const SELL_JOB: RefreshJob = { crypto: CRYPTO, direction: 'sell' };
 /** Long enough that no test reaches a second tick by accident. */
 const NEVER = { catalogMs: 100_000, routesMs: 100_000 };
 
@@ -62,19 +66,19 @@ function disco(opts: {
   corridor?: (country: string) => Promise<Corridor>;
 }): SupportedDiscovery {
   return {
-    countries: async (_crypto: string) => {
+    countries: async (_crypto: string, _direction) => {
       if (opts.countriesThrows) throw new Error('meld down');
       return opts.countries ?? [{ country: 'BR', name: 'Brazil' }];
     },
-    defaultFiat: async (country: string) => (opts.fiat ? opts.fiat(country) : 'BRL'),
-    corridor: async (country: string, _fiat: string, _crypto: string) =>
+    defaultFiat: async (country: string, _direction) => (opts.fiat ? opts.fiat(country) : 'BRL'),
+    corridor: async (country: string, _fiat: string, _crypto: string, _direction) =>
       opts.corridor ? opts.corridor(country) : corridor(country),
   };
 }
 
 describe('refreshCatalog', () => {
   it('returns an empty catalog, not a failure, when Meld lists no countries at all', async () => {
-    expect(await refreshCatalog(disco({ countries: [] }), CRYPTO, () => undefined)).toEqual([]);
+    expect(await refreshCatalog(disco({ countries: [] }), JOB, () => undefined)).toEqual([]);
   });
 
   it('pairs every country with its default fiat', async () => {
@@ -86,7 +90,7 @@ describe('refreshCatalog', () => {
         ],
         fiat: async (c) => (c === 'BR' ? 'BRL' : 'USD'),
       }),
-      CRYPTO,
+      JOB,
       () => undefined,
     );
 
@@ -102,7 +106,7 @@ describe('refreshCatalog', () => {
         ],
         fiat: async (c) => (c === 'NF' ? '' : 'BRL'),
       }),
-      CRYPTO,
+      JOB,
       () => undefined,
     );
 
@@ -122,7 +126,7 @@ describe('refreshCatalog', () => {
           return 'BRL';
         },
       }),
-      CRYPTO,
+      JOB,
       log,
     );
 
@@ -133,8 +137,8 @@ describe('refreshCatalog', () => {
   it('returns undefined, not an empty catalog, when the country list fails', async () => {
     // `[]` would mean "Meld serves nowhere" and retire every corridor on one bad call.
     const log = vi.fn();
-    expect(await refreshCatalog(disco({ countriesThrows: true }), CRYPTO, log)).toBeUndefined();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('could not list countries'));
+    expect(await refreshCatalog(disco({ countriesThrows: true }), JOB, log)).toBeUndefined();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('could not list'));
   });
 
   it('stops at a country boundary once the signal is aborted, without clobbering the catalog', async () => {
@@ -142,7 +146,7 @@ describe('refreshCatalog', () => {
     const fiat = vi.fn(async () => 'BRL');
     const catalog = await refreshCatalog(
       { ...disco({ countries: [{ country: 'BR', name: 'Brazil' }] }), defaultFiat: fiat },
-      CRYPTO,
+      JOB,
       () => undefined,
       AbortSignal.abort(),
     );
@@ -165,12 +169,12 @@ describe('refreshCatalog', () => {
           throw new Error('defaults down');
         },
       }),
-      CRYPTO,
+      JOB,
       log,
     );
 
     expect(catalog).toBeUndefined();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('could not resolve any default fiat'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('could not resolve any buy default fiat'));
   });
 
   it('keeps a country\'s last-known entry when its defaults call fails, but drops it when Meld says no fiat', async () => {
@@ -190,7 +194,7 @@ describe('refreshCatalog', () => {
           return ''; // FR genuinely has no fiat now -> drop it
         },
       }),
-      CRYPTO,
+      JOB,
       log,
       undefined,
       previous,
@@ -210,24 +214,34 @@ describe('refreshCatalog', () => {
         // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
         countries: () => Promise.reject('meld exploded'),
       },
-      CRYPTO,
+      JOB,
       log,
     );
 
     expect(catalog).toBeUndefined();
     expect(log).toHaveBeenCalledWith(expect.stringContaining('meld exploded'));
   });
+
+  it('passes the job\'s direction to countries() and defaultFiat(), a sell job included', async () => {
+    const countries = vi.fn(async () => [{ country: 'GB', name: 'United Kingdom' }]);
+    const fiat = vi.fn(async () => 'GBP');
+    await refreshCatalog({ ...disco({}), countries, defaultFiat: fiat }, SELL_JOB, () => undefined);
+
+    expect(countries).toHaveBeenCalledWith(CRYPTO, 'sell');
+    expect(fiat).toHaveBeenCalledWith('GB', 'sell');
+  });
 });
 
 describe('refreshRoutes', () => {
   it('upserts every deliverable corridor and reports the count', async () => {
     const store = fakeStore();
-    const written = await refreshRoutes(disco({}), store, CRYPTO, [BRAZIL], () => undefined);
+    const written = await refreshRoutes(disco({}), store, JOB, [BRAZIL], () => undefined);
 
     expect(written).toBe(1);
-    expect(await store.readCorridors(CRYPTO)).toEqual([
+    expect(await store.readCorridors(CRYPTO, 'buy')).toEqual([
       {
         destination_currency_code: CRYPTO,
+        direction: 'buy',
         country: 'BR',
         name: 'Brazil',
         fiat: 'BRL',
@@ -237,29 +251,29 @@ describe('refreshRoutes', () => {
     ]);
   });
 
-  it('asks for routes with the catalog\'s fiat, so it never re-reads defaults', async () => {
+  it('asks for routes with the catalog\'s fiat and the job\'s direction, so it never re-reads defaults', async () => {
     // Why the fast cadence is affordable: one call per country, not two.
-    const probe = vi.fn(async (_c: string, _f: string, _k: string) => corridor('BR'));
-    await refreshRoutes({ ...disco({}), corridor: probe }, fakeStore(), CRYPTO, [BRAZIL], () => undefined);
+    const probe = vi.fn(async (_c: string, _f: string, _k: string, _d: string) => corridor('BR'));
+    await refreshRoutes({ ...disco({}), corridor: probe }, fakeStore(), JOB, [BRAZIL], () => undefined);
 
-    expect(probe).toHaveBeenCalledWith('BR', 'BRL', CRYPTO);
+    expect(probe).toHaveBeenCalledWith('BR', 'BRL', CRYPTO, 'buy');
   });
 
   it('skips an empty-methods country and keeps its last-known-good row (never deletes on empty)', async () => {
     // Empty can be a swallowed transient failure, so the row is kept.
     const store = fakeStore();
-    await store.upsertCorridor({ destination_currency_code: CRYPTO, country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [{ paymentMethodType: 'PIX', category: 'bank', min: '10', max: '5000', currency: 'BRL' }] });
+    await store.upsertCorridor({ destination_currency_code: CRYPTO, direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [{ paymentMethodType: 'PIX', category: 'bank', min: '10', max: '5000', currency: 'BRL' }] });
 
     const written = await refreshRoutes(
       disco({ corridor: async (c) => corridor(c, { methods: [] }) }),
       store,
-      CRYPTO,
+      JOB,
       [BRAZIL],
       () => undefined,
     );
 
     expect(written).toBe(0);
-    expect((await store.readCorridors(CRYPTO)).map((r) => r.country)).toEqual(['BR']);
+    expect((await store.readCorridors(CRYPTO, 'buy')).map((r) => r.country)).toEqual(['BR']);
   });
 
   it('skips a country whose probe fails and keeps the rest of the pass', async () => {
@@ -273,13 +287,13 @@ describe('refreshRoutes', () => {
         },
       }),
       store,
-      CRYPTO,
+      JOB,
       [BRAZIL, { country: 'US', name: 'United States', fiat: 'USD' }],
       log,
     );
 
     expect(written).toBe(1);
-    expect((await store.readCorridors(CRYPTO)).map((r) => r.country)).toEqual(['US']);
+    expect((await store.readCorridors(CRYPTO, 'buy')).map((r) => r.country)).toEqual(['US']);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('BR/DOT_ASSETHUB'));
   });
 
@@ -289,7 +303,7 @@ describe('refreshRoutes', () => {
     const written = await refreshRoutes(
       { ...disco({}), corridor: async (c) => probe(c) },
       store,
-      CRYPTO,
+      JOB,
       [BRAZIL],
       () => undefined,
       AbortSignal.abort(),
@@ -297,7 +311,7 @@ describe('refreshRoutes', () => {
 
     expect(written).toBe(0);
     expect(probe).not.toHaveBeenCalled();
-    expect(await store.readCorridors(CRYPTO)).toEqual([]);
+    expect(await store.readCorridors(CRYPTO, 'buy')).toEqual([]);
   });
 
   it('skips the upsert when the signal fires during a probe', async () => {
@@ -312,14 +326,36 @@ describe('refreshRoutes', () => {
         },
       }),
       store,
-      CRYPTO,
+      JOB,
       [BRAZIL],
       () => undefined,
       controller.signal,
     );
 
     expect(written).toBe(0);
-    expect(await store.readCorridors(CRYPTO)).toEqual([]);
+    expect(await store.readCorridors(CRYPTO, 'buy')).toEqual([]);
+  });
+
+  /**
+   * The migration's whole point, exercised through the refresh rather than only through the
+   * store's own suite: a sell pass for the same (crypto, country) as an existing buy row must not
+   * overwrite it.
+   */
+  it('writes a sell corridor beside a buy corridor for the same (crypto, country), not over it', async () => {
+    const store = fakeStore();
+    await refreshRoutes(disco({}), store, JOB, [BRAZIL], () => undefined);
+    await refreshRoutes(
+      { ...disco({}), corridor: async (c) => corridor(c, { methods: [method({ paymentMethodType: 'PAYOUT_TO_BANK' })] }) },
+      store,
+      SELL_JOB,
+      [BRAZIL],
+      () => undefined,
+    );
+
+    expect((await store.readCorridors(CRYPTO, 'buy'))[0]?.methods.map((m) => m.paymentMethodType)).toEqual(['PIX']);
+    expect((await store.readCorridors(CRYPTO, 'sell'))[0]?.methods.map((m) => m.paymentMethodType)).toEqual([
+      'PAYOUT_TO_BANK',
+    ]);
   });
 });
 
@@ -343,13 +379,13 @@ describe('startSupportedRefresh', () => {
         },
       },
       store,
-      [CRYPTO],
+      [JOB],
       NEVER,
       () => undefined,
     );
 
     await vi.waitFor(async () => {
-      expect((await store.readCorridors(CRYPTO)).map((r) => r.country)).toEqual(['BR']);
+      expect((await store.readCorridors(CRYPTO, 'buy')).map((r) => r.country)).toEqual(['BR']);
     });
     await refresh.stop(0);
 
@@ -359,7 +395,7 @@ describe('startSupportedRefresh', () => {
   it('gives each pass its own cadence, both unref\'d and signal-bound', async () => {
     // One sleep per pass. `ref: false` replaces `timer.unref()`, the signal ends the loop.
     sleepCalls.length = 0;
-    const refresh = startSupportedRefresh(disco({}), fakeStore(), [CRYPTO], { catalogMs: 90_000, routesMs: 30_000 }, () => undefined);
+    const refresh = startSupportedRefresh(disco({}), fakeStore(), [JOB], { catalogMs: 90_000, routesMs: 30_000 }, () => undefined);
     // The loops only sleep once the immediate boot passes have returned.
     await vi.waitFor(() => {
       expect(sleepCalls).toHaveLength(2);
@@ -389,7 +425,7 @@ describe('startSupportedRefresh', () => {
         },
       },
       fakeStore(),
-      [CRYPTO],
+      [JOB],
       { catalogMs: 10, routesMs: 100_000 },
       () => undefined,
     );
@@ -410,7 +446,7 @@ describe('startSupportedRefresh', () => {
     const refresh = startSupportedRefresh(
       { ...disco({}), countries, corridor: async (c) => probe(c) },
       fakeStore(),
-      [CRYPTO],
+      [JOB],
       { catalogMs: 100_000, routesMs: 10 },
       () => undefined,
     );
@@ -436,7 +472,7 @@ describe('startSupportedRefresh', () => {
     const refresh = startSupportedRefresh(
       { ...disco({}), countries },
       store,
-      [CRYPTO],
+      [JOB],
       { catalogMs: 10, routesMs: 10 },
       () => undefined,
     );
@@ -445,7 +481,7 @@ describe('startSupportedRefresh', () => {
     await vi.waitFor(() => {
       expect(countries.mock.calls.length).toBeGreaterThan(2);
     });
-    expect((await store.readCorridors(CRYPTO)).map((r) => r.country)).toEqual(['BR']);
+    expect((await store.readCorridors(CRYPTO, 'buy')).map((r) => r.country)).toEqual(['BR']);
 
     await refresh.stop(0);
   });
@@ -464,13 +500,13 @@ describe('startSupportedRefresh', () => {
         },
       },
       store,
-      [CRYPTO],
+      [JOB],
       { catalogMs: 100_000, routesMs: 10 },
       () => undefined,
     );
 
     await vi.waitFor(async () => {
-      expect((await store.readCorridors(CRYPTO)).map((r) => r.country)).toEqual(['BR']);
+      expect((await store.readCorridors(CRYPTO, 'buy')).map((r) => r.country)).toEqual(['BR']);
     });
     await refresh.stop(0);
   });
@@ -480,7 +516,7 @@ describe('startSupportedRefresh', () => {
     const refresh = startSupportedRefresh(
       { ...disco({ countriesThrows: true }) },
       fakeStore(),
-      [CRYPTO],
+      [JOB],
       { catalogMs: 100_000, routesMs: 10 },
       log,
     );
@@ -495,7 +531,7 @@ describe('startSupportedRefresh', () => {
     // A hung boot pass is never awaited past, so neither interval is entered at all.
     sleepCalls.length = 0;
     const countries = vi.fn(() => new Promise<CountryRow[]>(() => undefined));
-    const refresh = startSupportedRefresh({ ...disco({}), countries }, fakeStore(), [CRYPTO], { catalogMs: 10, routesMs: 10 }, () => undefined);
+    const refresh = startSupportedRefresh({ ...disco({}), countries }, fakeStore(), [JOB], { catalogMs: 10, routesMs: 10 }, () => undefined);
 
     // Ten intervals' worth of real time: every one of them must find the pass still in flight.
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -514,7 +550,7 @@ describe('startSupportedRefresh', () => {
       thrown = true;
       throw new Error('sink is down');
     });
-    const refresh = startSupportedRefresh(disco({ countriesThrows: true }), fakeStore(), [CRYPTO], NEVER, log);
+    const refresh = startSupportedRefresh(disco({ countriesThrows: true }), fakeStore(), [JOB], NEVER, log);
 
     await vi.waitFor(() => {
       expect(log).toHaveBeenCalledWith(expect.stringContaining('loop stopped: sink is down'));
@@ -541,7 +577,7 @@ describe('startSupportedRefresh', () => {
     const refresh = startSupportedRefresh(
       { ...disco({}), countries },
       fakeStore(),
-      [CRYPTO],
+      [JOB],
       { catalogMs: 5, routesMs: 100_000 },
       log,
     );
@@ -566,7 +602,7 @@ describe('startSupportedRefresh', () => {
     const refresh = startSupportedRefresh(
       { ...disco({ corridor: corridorFn }), countries },
       fakeStore(),
-      [CRYPTO],
+      [JOB],
       { catalogMs: 5, routesMs: 5 },
       () => undefined,
     );
@@ -589,7 +625,7 @@ describe('startSupportedRefresh', () => {
       await gate;
       return [{ country: 'BR', name: 'Brazil' }];
     });
-    const refresh = startSupportedRefresh({ ...disco({}), countries }, fakeStore(), [CRYPTO], NEVER, () => undefined);
+    const refresh = startSupportedRefresh({ ...disco({}), countries }, fakeStore(), [JOB], NEVER, () => undefined);
 
     // The boot pass is blocked on the gate; stop must await it rather than returning early.
     let resolved = false;
@@ -604,7 +640,7 @@ describe('startSupportedRefresh', () => {
     expect(resolved).toBe(true);
   });
 
-  it('does not start the next crypto once stopping', async () => {
+  it('does not start the next job once stopping', async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -613,7 +649,13 @@ describe('startSupportedRefresh', () => {
       if (crypto === 'A') await gate;
       return [{ country: 'BR', name: 'Brazil' }];
     });
-    const refresh = startSupportedRefresh({ ...disco({}), countries }, fakeStore(), ['A', 'B'], NEVER, () => undefined);
+    const refresh = startSupportedRefresh(
+      { ...disco({}), countries },
+      fakeStore(),
+      [{ crypto: 'A', direction: 'buy' }, { crypto: 'B', direction: 'buy' }],
+      NEVER,
+      () => undefined,
+    );
 
     // The pass is blocked mid crypto 'A'; stopping must skip crypto 'B' entirely.
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -621,15 +663,38 @@ describe('startSupportedRefresh', () => {
     release?.();
     await stopped;
 
-    expect(countries).toHaveBeenCalledWith('A');
-    expect(countries).not.toHaveBeenCalledWith('B');
+    expect(countries).toHaveBeenCalledWith('A', 'buy');
+    expect(countries).not.toHaveBeenCalledWith('B', 'buy');
+  });
+
+  /**
+   * A buy job and a sell job for the same crypto are two independent slots in the in-memory
+   * catalog map: stopping mid `sell` must not have skipped `buy`, and vice versa, the way two
+   * different cryptos already do not interfere with each other above.
+   */
+  it('treats a buy job and a sell job for the same crypto as independent, not one clobbering the other', async () => {
+    const countries = vi.fn(async (_crypto: string, direction: string) => [{ country: direction === 'buy' ? 'US' : 'GB', name: direction }]);
+    const store = fakeStore();
+    const refresh = startSupportedRefresh(
+      { ...disco({}), countries, corridor: async (c) => corridor(c) },
+      store,
+      [JOB, SELL_JOB],
+      NEVER,
+      () => undefined,
+    );
+
+    await vi.waitFor(async () => {
+      expect((await store.readCorridors(CRYPTO, 'buy')).map((r) => r.country)).toEqual(['US']);
+      expect((await store.readCorridors(CRYPTO, 'sell')).map((r) => r.country)).toEqual(['GB']);
+    });
+    await refresh.stop(0);
   });
 
   it('stop returns within the grace window even if a pass is hung on a single Meld call', async () => {
     // Stop breaks at country boundaries only; a hung in-flight call is bounded by grace.
     const countries = vi.fn(async () => [{ country: 'BR', name: 'Brazil' }]);
     const defaultFiat = vi.fn(() => new Promise<string>(() => undefined));
-    const refresh = startSupportedRefresh({ ...disco({}), countries, defaultFiat }, fakeStore(), [CRYPTO], NEVER, () => undefined);
+    const refresh = startSupportedRefresh({ ...disco({}), countries, defaultFiat }, fakeStore(), [JOB], NEVER, () => undefined);
 
     // Let the boot pass reach the hung defaults call.
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -640,7 +705,7 @@ describe('startSupportedRefresh', () => {
   });
 
   it('returns at once when no pass is in flight, without waiting out the grace window', async () => {
-    const refresh = startSupportedRefresh(disco({}), fakeStore(), [CRYPTO], NEVER, () => undefined);
+    const refresh = startSupportedRefresh(disco({}), fakeStore(), [JOB], NEVER, () => undefined);
     // Let the boot passes finish, so stop sees nothing in flight.
     await new Promise((resolve) => setTimeout(resolve, 10));
 

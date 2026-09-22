@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Refusal } from '../../src/contract.js';
-import { MeldClient, MeldHttpError } from '../../src/meld/client.js';
+import {
+  MeldClient,
+  MeldHttpError,
+  type BuyWidgetSessionParams,
+  type SellWidgetSessionParams,
+} from '../../src/meld/client.js';
 import { Secret } from '../../src/secret.js';
 
 const KEY = 'meld-test-key-not-a-real-credential';
@@ -181,6 +186,84 @@ describe('createWidgetSession', () => {
     });
   });
 
+  it('sends a sell as sessionType SELL with the legs inverted and no wallet address', async () => {
+    const fetchMock = stub(200, session);
+    await client().createWidgetSession(sellParams());
+
+    // `toEqual` on the whole body, for the reason the buy case above gives: a partial assertion
+    // lets a term stop being sent while `lockFields` goes on naming it, and a lock over a field
+    // that is not in the request locks nothing.
+    //
+    // Every difference from the buy body is deliberate and verified against api-sb.meld.io:
+    // `sessionType` is `SELL` (the enum is `BUY, SELL, TRANSFER`); `sourceCurrencyCode` is the
+    // crypto and `destinationCurrencyCode` the fiat, which the server enforces rather than
+    // merely accepts; `sourceAmount` is the crypto committed, at a precision the fiat field
+    // could not hold; and there is no `walletAddress` at all, because Meld does not require one
+    // on a SELL and issues the deposit address itself.
+    expect(JSON.parse(sentInit(fetchMock).body as string)).toEqual({
+      sessionType: 'SELL',
+      sessionData: {
+        sourceCurrencyCode: 'DOT_ASSETHUB',
+        destinationCurrencyCode: 'GBP',
+        sourceAmount: '12.3456789012',
+        countryCode: 'GB',
+        paymentMethodType: 'PAYOUT_TO_BANK',
+        lockFields: [
+          'cryptoCurrency',
+          'destinationCurrencyCode',
+          'walletAddress',
+          'sourceAmount',
+          'sourceCurrencyCode',
+          'paymentMethodType',
+        ],
+        externalCustomerId: 'idem-sell-0001',
+      },
+      externalSessionId: 'idem-sell-0001',
+    });
+  });
+
+  it('omits walletAddress from a sell entirely, rather than sending it empty', async () => {
+    // Asserted on its own as well as inside the whole-body case above, because this endpoint
+    // accepts unknown and meaningless fields with a `200` — a bad address, and an invented key,
+    // both succeed. So nothing upstream would ever complain about an empty or placeholder
+    // `walletAddress` on a sell; it would simply sit in the request looking like a pinned
+    // destination to anyone auditing it, and be read by nobody.
+    const fetchMock = stub(200, session);
+    await client().createWidgetSession(sellParams());
+
+    const body = sentBody(fetchMock) as { sessionData: Record<string, unknown> };
+    expect(body.sessionData).not.toHaveProperty('walletAddress');
+  });
+
+  it('derives sessionType from the direction rather than from any other field', async () => {
+    // The two bodies above pin `BUY` and `SELL`, which a hardcoded literal cannot both satisfy.
+    // This adds the case they do not cover: two sells differing in every value still say SELL,
+    // so the type is not being inferred from a currency code or an absent address.
+    const fetchMock = stub(200, session);
+    await client().createWidgetSession({
+      ...sellParams(),
+      cryptoCurrencyCode: 'USDC_ASSETHUB',
+      fiatCurrencyCode: 'EUR',
+      countryCode: 'DE',
+      paymentMethodType: 'SEPA',
+    });
+
+    expect(sentBody(fetchMock)).toMatchObject({ sessionType: 'SELL' });
+  });
+
+  it('sends the sell amount at full precision, which the fiat field could not carry', async () => {
+    // Eighteen fraction digits, echoed back verbatim by Meld in a live probe with no truncation,
+    // rounding or exponent. The value never becomes a `number` on this path: a double
+    // round-trip turns `0.0000001` into `1e-7` and stops being identity past 2^53, and this is
+    // the exact figure a seller will be expected to send on-chain.
+    const fetchMock = stub(200, session);
+    await client().createWidgetSession({ ...sellParams(), cryptoAmount: '0.012345678901234567' });
+
+    expect(sentBody(fetchMock)).toMatchObject({
+      sessionData: { sourceAmount: '0.012345678901234567' },
+    });
+  });
+
   it('files the reference as a top-level externalSessionId, not only inside sessionData', async () => {
     // The placement is the whole point. A live-sandbox probe found `sessionData.externalCustomerId` comes
     // back `null` on every transaction while a top-level `externalSessionId` round-trips. So a
@@ -349,13 +432,68 @@ describe('createWidgetSession', () => {
     expect(error.detail).toBe('No Valid Quote Combinations Found.');
   });
 
-  it('leaves code and detail undefined when the error body carries neither', async () => {
+  it('leaves code, detail and providerDetail undefined when the error body carries none', async () => {
     stub(400, { something: 'unrelated' });
     const error = (await client()
       .createWidgetSession(params())
       .catch((e: unknown) => e)) as MeldHttpError;
     expect(error.code).toBeUndefined();
     expect(error.detail).toBeUndefined();
+    expect(error.providerDetail).toBeUndefined();
+  });
+
+  it('reads the code from `code` when the body has no `error` key, as a limit rejection does', async () => {
+    // The real shape of a below-minimum body, verbatim from a sandbox probe. It has no `error`
+    // key at all, so reading only `error` discarded the one field that names the failure
+    // precisely, and `refusal.ts` was left matching on the wording of a sentence. This is the
+    // same in both directions; the sell case is merely where it was noticed.
+    stub(400, {
+      code: 'INVALID_AMOUNT_TOO_LOW',
+      message: '[TRANSAK] Source amount is below the minimum allowed',
+      serviceProviderDetails: {
+        message: 'Minimum sell amount should be more than or equal to 0.00011648 BTC',
+        serviceProvider: 'TRANSAK',
+      },
+    });
+    const error = (await client()
+      .createWidgetSession(sellParams())
+      .catch((e: unknown) => e)) as MeldHttpError;
+
+    expect(error.code).toBe('INVALID_AMOUNT_TOO_LOW');
+    expect(error.detail).toBe('[TRANSAK] Source amount is below the minimum allowed');
+    // The provider's own sentence is carried apart from Meld's, never merged into it. On a sell
+    // it is the only place the threshold appears, and the number in it is crypto-denominated,
+    // which is why `refusal.ts` keeps it out of the wire value. See that file.
+    expect(error.providerDetail).toBe('Minimum sell amount should be more than or equal to 0.00011648 BTC');
+  });
+
+  it('prefers `error` over `code` when a body carries both', async () => {
+    // Both spellings exist in Meld's error bodies. The precedence is pinned rather than left to
+    // whichever branch happens to run first, because the two could disagree and a silent choice
+    // between them is a refusal tag decided by accident.
+    stub(400, { error: 'NO_VALID_QUOTES', code: 'SOMETHING_ELSE', message: 'no offers' });
+    const error = (await client()
+      .quote(probe())
+      .catch((e: unknown) => e)) as MeldHttpError;
+
+    expect(error.code).toBe('NO_VALID_QUOTES');
+  });
+
+  it.each([
+    ['a null serviceProviderDetails', null],
+    ['one carrying no message', { serviceProvider: 'TRANSAK' }],
+    ['one whose message is not a string', { message: 42 }],
+    ['a scalar in its place', 'TRANSAK'],
+  ])('leaves providerDetail undefined for %s', async (_label, serviceProviderDetails) => {
+    // `typeof null === 'object'`, so the null case is the one a naive guard walks into. The
+    // others are the same rule applied to a field this service does not control the shape of.
+    stub(400, { code: 'INVALID_AMOUNT_TOO_HIGH', message: 'too high', serviceProviderDetails });
+    const error = (await client()
+      .createWidgetSession(sellParams())
+      .catch((e: unknown) => e)) as MeldHttpError;
+
+    expect(error.code).toBe('INVALID_AMOUNT_TOO_HIGH');
+    expect(error.providerDetail).toBeUndefined();
   });
 
   it.each([
@@ -398,6 +536,93 @@ describe('quote', () => {
       destinationCurrencyCode: 'USDC_ASSETHUB',
       sourceAmount: '20',
       paymentMethodType: 'CREDIT_DEBIT_CARD',
+    });
+  });
+
+  it('prices a sell on the same endpoint, with the crypto as the source leg', async () => {
+    // The whole of what makes this a sell, on Meld's side, is that `sourceCurrencyCode` holds a
+    // crypto: there is no `direction`, `category` or `sessionType` on a quote request, and
+    // sending the fiat as source instead answers "Source currency is not a valid crypto
+    // currency". So this assertion is the contract, not a formatting preference — swap the two
+    // currency fields and Meld prices a buy, or refuses.
+    const fetchMock = stub(200, { quotes: [] });
+    await client().quoteSell(sellProbe());
+
+    expect(sentBody(fetchMock)).toEqual({
+      countryCode: 'GB',
+      sourceCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'GBP',
+      // `sourceAmount`, still mandatory, and crypto-denominated: a sell quote answers "what does
+      // this much crypto fetch", never "how much must I sell to receive 500".
+      sourceAmount: '12.3456789012',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+  });
+
+  it('POSTs a sell quote to the same path as a buy', async () => {
+    const fetchMock = stub(200, { quotes: [] });
+    await client().quoteSell(sellProbe());
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/payments/crypto/quote');
+    expect(sentMethod(fetchMock)).toBe('POST');
+  });
+
+  it('forwards a sell offer with its inverted fee shape untouched', async () => {
+    // A real sandbox sell quote. The fees are FIAT and come off the DESTINATION
+    // (631.88 - 12.58 = 619.30, from transactionFee 6.26 + partnerFee 6.32), exactly inverted
+    // from a buy where they come off the source. `sourceAmountWithoutFees` is null here and
+    // `destinationAmountWithoutFees` populated, also inverted, and `exchangeRate` is
+    // fiat-per-crypto rather than destination-per-source.
+    //
+    // Nothing in this client converts any of that, and this test exists to say that the
+    // forwarding is whole: a consumer working the breakdown backwards needs every component,
+    // and dropping one would move the error into its arithmetic rather than showing up here.
+    stubRaw(
+      200,
+      JSON.stringify({
+        quotes: [
+          {
+            transactionType: 'CRYPTO_SELL',
+            serviceProvider: 'TRANSAK',
+            sourceAmount: 0.01,
+            sourceAmountWithoutFees: null,
+            sourceCurrencyCode: 'BTC',
+            destinationAmount: 619.3,
+            destinationAmountWithoutFees: 631.88,
+            destinationCurrencyCode: 'GBP',
+            exchangeRate: 63188,
+            totalFee: 12.58,
+            transactionFee: 6.26,
+            partnerFee: 6.32,
+            networkFee: null,
+            customerScore: null,
+            paymentMethodType: 'PAYOUT_TO_BANK',
+          },
+        ],
+      }),
+    );
+
+    const [offer] = await client().quoteSell(sellProbe());
+
+    // Exact digits, as strings, because the numbers arrived as bare JSON numbers and a double
+    // round-trip is not identity: `619.3` must not become the fiat the seller is quoted by way
+    // of a float.
+    expect(offer).toEqual({
+      transactionType: 'CRYPTO_SELL',
+      serviceProvider: 'TRANSAK',
+      sourceAmount: '0.01',
+      sourceAmountWithoutFees: null,
+      sourceCurrencyCode: 'BTC',
+      destinationAmount: '619.3',
+      destinationAmountWithoutFees: '631.88',
+      destinationCurrencyCode: 'GBP',
+      exchangeRate: '63188',
+      totalFee: '12.58',
+      transactionFee: '6.26',
+      partnerFee: '6.32',
+      networkFee: null,
+      customerScore: null,
+      paymentMethodType: 'PAYOUT_TO_BANK',
     });
   });
 
@@ -534,6 +759,118 @@ describe('quote', () => {
   });
 });
 
+describe('the guard on the legs, before anything is sent', () => {
+  /**
+   * The finding this suite exists for: `POST /payments/crypto/quote` has **no direction field**.
+   * Meld infers the direction from whether the source currency is a crypto. So a sell whose legs
+   * were crossed the wrong way is not a malformed request upstream — it is a valid buy, which
+   * Meld prices and answers `200`. The wrong price comes back indistinguishable from the right
+   * one, and it is the price a seller decides on.
+   *
+   * Nothing downstream can catch that, so the boundary has to. Every case below asserts that
+   * `fetch` was never reached: a guard that fires after the request has gone is not a guard.
+   */
+  const neverSent = (fetchMock: ReturnType<typeof stub>) => {
+    expect(fetchMock).not.toHaveBeenCalled();
+  };
+
+  it('refuses a sell whose legs are crossed the wrong way, without asking Meld', async () => {
+    // The exact regression: fiat in the crypto position and crypto in the fiat position. Meld
+    // would answer this `200` with a buy's price.
+    const fetchMock = stub(200, { quotes: [] });
+
+    await expect(
+      client().quoteSell({ ...sellProbe(), cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'DOT_ASSETHUB' }),
+    ).rejects.toThrow(/legs are crossed/);
+    neverSent(fetchMock);
+  });
+
+  it('refuses a buy whose source is a crypto, which Meld would read as a sell', async () => {
+    // The mirror, and it is the same class of silent success in the other direction: Meld would
+    // read a crypto source as a sell and price one.
+    const fetchMock = stub(200, { quotes: [] });
+
+    await expect(
+      client().quote({ ...probe(), sourceCurrencyCode: 'DOT_ASSETHUB', destinationCurrencyCode: 'USD' }),
+    ).rejects.toThrow(/legs are crossed/);
+    neverSent(fetchMock);
+  });
+
+  it.each([
+    ['both crypto', { cryptoCurrencyCode: 'DOT_ASSETHUB', fiatCurrencyCode: 'USDC_ASSETHUB' }],
+    ['both fiat', { cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'USD' }],
+  ])('refuses a sell naming %s, which the source check alone would not see', async (_label, legs) => {
+    // The "both crypto" case passes the source test and is still unsendable. The "both fiat"
+    // case fails the source test first; it is here so the pair documents that exactly one leg
+    // is crypto in either direction, rather than leaving that rule stated only in prose.
+    const fetchMock = stub(200, { quotes: [] });
+
+    await expect(client().quoteSell({ ...sellProbe(), ...legs })).rejects.toThrow(
+      /legs are crossed|same kind of currency/,
+    );
+    neverSent(fetchMock);
+  });
+
+  it('refuses a buy naming two cryptos, which is a dropped leg rather than a crossed one', async () => {
+    const fetchMock = stub(200, { quotes: [] });
+
+    await expect(
+      client().quote({ ...probe(), sourceCurrencyCode: 'DOT_ASSETHUB', destinationCurrencyCode: 'USDC_ASSETHUB' }),
+    ).rejects.toThrow(/legs are crossed/);
+    neverSent(fetchMock);
+  });
+
+  it('refuses a buy naming two fiats, so a destination that lost its asset code cannot be sent', async () => {
+    // `sourceCurrencyCode` is fiat, which is right for a buy, so the source check passes and
+    // only the both-the-same check catches it. This is what a destination code silently
+    // becoming the fiat code looks like on the wire.
+    const fetchMock = stub(200, { quotes: [] });
+
+    await expect(
+      client().quote({ ...probe(), destinationCurrencyCode: 'USD' }),
+    ).rejects.toThrow(/same kind of currency/);
+    neverSent(fetchMock);
+  });
+
+  it.each(['buy', 'sell'] as const)('guards the session call too, on a %s', async (direction) => {
+    // The session endpoint does check server-side, so a crossed sell fails at Meld either way.
+    // Guarded anyway: the failure then names this service's own mapping instead of arriving as
+    // a currency complaint about the caller's request, and one rule in one place cannot drift
+    // into applying to only one of the two calls.
+    const fetchMock = stub(200, { id: 'meld-1', serviceProviderWidgetUrl: 'https://widget.example/s/1' });
+
+    const crossed =
+      direction === 'sell'
+        ? client().createWidgetSession({ ...sellParams(), cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'DOT_ASSETHUB' })
+        : client().createWidgetSession({ ...params(), sourceCurrency: 'DOT_ASSETHUB', destinationCode: 'USD' });
+
+    await expect(crossed).rejects.toThrow(/legs are crossed/);
+    neverSent(fetchMock);
+  });
+
+  it('is a fault and not a refusal, because no caller can cause it', async () => {
+    // Both the direction and the legs are chosen by this service from an already-validated
+    // request, so this can only fire on our own mapping being wrong. A `Refusal` would surface
+    // it as a `400` telling a caller to fix something they did not send; a plain `Error` is the
+    // `500` it actually is. Same judgement `onramp.ts`'s `committedTerm` makes.
+    stub(200, { quotes: [] });
+
+    const error = await client()
+      .quoteSell({ ...sellProbe(), cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'DOT_ASSETHUB' })
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(Refusal);
+  });
+
+  it('lets a correctly-crossed sell through, so the guard is not simply refusing everything', async () => {
+    const fetchMock = stub(200, { quotes: [] });
+
+    await expect(client().quoteSell(sellProbe())).resolves.toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('the outbound request line', () => {
   /**
    * The URL and the verb, which every other test in this file took for granted.
@@ -628,6 +965,34 @@ describe('transaction', () => {
 
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('a%2Fb%20%3Fx');
   });
+
+  it('reads the off-ramp deposit address off cryptoDetails, when Meld discloses one', async () => {
+    // The one field `meld/rail.ts`'s `depositFrom` reads. Confirmed here at the schema boundary,
+    // not only through a stubbed client in `rail.test.ts`: this is what actually proves
+    // `transactionResponse` parses the field rather than dropping it under `.loose()`.
+    stub(200, {
+      id: 'tx-1',
+      status: 'PENDING',
+      cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress', walletAddress: null },
+    });
+
+    const txn = await client().transaction('tx-1');
+    expect(txn.cryptoDetails?.offrampDestinationWalletAddress).toBe('1DepositAddress');
+  });
+
+  it('reads a null deposit address as not yet disclosed, which is every buy this account has produced', async () => {
+    stub(200, { id: 'tx-1', status: 'SETTLED', cryptoDetails: { offrampDestinationWalletAddress: null } });
+
+    const txn = await client().transaction('tx-1');
+    expect(txn.cryptoDetails?.offrampDestinationWalletAddress).toBeNull();
+  });
+
+  it('tolerates a transaction record with no cryptoDetails at all', async () => {
+    stub(200, { id: 'tx-1', status: 'PENDING' });
+
+    const txn = await client().transaction('tx-1');
+    expect(txn.cryptoDetails).toBeUndefined();
+  });
 });
 
 describe('verifyCredentials', () => {
@@ -674,7 +1039,8 @@ describe('verifyCredentials', () => {
   });
 });
 
-const params = () => ({
+const params = (): BuyWidgetSessionParams => ({
+  direction: 'buy',
   destinationCode: 'USDC_ASSETHUB',
   walletAddress: '1abc',
   sourceAmount: '25.00',
@@ -684,12 +1050,39 @@ const params = () => ({
   clientReference: 'idem-0000-0001',
 });
 
+/**
+ * The sell counterpart, named by leg rather than by Meld's field.
+ *
+ * The same corridor read the other way round: `DOT_ASSETHUB` is what is sold and `GBP` is what
+ * comes back. The amount carries ten fraction digits, which is DOT's own precision and more than
+ * the fiat validator can express, so a test that sees it survive to the wire has seen something
+ * `sourceAmount` could not have carried.
+ */
+const sellParams = (): SellWidgetSessionParams => ({
+  direction: 'sell',
+  cryptoCurrencyCode: 'DOT_ASSETHUB',
+  fiatCurrencyCode: 'GBP',
+  cryptoAmount: '12.3456789012',
+  countryCode: 'GB',
+  paymentMethodType: 'PAYOUT_TO_BANK',
+  clientReference: 'idem-sell-0001',
+});
+
 const probe = () => ({
   countryCode: 'US',
   sourceCurrencyCode: 'USD',
   destinationCurrencyCode: 'USDC_ASSETHUB',
   sourceAmount: '20',
   paymentMethodType: 'CREDIT_DEBIT_CARD',
+});
+
+/** The sell counterpart of `probe`: crypto in, fiat out, priced from the crypto. */
+const sellProbe = () => ({
+  countryCode: 'GB',
+  cryptoCurrencyCode: 'DOT_ASSETHUB',
+  fiatCurrencyCode: 'GBP',
+  cryptoAmount: '12.3456789012',
+  paymentMethodType: 'PAYOUT_TO_BANK',
 });
 
 describe('transactionByReference', () => {
