@@ -194,6 +194,16 @@ describe('toFundingRequestDto: the deposit disclosure', () => {
     expect(dto.deposit).toBeUndefined();
   });
 
+  it('withholds an address, amount and currency with no timestamp to say when they were observed', () => {
+    // `observedAt` is what lets a client judge whether a disclosure is fresh, so stamping "now"
+    // over a missing one would fabricate the one fact that question depends on -- a wrong-but-
+    // plausible timestamp is worse than no disclosure, because it reads as current. Unreachable
+    // today (`mergeAdvance` writes it in the same merge as the address), but the gate treats it
+    // exactly like a missing amount or currency rather than falling back to a clock, defensively.
+    const dto = toFundingRequestDto({ ...disclosed, deposit_observed_at: undefined }, BEFORE);
+    expect(dto.deposit).toBeUndefined();
+  });
+
   it('withholds everything when nothing has been disclosed yet', () => {
     const dto = toFundingRequestDto(sellRecord({ status: 'transaction_seen' }), BEFORE);
     expect(dto).not.toHaveProperty('deposit');
@@ -204,11 +214,4 @@ describe('toFundingRequestDto: the deposit disclosure', () => {
     expect(dto).not.toHaveProperty('deposit');
   });
 
-  it('falls back the observed timestamp to the caller\'s own clock if the column is ever absent', () => {
-    // Defensive only: `mergeAdvance` writes `deposit_observed_at` in the same merge as the
-    // address, so production never reaches this branch. A DTO builder should not assert a
-    // database invariant it did not write.
-    const dto = toFundingRequestDto({ ...disclosed, deposit_observed_at: undefined }, BEFORE);
-    expect(dto.deposit?.observedAt).toBe(BEFORE);
-  });
 });

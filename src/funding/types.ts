@@ -302,7 +302,7 @@ export function toFundingRequestDto(record: FundingRecord, now: number): Funding
     ...(live && record.hosted_widget_url !== undefined ? { widgetUrl: record.hosted_widget_url } : {}),
     ...(live && record.expires_at !== undefined ? { expiresAt: record.expires_at } : {}),
     ...(record.cancelled_at === undefined ? {} : { cancelledAt: record.cancelled_at }),
-    ...(live ? depositDisclosure(record, now) : {}),
+    ...(live ? depositDisclosure(record) : {}),
     createdAt: record.created_at,
     updatedAt: record.updated_at,
     history: record.status_history,
@@ -313,29 +313,40 @@ export function toFundingRequestDto(record: FundingRecord, now: number): Funding
  * The `{ deposit }` wrapper for `toFundingRequestDto`, or `{}` when there is nothing safe to show.
  *
  * Gated on the caller passing `live` first (see `toFundingRequestDto`), and, independently, on
- * `address`, `amount` and `currency` all being present. The three are read together deliberately:
- * `mergeAdvance` can, in principle, leave a row with an address and no amount yet (a provider that
- * discloses one before the other, which is unverified either way -- see `funding/merge.ts`), and a
- * half-disclosure is worse than none. An address with no amount looks like a destination with
- * nothing wrong with it; a seller cannot tell "not disclosed" from "disclosed, but this service
- * dropped a field" from the wire alone, so neither is sent until all three exist.
+ * `address`, `amount`, `currency` **and `observedAt`** all being present. The four are read
+ * together deliberately: `mergeAdvance` can, in principle, leave a row with an address and no
+ * amount yet (a provider that discloses one before the other, which is unverified either way --
+ * see `funding/merge.ts`), and a half-disclosure is worse than none. An address with no amount
+ * looks like a destination with nothing wrong with it; a seller cannot tell "not disclosed" from
+ * "disclosed, but this service dropped a field" from the wire alone, so none of the four is sent
+ * until all four exist.
+ *
+ * `observedAt` is in that gate, not defaulted, for the same reason the other three are not
+ * defaulted: it exists so a client can judge whether a disclosure is fresh, and stamping a
+ * disclosure "observed now" when this service does not actually know when it was observed would
+ * be fabricating the one fact that question depends on -- worse than omitting the disclosure
+ * entirely, because a wrong-but-plausible timestamp reads as current. `deposit_observed_at` is
+ * written in the same merge as `deposit_address` (see `mergeAdvance`), so in practice it is never
+ * absent here under the single merge writer this service has today; this is defence in depth
+ * against a future one that is not, not a guard against something reachable now, and it is why
+ * the missing case withholds rather than falls back to `Date.now()` or a passed-in clock -- either
+ * would silently reintroduce the fabrication this gate exists to refuse.
  */
-function depositDisclosure(record: FundingRecord, now: number): { deposit?: FundingRequestDeposit } {
-  const { deposit_address: address, deposit_amount: amount, deposit_currency: currency } = record;
-  if (address === undefined || amount === undefined || currency === undefined) return {};
+function depositDisclosure(record: FundingRecord): { deposit?: FundingRequestDeposit } {
+  const {
+    deposit_address: address,
+    deposit_amount: amount,
+    deposit_currency: currency,
+    deposit_observed_at: observedAt,
+  } = record;
+  if (address === undefined || amount === undefined || currency === undefined || observedAt === undefined) return {};
   return {
     deposit: {
       address,
       amount,
       currency,
       ...(record.deposit_memo === undefined ? {} : { memo: record.deposit_memo }),
-      // `deposit_observed_at` is written in the same merge as `deposit_address` (see
-      // `mergeAdvance`), so in practice it is never absent here; still guarded rather than
-      // asserted, because a DTO builder asserting a database's internal consistency is the wrong
-      // place to discover it is wrong. `now` is the caller's own clock (see `toFundingRequestDto`),
-      // never `Date.now()`, so this stays exactly as pure and as testable as the function it falls
-      // back inside of.
-      observedAt: record.deposit_observed_at ?? now,
+      observedAt,
     },
   };
 }
