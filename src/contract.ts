@@ -134,9 +134,11 @@ export const noQuotesAvailable = (detail: string) =>
  * path that refused with `NoQuotesAvailable` or `CURRENCY_UNSUPPORTED` would send a caller round
  * a loop changing the amount, the method and the region, none of which is the problem.
  *
- * A factory rather than an inline `reject`, because both rails raise it today (Meld while its
- * sell path is unbuilt, Chainflip permanently, having no fiat leg at all) and two copies of one
- * user-facing sentence is one edit away from two answers for one condition.
+ * A factory rather than an inline `reject`. Only Chainflip raises it now — permanently, having
+ * no fiat leg to pay a seller from — since the Meld rail serves a sell. It stays a factory
+ * because the sentence is user-facing and a second rail refusing a direction is exactly the
+ * situation in which a second copy of it would drift, which is what happened while both rails
+ * raised it.
  *
  * Not retryable: the remedy is a different rail or a different direction, never the same request
  * again.
@@ -489,8 +491,30 @@ export const supportedCorridorsQuery = z.object({ destinationCurrencyCode }).str
 export interface QuoteResponse {
   quotes: unknown[];
   /** Echoed in canonical form, so a caller confirms what was committed rather than assuming. */
-  requested: { destinationCurrencyCode: string; sourceAmount: string; fiat: string };
+  requested: QuoteEcho;
 }
+
+/**
+ * What the caller asked to be priced, echoed back canonically.
+ *
+ * A union on the amount, mirroring `RailQuote`, and for the same reason: a buy prices a fiat
+ * amount and a sell prices a crypto one, validated by different rules and denominated in
+ * different currencies. Echoing a crypto amount under `sourceAmount` would put a ten-decimal DOT
+ * figure into the field the whole surface uses for two-decimal fiat, beside a `fiat` key naming
+ * the currency it is **not** in — a caller reading
+ * `{ sourceAmount: "12.3456789012", fiat: "GBP" }` would be reading something false in a
+ * perfectly well-formed shape. That is the confusion the direction split exists to prevent, and
+ * the echo is the last place it could re-enter.
+ *
+ * A buy's echo is byte-identical to the one this service produced before sell existed: the same
+ * three keys in the same order, with no `direction` and no `cryptoAmount`. The sell arm is
+ * purely additive, and the key that is present is the discriminator — there is no `direction`
+ * field here, because the amount already says which one it is and a second statement of it
+ * could disagree with the first.
+ */
+export type QuoteEcho =
+  | { destinationCurrencyCode: string; sourceAmount: string; fiat: string }
+  | { destinationCurrencyCode: string; cryptoAmount: string; fiat: string };
 
 /** What a caller gets back from `POST /session`: the two ids, and where to send the buyer. */
 export interface CreateSessionResponse {

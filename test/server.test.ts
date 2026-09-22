@@ -1865,6 +1865,127 @@ describe('the threshold pulled out of a Meld limit message', () => {
   });
 });
 
+describe("Meld's own limit code, which the service used to discard", () => {
+  /**
+   * The body shape a limit rejection actually has, verbatim from a sandbox probe. It carries no
+   * `error` key, only `code`, and the threshold lives in the sub-provider's own sentence rather
+   * than in Meld's.
+   */
+  const limit = (code: string, message: string, provider?: string) =>
+    new MeldHttpError(400, code, message, provider);
+
+  it.each([
+    ['INVALID_AMOUNT_TOO_LOW', 'BelowMinimum'],
+    ['INVALID_AMOUNT_TOO_HIGH', 'AboveMaximum'],
+  ])('resolves %s from the code, not from the wording of the message', async (code, tag) => {
+    // The message here says nothing a phrase match could use — no "below the minimum", no
+    // "above the maximum". Before the code was read, this fell through to
+    // `Other{PROVIDER_REJECTED}`, which tells a seller the provider declined rather than that
+    // their amount was out of bounds, and that is one provider rewrite away from being what
+    // every real limit rejection produced.
+    const app = await serve(() => Promise.reject(limit(code, '[TRANSAK] Amount not allowed')));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/session',
+      headers: DEV_HEADERS,
+      payload: createRequest(),
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: { tag }, request_id: expect.any(String) });
+  });
+
+  it('keeps the fiat threshold when the code and the buy wording arrive together', async () => {
+    // Reading the code must not cost the number a buy does carry. Both signals are present on a
+    // buy limit rejection, and the value is still pulled out of the top-level message.
+    const app = await serve(() =>
+      Promise.reject(
+        limit('INVALID_AMOUNT_TOO_LOW', 'Source amount is below the minimum allowed, which is 5.00 USD for TRANSAK'),
+      ),
+    );
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/session',
+      headers: DEV_HEADERS,
+      payload: createRequest(),
+    });
+
+    expect(response.json<{ error: unknown }>().error).toEqual({
+      tag: 'BelowMinimum',
+      value: { amount: '5.00', currency: 'USD' },
+    });
+  });
+
+  it("does not put a sell's crypto threshold on the wire, where it would be read as fiat", async () => {
+    // The sell shape. The only number anywhere in this rejection is `0.00011648 BTC`, in the
+    // provider's sentence, and `FundingFailure`'s threshold is `{ amount, currency }` with
+    // nowhere to say which kind of currency — every other producer of it fills it with fiat.
+    // Emitting it here would make a client render "the minimum is 0.00011648" in units it
+    // cannot know it is reading, beside a `fiat` echo naming something else. So the tag travels
+    // and the number does not: "too low" is a true thing to say, and a wrongly-denominated
+    // threshold is a specific false one.
+    const app = await serve(() =>
+      Promise.reject(
+        limit(
+          'INVALID_AMOUNT_TOO_LOW',
+          '[TRANSAK] Source amount is below the minimum allowed',
+          'Minimum sell amount should be more than or equal to 0.00011648 BTC',
+        ),
+      ),
+    );
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/session',
+      headers: DEV_HEADERS,
+      payload: createRequest(),
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: { tag: 'BelowMinimum' }, request_id: expect.any(String) });
+    // Not merely "no `value`": the digits must not reach the caller under any key at all.
+    expect(response.body).not.toContain('0.00011648');
+    expect(response.body).not.toContain('BTC');
+  });
+
+  it('still resolves a limit rejection that carries a message and no code', async () => {
+    // The phrase match stays underneath the code, rather than being replaced by it. A body with
+    // the wording and no code is a shape this service has assumed for long enough that dropping
+    // its handler on the strength of one account's probe would trade a verified behaviour for a
+    // plausible one.
+    const app = await serve(() =>
+      Promise.reject(new MeldHttpError(400, undefined, 'Source amount is above the maximum allowed')),
+    );
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/session',
+      headers: DEV_HEADERS,
+      payload: createRequest(),
+    });
+
+    expect(response.json<{ error: unknown }>().error).toEqual({ tag: 'AboveMaximum' });
+  });
+
+  it('leaves an unrelated code to the phrase match rather than mapping it to a limit', async () => {
+    // `LIMIT_TAG` is a lookup on a plain object, so a code that is not in it must miss. Pinned
+    // because a prototype key (`constructor`, `toString`) is a code-shaped string that a naive
+    // lookup would resolve to a function and treat as a tag.
+    const app = await serve(() => Promise.reject(new MeldHttpError(400, 'constructor', 'unrelated')));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/session',
+      headers: DEV_HEADERS,
+      payload: createRequest(),
+    });
+
+    expect(response.json<{ error: { value: { code: string } } }>().error.value.code).toBe('PROVIDER_REJECTED');
+  });
+});
+
 describe('the discovery routes', () => {
   it('GET /supported returns the corridor for the (country, fiat, crypto)', async () => {
     const built = await serve();

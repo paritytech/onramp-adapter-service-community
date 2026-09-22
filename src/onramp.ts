@@ -253,9 +253,16 @@ export class Onramp {
     // And only a buy, which is the second half of the same argument. A sell commits crypto while
     // the corridor's published limits are fiat (observed: an off-ramp route's `limits.currencyCode`
     // is the payout fiat), so running this gate on a sell would compare a DOT amount against a GBP
-    // bound in fiat minor units and refuse or admit by a number that means nothing. Every rail
-    // refuses a sell outright in this build, so the gate is unreachable either way; the condition
-    // is here so it cannot become reachable by accident when one of them stops refusing.
+    // bound in fiat minor units and refuse or admit by a number that means nothing.
+    //
+    // That condition used to be belt-and-braces over a rail that refused every sell anyway. It
+    // is load-bearing now: Meld serves a sell, so a sell really does reach this line and really
+    // does skip the gate. Skipping is the correct behaviour and not a hole — there is no
+    // crypto-denominated bound in the catalog or the config to apply, so the alternatives were a
+    // meaningless comparison or none. The bound that does exist is the provider's own, enforced
+    // at quote time, and it comes back as `INVALID_AMOUNT_TOO_LOW`/`_TOO_HIGH` -> the same
+    // `BelowMinimum`/`AboveMaximum` tags a buy would be refused with locally. Two limit systems
+    // in two currencies, and only the fiat one is ours; `docs/api.md` says so to callers.
     if (rail.provider === 'meld' && direction === 'buy') {
       await this.limitFor(
         destination.code,
@@ -282,23 +289,26 @@ export class Onramp {
         : ({ ...legs, direction, sourceAmount: committedTerm(request.sourceAmount, 'sourceAmount', direction) } as const);
     const quotes = await rail.quote(priced);
 
-    // Only a buy gets this far: every rail in this build refuses a sell quote outright
-    // (`DIRECTION_UNSUPPORTED`), so there is no sell that reaches the echo. Asserted rather than
-    // assumed, because the echo's `sourceAmount` is the fiat the caller committed and a sell has
-    // committed none; quietly echoing a crypto amount under that name would be the unit confusion
-    // this whole direction split exists to avoid. When a rail does serve a sell, this grows a
-    // `cryptoAmount` arm and the wire contract grows with it, deliberately and not in advance.
-    if (priced.direction === 'sell') {
-      throw new Error('a sell quote returned from a rail that is supposed to refuse every sell');
-    }
-
     // The echo is built here rather than round-tripped through the rail: every value in it is
     // already in hand, so asking the rail to hand back its own arguments bought nothing.
+    //
+    // The amount is echoed under the name of the term the caller actually committed, and it is
+    // read off `priced` rather than `request` so that the narrowing which chose the term and the
+    // narrowing which names it are the same one. A sell's is crypto and a buy's is fiat; putting
+    // either under the other's key, beside a `fiat` code that describes only one of them, is the
+    // unit confusion this whole direction split exists to avoid. `QuoteEcho` has the rest.
+    //
+    // This replaced a deliberate throw. Until this release every rail refused every sell, so
+    // this arm was unreachable, and it said so out loud rather than quietly echoing a crypto
+    // amount as `sourceAmount` the day one of them stopped refusing. Meld serves a sell now, and
+    // the wire contract grew the shape to carry it.
     return {
       quotes,
       requested: {
         destinationCurrencyCode: destination.code,
-        sourceAmount: priced.sourceAmount,
+        ...(priced.direction === 'sell'
+          ? { cryptoAmount: priced.cryptoAmount }
+          : { sourceAmount: priced.sourceAmount }),
         fiat: request.fiat.toUpperCase(),
       },
     };
@@ -1058,8 +1068,13 @@ export class Onramp {
     //
     // And only a buy, for the reason spelled out in `quote`: the corridor's limits are fiat while
     // a sell commits crypto, so this comparison would be DOT against GBP in fiat minor units.
-    // Every rail refuses a sell before a session exists, so no sell reaches a gate at all in this
-    // build; the direction condition is what keeps that true if one stops refusing.
+    //
+    // A sell now reaches this line and skips the gate, where before Meld refused it earlier. So
+    // a sell's amount meets exactly two checks locally: the schema's shape, and its "greater
+    // than zero" refinement. `contract.ts` says at `cryptoAmount` that that refinement is the
+    // only thing between a caller and a zero-amount sale, and this is the line that makes it
+    // true. The corridor-derived floor and ceiling a buy gets have no crypto counterpart to
+    // apply; the provider applies its own at session time and refuses with the same two tags.
     if (rail.provider === 'meld' && direction === 'buy') {
       const limit = await this.limitFor(
         destination.code,

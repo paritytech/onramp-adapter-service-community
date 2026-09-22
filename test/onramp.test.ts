@@ -981,6 +981,34 @@ describe('Onramp.create', () => {
     expect(row?.client_reference).toBe('idem-0000-0001');
   });
 
+  it("carries the sub-provider's own sentence into the operator detail, and only there", () => {
+    // The threshold on a sell exists in exactly one place: the provider's prose, crypto-
+    // denominated. It stays off the wire (see `server.test.ts`), which leaves the operator log
+    // as the only place it can usefully appear — and `Refusal.message` is never serialized to a
+    // client, so it is the right place for a number that cannot be safely typed onto the wire.
+    // Without this the figure is simply lost and nobody can tell a seller what to send.
+    const refusal = railRefusal(
+      new MeldHttpError(
+        400,
+        'INVALID_AMOUNT_TOO_LOW',
+        '[TRANSAK] Source amount is below the minimum allowed',
+        'Minimum sell amount should be more than or equal to 0.00011648 BTC',
+      ),
+    );
+
+    expect(refusal.failure).toEqual({ tag: 'BelowMinimum' });
+    expect(refusal.message).toContain('[TRANSAK] Source amount is below the minimum allowed');
+    expect(refusal.message).toContain('0.00011648 BTC');
+  });
+
+  it('says only what Meld said when there is no sub-provider sentence', () => {
+    // Both halves, or the one that exists: an absent provider detail must not leave a trailing
+    // "(provider: undefined)" in an operator's log line.
+    const refusal = railRefusal(new MeldHttpError(400, 'INVALID_AMOUNT_TOO_HIGH', 'above the maximum allowed'));
+
+    expect(refusal.message).toBe('above the maximum allowed');
+  });
+
   it.each([
     // The money-losing direction, and the one that was undefended. Mutating the `definitive` test
     // to `? true` (so a 5xx or a timeout counts as "the rail read this and said no") survived all
@@ -1088,7 +1116,9 @@ describe('Onramp.create', () => {
   it('adds the direction and the crypto amount to that line, and only on a sell', async () => {
     // The other half of the same claim: the new keys exist, they appear only where they mean
     // something, and the fiat terms a sell never committed are absent rather than empty.
-    const meld = new FakeMeld(() => directionUnsupported('the sell path is not built on this rail yet'));
+    // Refusing, so the line is emitted on a path that does not need a rail answer. The refusal
+    // is Chainflip's, which is still the permanent one; Meld serves a sell now.
+    const meld = new FakeMeld(() => directionUnsupported('no fiat leg, so there is no fiat payout to sell into'));
     const audit = new FakeAudit();
     const funding = fakeStore();
     let n = 0;
@@ -1947,7 +1977,8 @@ describe('a sell request', () => {
     // The configured limits cover USDC_ASSETHUB in USD and nothing else, so a buy of
     // DOT_ASSETHUB is `RegionUnavailable` before any rail call. A sell of the same corridor must
     // not be refused by that gate: the bound is fiat, the committed amount is crypto, and the
-    // comparison is minor units of two different things. The rail is what refuses a sell.
+    // comparison is minor units of two different things. The sell's bound is the provider's,
+    // applied upstream at session time and returned as the same BelowMinimum/AboveMaximum tags.
     const meld = new FakeMeld();
     const { service } = build(meld);
 
@@ -2007,10 +2038,12 @@ describe('a sell request', () => {
   });
 
   it('records the rail refusal as a refused row and frees the key, exactly as a buy refusal does', async () => {
-    // What a caller actually meets today on both rails: the direction is understood, routed, and
-    // declined by the rail with a reason of its own. The row says so and the key is released, so
-    // a retry once a rail serves sells is not stuck replaying a dead row for ever.
-    const meld = new FakeMeld(() => directionUnsupported('the sell path is not built on this rail yet'));
+    // A rail that does not serve the direction: Chainflip, permanently, having no fiat leg to
+    // pay a seller from. Meld serves a sell now, so this is no longer what every sell meets —
+    // but the handling it exercises is the general one, and it is the path a caller naming
+    // `rail: "chainflip"` still takes. The row says so and the key is released, so a retry on a
+    // rail that does serve the direction is not stuck replaying a dead row for ever.
+    const meld = new FakeMeld(() => directionUnsupported('no fiat leg, so there is no fiat payout to sell into'));
     const { service, funding, audit } = build(meld);
 
     const failure = await failureOf(() => service.createSession(SUBJECT, sell(), REQUEST_ID));
@@ -2026,25 +2059,80 @@ describe('a sell request', () => {
     expect(audit.events.find((e) => e.event === 'session.rail_refused')).toMatchObject({ direction: 'sell' });
   });
 
-  it('treats a quote that a rail answered for a sell as a fault, not a response', async () => {
-    // Every rail refuses a sell quote in this build, so returning offers for one means the rail
-    // and this mapping disagree. The echo below it names `sourceAmount`, the fiat the caller
-    // committed, and a sell committed none: quietly echoing a crypto amount under that name is
-    // exactly the unit confusion the direction split exists to prevent. So it throws rather than
-    // inventing an echo, and the wire contract grows a sell arm when a rail actually serves one.
+  it('echoes the crypto a sell committed, under its own name and never under sourceAmount', async () => {
+    // This replaced a deliberate throw. While every rail refused every sell, returning offers
+    // for one meant the rail and this mapping disagreed, and the code said so rather than
+    // quietly echoing a crypto figure under `sourceAmount`. Meld serves a sell now, so the arm
+    // is real — and the thing the throw was defending is what this asserts instead.
+    //
+    // `sourceAmount` must be **absent**, not empty. `{ sourceAmount: "12.3456789012",
+    // fiat: "GBP" }` is a well-formed shape saying something false: a ten-decimal DOT figure in
+    // the field the rest of the surface uses for two-decimal fiat, beside a currency code
+    // naming what it is not denominated in.
     const meld = new FakeMeld();
     const { service } = build(meld);
 
-    await expect(
-      service.quote({
-        direction: 'sell',
-        destinationCurrencyCode: 'DOT_ASSETHUB',
-        cryptoAmount: '12.3456789012',
-        fiat: 'GBP',
-        country: 'GB',
-        paymentMethodType: 'PAYOUT_TO_BANK',
-      }),
-    ).rejects.toThrow(/supposed to refuse every sell/);
+    const answer = await service.quote({
+      direction: 'sell',
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'GBP',
+      country: 'GB',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+
+    expect(answer.requested).toEqual({
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'GBP',
+    });
+    expect(answer.requested).not.toHaveProperty('sourceAmount');
+  });
+
+  it('prices a sell through the rail with the crypto amount, not a fiat one', async () => {
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    await service.quote({
+      direction: 'sell',
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'gbp',
+      country: 'GB',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+
+    // The legs are the port's, in the port's naming: `destinationCurrencyCode` is the crypto in
+    // both directions and the fiat is upper-cased here as it is on a buy. The rail is what
+    // crosses this onto Meld's inverted legs.
+    expect(meld.quoteCalls[0]).toEqual({
+      direction: 'sell',
+      countryCode: 'GB',
+      sourceCurrencyCode: 'GBP',
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+  });
+
+  it('does not run the fiat limit gate on a sell quote either', async () => {
+    // The mirror of the session-side case above, and it matters more now that a sell is served:
+    // the configured limits cover USDC_ASSETHUB in USD only, so this corridor has no fiat bound
+    // at all, and applying one would compare DOT against GBP in minor units. A sell's floor and
+    // ceiling are the provider's, at quote time.
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    const answer = await service.quote({
+      direction: 'sell',
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '0.0000000001',
+      fiat: 'GBP',
+      country: 'GB',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+
+    expect(answer.requested).toMatchObject({ cryptoAmount: '0.0000000001' });
   });
 
   it('is a fault, not a refusal, when a request reaches the rail mapping without its amount', async () => {

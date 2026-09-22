@@ -67,8 +67,20 @@ reinterpreted:
 | | buy | sell |
 | --- | --- | --- |
 | amount field | `sourceAmount`, the fiat charged | `cryptoAmount`, the crypto sold |
-| format | decimal, at most **2** fraction digits | exact decimal, up to **30** fraction digits, kept as a string end to end and never rounded |
+| format | decimal, at most **2** fraction digits | exact decimal, kept as a string end to end and never rounded or parsed; **this service accepts** up to 30 fraction digits (see the note below on what the provider has been observed to accept) |
 | `walletAddress` | **required** on `/session` | **refused**: the provider issues the deposit address after the session exists |
+
+**What "30 fraction digits" is and is not a promise about.** 30 is this service's own accepted
+bound, chosen to be wider than any asset's precision so that nothing is ever silently truncated on
+the way through — the value is stored and forwarded as the exact string you send and is never
+parsed into a number anywhere. It is **not** a statement about what the provider will accept or
+honour. The provider has been observed echoing 18 fraction digits back verbatim, with no
+truncation, rounding or exponent — but that was observed on BTC and ETH, and **the precision the
+provider applies to the Asset Hub assets this service delivers has not been observed at all**,
+because no onboarded provider currently off-ramps them. Send your asset's natural precision (DOT
+has 10; Asset Hub USDC and USDT have 6). A value finer than the provider's own precision may be
+rounded by it, and on a sell the amount you commit is the amount you will be expected to send
+on-chain, so a rounding difference there is a payout that does not complete.
 
 `cryptoAmount` must be greater than zero: `"0"` and `"0.00000000"` are refused. On a sell there
 is no amount gate behind this one (the corridor's published limits are fiat while the committed
@@ -85,10 +97,38 @@ The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount
 `walletAddress`, a buy carrying `cryptoAmount`, or either direction missing its own amount, is a
 local `400 MALFORMED_REQUEST` before any upstream call.
 
-**Today every rail refuses a sell** with `400 Other{ DIRECTION_UNSUPPORTED }`. Meld because its
-sell path is not built here yet; Chainflip permanently, having no fiat leg to pay a seller from.
-A sell is parsed, validated and routed like any other request, and declined by the rail with that
-reason rather than by a misleading currency or quote error.
+**The Meld rail serves a sell.** Chainflip still refuses one with
+`400 Other{ DIRECTION_UNSUPPORTED }`, permanently: it has no fiat leg to pay a seller from, and no
+amount of waiting changes that.
+
+### What a sell does not get, and what stands in for it
+
+**No local amount gate.** A buy's minimum and maximum come from the live corridor catalog,
+tightened by a configured `limits` row, and both are **fiat**. A sell commits crypto, so there is
+no local bound to compare it against that would mean anything — comparing a DOT figure to a GBP
+bound in minor units is a number, not a check. So a sell's amount meets exactly two local checks:
+its shape, and that it is greater than zero.
+
+The bound that does apply is the **provider's**, enforced when Meld is called, and it is
+crypto-denominated. It comes back as the same `BelowMinimum` / `AboveMaximum` tags a buy would get
+locally — but **without a `value`**. On a buy that tag carries `{ amount, currency }` in fiat; on a
+sell the provider states the threshold in crypto ("minimum sell amount ... 0.00011648 BTC") and the
+failure type has nowhere to say which kind of currency a threshold is in, so putting a crypto
+figure in the field every other producer fills with fiat would be a specific false statement rather
+than a missing one. A sell that is out of bounds therefore gets the correct tag and no number. The
+figure is in the operator's log against the `request_id`.
+
+Two practical consequences: a sell is refused for being out of bounds **upstream, not locally**, so
+it costs one provider call to find out; and a client cannot render "the minimum is X" on a sell.
+
+### Not yet built
+
+A sell session can be created, and its row sits at `session_opened`. **Nothing yet surfaces a
+deposit address**, so there is currently no way for a seller to complete a sale through this
+service: the provider issues the address after KYC inside its own widget, and this service does not
+read it back. `GET /funding/:id` on a sell row will show no address and no deposit terms. The
+worker that observes them is a later step, as are off-ramp corridor discovery (`GET /supported*`
+answers on-ramp corridors only) and cancellation once an address has been disclosed.
 
 ## `POST /quote`
 
@@ -135,6 +175,26 @@ breakdown is complete:
 }
 ```
 
+A sell is priced from the crypto and the echo says so, carrying `cryptoAmount` where a buy carries
+`sourceAmount`. The key that is present is the discriminator; there is no `direction` in the echo,
+because the amount already names the direction and a second statement of it could disagree with the
+first.
+
+```json
+{
+  "quotes": [ /* ... */ ],
+  "requested": { "destinationCurrencyCode": "DOT_ASSETHUB", "cryptoAmount": "12.3456789012", "fiat": "GBP" }
+}
+```
+
+**A sell's offers carry the fee breakdown in the payout fiat, deducted from the destination, not
+the source.** That is inverted from a buy: a buy's `sourceAmountWithoutFees` is populated and the
+fees come off what the buyer pays; a sell's is `null`, `destinationAmountWithoutFees` is populated,
+and the fees come off what the seller receives (`631.88 - 12.58 = 619.30`). `exchangeRate` is
+fiat-per-crypto rather than destination-per-source. The offers are forwarded exactly as the provider
+sent them, so any code assuming "fees are in the same currency as `sourceAmount`" is wrong on a
+sell.
+
 **Every amount is a decimal string carrying Meld's exact digits.** Meld may send a fee as a bare
 JSON number, and a double round-trip is not identity: `20.00` returns as `20`, `0.0000001` as
 `1e-7`, and anything past 2^53 loses digits. Numbers in unnamed fields are stringified too, since
@@ -154,6 +214,18 @@ sent locked: `cryptoCurrency`, `destinationCurrencyCode`, `walletAddress`, `sour
 **`country` is echoed, not locked.** Meld exposes no `lockFields` entry for it, so a buyer who
 changes jurisdiction inside Meld's flow is not stopped here. `pinned` records what was committed,
 not necessarily what the buyer transacted under. See threat model R11.
+
+**On a sell, the same six fields are sent and accepted — and that is all this service claims.**
+The pinning above is a statement about a buy, established by probing the provider's behaviour. That
+probing has **not** been repeated for a sell, and the evidence available does not substitute for it:
+the provider exposes no way to read a session back, and its session endpoint accepts unknown and
+meaningless fields with a `200`, so acceptance of a lock proves only that the name is spelled
+correctly. What can be said is that the vocabulary is identical in both directions (there is no
+seventh, sell-specific lockable field), and that on a sell the inversion puts the two terms that
+most need pinning — the crypto amount and the payout method — onto `sourceAmount` and
+`paymentMethodType`, which are among the six. **Whether any of them is enforced on a sell has not
+been observed.** Treat `pinned` on a sell as a record of what this service committed, not as a
+guarantee about what the provider's widget will allow.
 
 ```json
 {
@@ -228,7 +300,10 @@ the same corridor, and a mismatch must be treated as "this is a different sale",
 
 `serviceProviderWidgetUrl` is the provider's capture page, always present. `widgetUrl` is Meld's
 own hosted widget for the session, present only when Meld returns one; a product embedding Meld's
-UI opens that one. `expiresAt` is absent when Meld supplies none.
+UI opens that one. `expiresAt` is absent when Meld supplies none — **and on a sell it is always
+absent**: a sell session carries no provider expiry at all, so the only deadline is this service's
+own `worker.session_max_age_ms`, after which the row concludes without the sale having been
+observed.
 
 `fundingRequestId` is this service's durable handle, the id a caller polls `GET /funding/:id` with.
 Meld's `sessionId` is kept alongside for an operator's Meld-side support conversation.
@@ -394,7 +469,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 409 | `Other{ REQUEST_ALREADY_SETTLED }` | The key belongs to a request the buyer **already paid**. Do not start another for it. Split out of `REQUEST_CONCLUDED` because a client cannot act on one code for both: told "start a new one" after a settled purchase, it opens a second payable surface for money already taken. |
 | 409 | `Other{ REQUEST_OUTCOME_UNKNOWN }` | The key belongs to a request that concluded as `unobserved`: we stopped being able to ask the rail and never learned whether the buyer paid. Distinct from **both** other 409 conclusions: `REQUEST_CONCLUDED` says it finished and nothing was paid, `REQUEST_ALREADY_SETTLED` says it finished and *was* paid, this one says nobody knows which. Starting a new request means accepting the risk of paying twice. |
 | 400 | `RegionUnavailable` | A real destination this deployment has not configured. |
-| 400 | `BelowMinimum` / `AboveMaximum` | Outside the effective fiat bounds: Meld's live corridor bound, tightened by a `limits` row when one names that pair. |
+| 400 | `BelowMinimum` / `AboveMaximum` | On a **buy**, outside the effective fiat bounds (Meld's live corridor bound, tightened by a `limits` row when one names that pair), carrying `value: { amount, currency }` in fiat. On a **sell**, the provider's own crypto-denominated bound, refused upstream and carrying **no** `value`; see `direction` above for why a crypto threshold is not put on the wire. |
 | 400 | `Other{ CORRIDOR_UNAVAILABLE }` | A configured `limits` row does not overlap the live corridor bound, so this deployment cannot serve the corridor within its own limits. Refused rather than widened to the upstream bound. |
 | 400 | `Other{ INVALID_ADDRESS }` | Address failed to decode, or is not a 32-byte account. |
 | 400 | `Other{ CURRENCY_UNSUPPORTED }` | Not the configured currency for that destination. |
@@ -404,7 +479,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 400 | `RouteWithdrawn` | The operator has disabled session creation. |
 | 400 | `Other{ UNKNOWN_RAIL }` | A rail this build knows but this deployment has not wired. |
 | 400 | `Other{ PROVIDER_REJECTED }` | Meld understood the request and declined it, for a reason not enumerated above. Not retryable. |
-| 400 | `Other{ DIRECTION_UNSUPPORTED }` | The named rail does not serve that direction. Both rails refuse `direction: "sell"` today: Meld because the sell path is not built here yet, Chainflip permanently. Not retryable; the remedy is a different rail or a different direction, never the same request again. |
+| 400 | `Other{ DIRECTION_UNSUPPORTED }` | The named rail does not serve that direction. `chainflip` refuses `direction: "sell"` permanently, having no fiat leg to pay a seller from; `meld` serves both. Not retryable; the remedy is a different rail or a different direction, never the same request again. |
 | 400 | `Other{ RAIL_REFUSED }` | The Chainflip rail refuses **session creation**: it swaps on-chain assets and has no fiat leg. Not retryable. (Its quote leg answers `422 NoQuotesAvailable`.) |
 | 409 | `Other{ REQUEST_IN_FLIGHT }` | Another request is already opening a session under this idempotency key. Well-formed; retry shortly. |
 | 404 | `Other{ NOT_FOUND }` | No such route, or no such funding request *for this caller*. |

@@ -67,6 +67,24 @@ let started = false;
 /** Every authenticated path the fake Meld was asked for, in order. */
 let meldCalls: string[] = [];
 
+/**
+ * The asset codes this deployment delivers, as Meld would classify them.
+ *
+ * The fake needs to tell a crypto code from a fiat one because that, and nothing else, is how
+ * Meld decides which direction a quote or a session is (verified). A list rather than a pattern:
+ * `DOT` and `BTC` are three letters, so no shape test separates them from `USD`.
+ */
+const CRYPTO_CODES = ['USDC_ASSETHUB', 'USDT_ASSETHUB', 'DOT_ASSETHUB'];
+const isCrypto = (code: unknown): boolean => typeof code === 'string' && CRYPTO_CODES.includes(code);
+
+/** The request body as JSON, or an empty object for a GET. */
+async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  const text = Buffer.concat(chunks).toString('utf8');
+  return text === '' ? {} : (JSON.parse(text) as Record<string, unknown>);
+}
+
 /** A Meld that answers the boot probe, a quote, and a session creation. */
 async function fakeMeld(
   opts: { failQuote?: boolean; failBoot?: boolean; transactionStatus?: string } = {},
@@ -169,40 +187,99 @@ async function fakeMeld(
       );
       return;
     }
-    if (req.url?.startsWith('/payments/crypto/quote')) {
-      // The boot probe uses this path too, so failing it only after boot keeps the service up.
-      if (opts.failBoot && !started) {
-        json({ code: 'BAD_CREDENTIAL' }, 401);
-        return;
-      }
-      if (opts.failQuote && started) {
-        json({ code: 'UPSTREAM_BOOM' }, 500);
-        return;
-      }
-      json({
-        quotes: [
-          {
-            serviceProvider: 'TRANSAK',
-            sourceAmount: '25.00',
-            sourceCurrencyCode: 'USD',
-            destinationAmount: '24',
-            destinationCurrencyCode: 'USDC_ASSETHUB',
-            totalFee: '1.00',
-          },
-        ],
+    // Both POST bodies are needed to model the parts of Meld's contract that depend on them,
+    // so they are read here rather than per branch.
+    readBody(req)
+      .then((body) => {
+        if (req.url?.startsWith('/payments/crypto/quote')) {
+          // The boot probe uses this path too, so failing it only after boot keeps the service up.
+          if (opts.failBoot && !started) {
+            json({ code: 'BAD_CREDENTIAL' }, 401);
+            return;
+          }
+          if (opts.failQuote && started) {
+            json({ code: 'UPSTREAM_BOOM' }, 500);
+            return;
+          }
+          // Meld has no direction flag on a quote: it infers the direction from whether the
+          // SOURCE currency is a crypto, and answers "Source currency is not a valid crypto
+          // currency" when a sell is sent the other way round. The fake enforces exactly that,
+          // because a rail that failed to cross the legs would otherwise be served a happy buy
+          // quote and this suite would be blind to the one mistake the seam can make.
+          const source = body.sourceCurrencyCode;
+          const destination = body.destinationCurrencyCode;
+          if (isCrypto(source)) {
+            if (isCrypto(destination)) {
+              json({ code: 'BAD_REQUEST', message: 'Destination currency is not a valid fiat currency' }, 400);
+              return;
+            }
+            // A sell offer, with the fee shape the real one has: fees in the payout fiat,
+            // deducted from the DESTINATION, `sourceAmountWithoutFees` null and
+            // `destinationAmountWithoutFees` populated. Inverted from the buy offer below.
+            json({
+              quotes: [
+                {
+                  transactionType: 'CRYPTO_SELL',
+                  serviceProvider: 'TRANSAK',
+                  sourceAmount: body.sourceAmount,
+                  sourceAmountWithoutFees: null,
+                  sourceCurrencyCode: source,
+                  destinationAmount: '61.93',
+                  destinationAmountWithoutFees: '63.18',
+                  destinationCurrencyCode: destination,
+                  totalFee: '1.25',
+                },
+              ],
+            });
+            return;
+          }
+          json({
+            quotes: [
+              {
+                serviceProvider: 'TRANSAK',
+                sourceAmount: '25.00',
+                sourceCurrencyCode: 'USD',
+                destinationAmount: '24',
+                destinationCurrencyCode: 'USDC_ASSETHUB',
+                totalFee: '1.00',
+              },
+            ],
+          });
+          return;
+        }
+        if (req.url?.startsWith('/crypto/session/widget')) {
+          const data = (body.sessionData ?? {}) as Record<string, unknown>;
+          if (body.sessionType !== 'BUY' && body.sessionType !== 'SELL') {
+            json({ code: 'BAD_REQUEST', errors: ['[sessionType] value is not one of: BUY, SELL, TRANSFER'] }, 400);
+            return;
+          }
+          // The one field whose requirement genuinely differs by direction (verified): a BUY
+          // without `walletAddress` is refused, a SELL without one is accepted.
+          if (body.sessionType === 'BUY' && typeof data.walletAddress !== 'string') {
+            json({ code: 'BAD_REQUEST', errors: ['[sessionData.walletAddress] must not be blank'] }, 400);
+            return;
+          }
+          // And the same source-must-be-crypto rule as the quote, which is server-enforced on
+          // sessions too: `sessionType` and the leg orientation are checked against each other.
+          if ((body.sessionType === 'SELL') !== isCrypto(data.sourceCurrencyCode)) {
+            json({ code: 'BAD_REQUEST', errors: ['Source currency is not a valid crypto currency'] }, 400);
+            return;
+          }
+          json({
+            id: 'meld-session-e2e',
+            serviceProviderWidgetUrl: 'https://meldcrypto.com/session/e2e',
+            widgetUrl: MELD_WIDGET_URL,
+            // Null on a buy, and on a sell Meld omits the key entirely. Both reach the client
+            // as "no expiry", so one spelling covers it here.
+            expiresAt: null,
+          });
+          return;
+        }
+        json({ quotes: [] });
+      })
+      .catch(() => {
+        json({ code: 'BAD_REQUEST', message: 'unreadable body' }, 400);
       });
-      return;
-    }
-    if (req.url?.startsWith('/crypto/session/widget')) {
-      json({
-        id: 'meld-session-e2e',
-        serviceProviderWidgetUrl: 'https://meldcrypto.com/session/e2e',
-        widgetUrl: MELD_WIDGET_URL,
-        expiresAt: null,
-      });
-      return;
-    }
-    json({ quotes: [] });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   meld = server;
@@ -757,6 +834,116 @@ describe('the funding journey over real HTTP', () => {
     expect(body.corridors[0]?.methods[0]?.providers).toBeUndefined();
     // Read entirely from Postgres: the request added no Meld call.
     expect(meldCalls.length).toBe(before);
+  }, 30_000);
+
+  it('quotes and opens a sell against a Meld that enforces the direction rules', async () => {
+    /**
+     * The sell path end to end, through the built artifact, over a real socket, against a real
+     * Postgres — and against a fake Meld that enforces the two rules the real one enforces: the
+     * source currency must be the crypto on a sell, and `walletAddress` is required on a buy and
+     * not on a sell. That is what makes this more than a smoke test.
+     *
+     * Be precise about what catches a regression here, because the two calls differ. A crossed
+     * sell **session** is refused by the fake with "Source currency is not a valid crypto
+     * currency", which is what the real endpoint answers. A crossed sell **quote** is not: the
+     * real quote endpoint has no direction field and would price a perfectly valid buy and
+     * answer `200`, so the fake does the same, and the only thing that would fail here is the
+     * currency-code assertion on the echoed offer below. Thin, for the more dangerous of the two
+     * calls — which is why `client.ts` now guards the legs before either request is sent, and
+     * a crossed quote fails at this service's own boundary rather than depending on the shape
+     * assertion below to notice.
+     *
+     * **This is as far as a sell can be taken here.** No provider on the account off-ramps
+     * `*_ASSETHUB`, so the real corridor could not be exercised even against the live sandbox;
+     * and nothing yet reads a deposit address back, so the row correctly stops at
+     * `session_opened` and the sale cannot be completed through this service.
+     */
+    const baseUrl = await fakeMeld();
+    const port = await freePort();
+    const schema = await createSchema();
+    const configPath = await writeConfig(baseUrl, port, schema);
+    child = await startService(configPath, port);
+    const base = `http://127.0.0.1:${String(port)}`;
+    const headers = { 'content-type': 'application/json', 'x-dev-product-id': PRODUCT };
+
+    const quote = await fetch(`${base}/quote`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        direction: 'sell',
+        country: 'GB',
+        fiat: 'GBP',
+        destinationCurrencyCode: 'DOT_ASSETHUB',
+        cryptoAmount: '12.3456789012',
+        paymentMethodType: 'PAYOUT_TO_BANK',
+      }),
+    });
+    expect(quote.status).toBe(200);
+    const priced = (await quote.json()) as { quotes: Record<string, unknown>[]; requested: Record<string, unknown> };
+    // The echo names the term the seller committed, and does not name one they did not.
+    expect(priced.requested).toEqual({
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'GBP',
+    });
+    expect(priced.requested).not.toHaveProperty('sourceAmount');
+    // A sell-shaped offer, forwarded whole: the fee is in the payout fiat and comes off the
+    // destination, which is inverted from a buy.
+    expect(priced.quotes[0]).toMatchObject({
+      transactionType: 'CRYPTO_SELL',
+      sourceCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'GBP',
+      sourceAmountWithoutFees: null,
+      destinationAmountWithoutFees: '63.18',
+    });
+
+    const session = await fetch(`${base}/session`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        idempotencyKey: 'e2e-sell-0001',
+        direction: 'sell',
+        country: 'GB',
+        fiat: 'GBP',
+        destinationCurrencyCode: 'DOT_ASSETHUB',
+        cryptoAmount: '12.3456789012',
+        paymentMethodType: 'PAYOUT_TO_BANK',
+        serviceProvider: 'TRANSAK',
+      }),
+    });
+    expect(session.status).toBe(201);
+    const created = (await session.json()) as {
+      fundingRequestId: string;
+      expiresAt?: number;
+      pinned: Record<string, unknown>;
+    };
+    expect(created.pinned).toEqual({
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'GBP',
+      country: 'GB',
+    });
+    // Absent, not zero: a sell session carries no provider expiry, so this service's own
+    // ceiling is the whole deadline.
+    expect(created.expiresAt).toBeUndefined();
+
+    // And the durable row, read through a second connection, holds the sell terms and sits at
+    // `session_opened` — which is the correct end state for this step, because nothing yet
+    // observes the seller's deposit.
+    const rows = await rawQuery(
+      schema,
+      'SELECT direction, crypto_amount, source_amount, wallet_address, status, expires_at FROM funding_requests',
+    );
+    expect(rows).toEqual([
+      {
+        direction: 'sell',
+        crypto_amount: '12.3456789012',
+        source_amount: null,
+        wallet_address: null,
+        status: 'session_opened',
+        expires_at: null,
+      },
+    ]);
   }, 30_000);
 
   it('quotes, creates a session, and lists the request back', async () => {
