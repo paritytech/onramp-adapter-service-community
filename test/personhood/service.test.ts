@@ -4,7 +4,8 @@ import { describe, expect, it } from 'vitest';
 import { hexToU8a, u8aToHex } from '@polkadot/util';
 
 import { Refusal } from '../../src/contract.js';
-import { PersonhoodService, type PersonhoodDeps } from '../../src/personhood.js';
+import type { ChainCommitments } from '../../src/personhood/register.js';
+import { PersonhoodService, type PersonhoodDeps, type PersonhoodNetwork } from '../../src/personhood.js';
 import { mintChallenge } from '../../src/personhood/challenge.js';
 import { mintToken, verifyToken } from '../../src/personhood/token.js';
 
@@ -12,6 +13,8 @@ const ALIAS = '0x' + 'ab'.repeat(32);
 const COMMITMENT = '0x' + '11'.repeat(768);
 const IDENTIFIER = '0x' + '22'.repeat(32);
 const PRODUCT = 'app.dot';
+/** The one network the default harness serves; the id a redeem declares. */
+const NETWORK = 'previewnet';
 const OTHER = 'other.dot';
 const UNALLOWED = 'dropshipped.dot';
 
@@ -24,20 +27,37 @@ let keyNonce = 0;
  * A handshake under test: the service, its two injected keys, and the stub commitments/validate.
  * Tests may replace any of `deps` and rebuild to isolate the one step under test.
  */
-function makeService(overrides: Partial<PersonhoodDeps> = {}): { service: PersonhoodService; deps: PersonhoodDeps } {
+type ServiceOverrides = Partial<Omit<PersonhoodDeps, 'networks'>> & {
+  /** The whole network list, for tests about choosing between networks. */
+  networks?: readonly PersonhoodNetwork[];
+  /** This deployment's one network, for the majority of tests that are about collections. */
+  commitments?: ChainCommitments;
+  rings?: PersonhoodNetwork['rings'];
+};
+
+function makeService(overrides: ServiceOverrides = {}): { service: PersonhoodService; deps: PersonhoodDeps } {
   const challengeKey = new Uint8Array(32).fill(0x10 + keyNonce);
   const tokenKey = { secret: new Uint8Array(32).fill(0x20 + keyNonce) };
   keyNonce += 1;
+  const { commitments, rings, networks, ...rest } = overrides;
   const deps: PersonhoodDeps = {
     validate: () => hexToU8a(ALIAS),
-    commitments: { commitment: async () => COMMITMENT },
     challengeKey,
     tokenKey,
     challengeTtlMs: 60_000,
     tokenTtlSeconds: 300,
-    rings: [{ identifier: IDENTIFIER, exponent: 9 }],
+    // `commitments`/`rings` configure the single default network, so every test written before
+    // the network list existed still reads as a statement about collections rather than about
+    // topology. `networks` replaces the list outright, for the tests that are about the choice.
+    networks: networks ?? [
+      {
+        id: NETWORK,
+        commitments: commitments ?? { commitment: async () => COMMITMENT },
+        rings: rings ?? [{ identifier: IDENTIFIER, exponent: 9 }],
+      },
+    ],
     allowedProducts: [PRODUCT, OTHER],
-    ...overrides,
+    ...rest,
   };
   return { service: new PersonhoodService(deps), deps };
 }
@@ -159,6 +179,7 @@ function validRedeem(deps: PersonhoodDeps, overrides: Record<string, unknown> = 
     proof: wire(new Uint8Array([1, 2, 3])),
     ring: 0,
     productId: PRODUCT,
+    network: NETWORK,
     ...overrides,
   };
 }
@@ -367,7 +388,7 @@ describe('redeem()', () => {
     // Named, not just "rejected": the operator detail is the only thing separating a
     // misconfigured collection (this case, the ring has no current root) from a
     // caller whose proof does not open. The wire deliberately shows the same 401 for both.
-    await refuse(service.redeem(validRedeem(deps)), /membership proof rejected by all 1 configured collection\(s\): UnknownRing/);
+    await refuse(service.redeem(validRedeem(deps)), /membership proof rejected by all 1 collection\(s\) configured for network 'previewnet': UnknownRing/);
   });
 
   it('refuses a proof that fails to open against the current commitment', async () => {
@@ -376,7 +397,7 @@ describe('redeem()', () => {
         throw new Error('verify failed');
       },
     });
-    await refuse(service.redeem(validRedeem(deps)), /membership proof rejected by all 1 configured collection\(s\): NotMember/);
+    await refuse(service.redeem(validRedeem(deps)), /membership proof rejected by all 1 collection\(s\) configured for network 'previewnet': NotMember/);
   });
 
   it('surfaces a chain transport failure distinctly, not as a caller mistake', async () => {
@@ -409,14 +430,14 @@ describe('redeem()', () => {
 describe('verify()', () => {
   it('accepts a token minted for an allowed product and returns the proven subject', async () => {
     const { service, deps } = makeService();
-    const token = await mintToken(deps.tokenKey, '0xalias', PRODUCT, 300);
+    const token = await mintToken(deps.tokenKey, '0xalias', PRODUCT, 'previewnet', 300);
 
-    await expect(service.verify(token)).resolves.toEqual({ subject: '0xalias', productId: PRODUCT });
+    await expect(service.verify(token)).resolves.toEqual({ subject: '0xalias', productId: PRODUCT, network: NETWORK });
   });
 
   it('rejects a token whose audience is no longer allowed (revoked product)', async () => {
     const { service, deps } = makeService();
-    const token = await mintToken(deps.tokenKey, '0xalias', UNALLOWED, 300);
+    const token = await mintToken(deps.tokenKey, '0xalias', UNALLOWED, 'previewnet', 300);
 
     await refuse(service.verify(token));
   });
@@ -424,14 +445,14 @@ describe('verify()', () => {
   it('rejects a token signed by a different key', async () => {
     const { service } = makeService();
     const { deps: otherDeps } = makeService();
-    const token = await mintToken(otherDeps.tokenKey, '0xalias', PRODUCT, 300);
+    const token = await mintToken(otherDeps.tokenKey, '0xalias', PRODUCT, 'previewnet', 300);
 
     await refuse(service.verify(token));
   });
 
   it('rejects a token that was tampered with after minting', async () => {
     const { service, deps } = makeService();
-    const token = await mintToken(deps.tokenKey, '0xalias', PRODUCT, 300);
+    const token = await mintToken(deps.tokenKey, '0xalias', PRODUCT, 'previewnet', 300);
 
     // Flip the payload segment so the signature no longer covers it.
     const [header, payload, signature] = token.split('.');
@@ -444,8 +465,129 @@ describe('verify()', () => {
 
   it('rejects an expired token through the verify path, not just the token unit', async () => {
     const { service, deps } = makeService();
-    const token = await mintToken(deps.tokenKey, '0xalias', PRODUCT, -10);
+    const token = await mintToken(deps.tokenKey, '0xalias', PRODUCT, 'previewnet', -10);
 
     await refuse(service.verify(token));
+  });
+});
+/**
+ * Choosing between People networks: the declared one is the only chain consulted, and the choice
+ * comes from the operator's list rather than the caller.
+ */
+describe('several networks', () => {
+  const OTHER_NETWORK = 'polkadot-test';
+  const OTHER_COMMITMENT = '0x' + '44'.repeat(768);
+  const OTHER_ALIAS = '0x' + 'cd'.repeat(32);
+
+  /**
+   * Two networks publishing different roots for the *same* collection identifier -- the live shape
+   * on all three environments, and why the identifier cannot disambiguate them.
+   */
+  function twoNetworks(): PersonhoodNetwork[] {
+    return [
+      {
+        id: NETWORK,
+        commitments: { commitment: async () => COMMITMENT },
+        rings: [{ identifier: IDENTIFIER, exponent: 9 }],
+      },
+      {
+        id: OTHER_NETWORK,
+        commitments: { commitment: async () => OTHER_COMMITMENT },
+        rings: [{ identifier: IDENTIFIER, exponent: 9 }],
+      },
+    ];
+  }
+
+  it('reads the root of the network the caller declared, and of no other', async () => {
+    const seen: string[] = [];
+    const networks = twoNetworks().map((network) => ({
+      ...network,
+      commitments: {
+        commitment: async () => {
+          seen.push(network.id);
+          return network.id === NETWORK ? COMMITMENT : OTHER_COMMITMENT;
+        },
+      },
+    }));
+    const { service, deps } = makeService({ networks });
+
+    await service.redeem(validRedeem(deps, { network: OTHER_NETWORK }));
+
+    // "The other was never asked", not "the right one answered": a fallback walk across networks
+    // would let a proof minted for a weak chain be admitted by a strong one.
+    expect(seen).toEqual([OTHER_NETWORK]);
+  });
+
+  it('hands the declared network its own root, so one proof does not open on both', async () => {
+    // Stands in for the ring-VRF check: opens only against its own network's commitment.
+    const networks = twoNetworks();
+    const { service, deps } = makeService({
+      networks,
+      validate: (_exponent, _proof, commitment) =>
+        hexToU8a(u8aToHex(commitment) === COMMITMENT ? ALIAS : OTHER_ALIAS),
+    });
+
+    const first = await service.redeem(validRedeem(deps, { network: NETWORK }));
+    const second = await service.redeem(validRedeem(deps, { network: OTHER_NETWORK }));
+
+    await expect(service.verify(first.token)).resolves.toMatchObject({ subject: ALIAS, network: NETWORK });
+    await expect(service.verify(second.token)).resolves.toMatchObject({
+      subject: OTHER_ALIAS,
+      network: OTHER_NETWORK,
+    });
+  });
+
+  it('refuses a network this instance does not serve, before opening any socket', async () => {
+    let read = false;
+    const { service, deps } = makeService({
+      networks: [
+        {
+          id: NETWORK,
+          commitments: {
+            commitment: async () => {
+              read = true;
+              return COMMITMENT;
+            },
+          },
+          rings: [{ identifier: IDENTIFIER, exponent: 9 }],
+        },
+      ],
+    });
+
+    await refuse(service.redeem(validRedeem(deps, { network: 'mainnet-people' })), /not served by this instance/);
+    // An unknown name must not become an outbound read.
+    expect(read).toBe(false);
+  });
+
+  it('matches the network id exactly, so a near-miss is refused rather than resolved', async () => {
+    const { service, deps } = makeService();
+
+    await refuse(service.redeem(validRedeem(deps, { network: NETWORK.toUpperCase() })));
+    await refuse(service.redeem(validRedeem(deps, { network: ` ${NETWORK}` })));
+  });
+
+  it('carries the network into the token, so the audit trail can name it a TTL later', async () => {
+    const { service, deps } = makeService({ networks: twoNetworks() });
+
+    const { token } = await service.redeem(validRedeem(deps, { network: OTHER_NETWORK }));
+
+    // Through `verifyToken`, not by decoding: the claim must survive the check the routes run.
+    await expect(verifyToken(deps.tokenKey, token, [PRODUCT])).resolves.toMatchObject({
+      net: OTHER_NETWORK,
+    });
+  });
+
+  it('gives one key the same alias on both networks, because the alias is chain-independent', async () => {
+    // `alias_in_context(entropy, context)` takes no ring. This keeps the rate-limit bucket and
+    // funding scope from splitting per network, and is why `net` is a claim, not part of `sub`.
+    const { service, deps } = makeService({ networks: twoNetworks() });
+
+    const first = await service.redeem(validRedeem(deps, { network: NETWORK }));
+    const second = await service.redeem(validRedeem(deps, { network: OTHER_NETWORK }));
+
+    const a = await service.verify(first.token);
+    const b = await service.verify(second.token);
+    expect(a.subject).toBe(b.subject);
+    expect(a.network).not.toBe(b.network);
   });
 });

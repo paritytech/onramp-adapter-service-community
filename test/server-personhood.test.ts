@@ -12,17 +12,24 @@ const PRODUCT = 'app.dot';
 
 /** A fully-functional PersonhoodService with stub chain reads. */
 const TOKEN_KEY = new Uint8Array(32).fill(5);
+/** The one network the handshake under test serves. */
+const NETWORK = 'previewnet';
 
 function makeHandshake(): { service: PersonhoodService } {
   const challengeKey = new Uint8Array(32).fill(4);
   const deps: PersonhoodDeps = {
     validate: () => new Uint8Array(32),
-    commitments: { commitment: async () => COMMITMENT },
     challengeKey,
     tokenKey: { secret: TOKEN_KEY },
     challengeTtlMs: 60_000,
     tokenTtlSeconds: 300,
-    rings: [{ identifier: IDENTIFIER, exponent: 9 }],
+    networks: [
+      {
+        id: NETWORK,
+        commitments: { commitment: async () => COMMITMENT },
+        rings: [{ identifier: IDENTIFIER, exponent: 9 }],
+      },
+    ],
     allowedProducts: [PRODUCT],
   };
   return { service: new PersonhoodService(deps) };
@@ -67,7 +74,7 @@ describe('personhood handshake routes', () => {
     const redeemResponse = await app.inject({
       method: 'POST',
       url: '/api/v1/auth/redeem',
-      payload: { challenge, proof: wire(new Uint8Array([1, 2, 3])), ring: 0, productId: PRODUCT },
+      payload: { challenge, proof: wire(new Uint8Array([1, 2, 3])), ring: 0, productId: PRODUCT, network: NETWORK },
     });
     expect(redeemResponse.statusCode).toBe(200);
     const { token, expiresAtMs } = redeemResponse.json<{ token: string; expiresAtMs: number }>();
@@ -116,7 +123,7 @@ describe('personhood handshake routes', () => {
     const response = await app.inject({
       method: 'POST',
       url: '/api/v1/auth/redeem',
-      payload: { challenge, proof: wire(new Uint8Array([1])), ring: 0, productId: 'not-allowed.dot' },
+      payload: { challenge, proof: wire(new Uint8Array([1])), ring: 0, productId: 'not-allowed.dot', network: NETWORK },
     });
     expect(response.statusCode).toBe(401);
     expect(response.json().error.value.code).toBe('UNAUTHORIZED');
@@ -205,7 +212,7 @@ describe('the address ceiling in front of the two public handshake routes', () =
         method: 'POST',
         url: '/api/v1/auth/redeem',
         headers: { 'x-forwarded-for': '203.0.113.6' },
-        payload: { challenge: wire(new Uint8Array(8)), proof: wire(new Uint8Array([1])), ring: 0, productId: PRODUCT },
+        payload: { challenge: wire(new Uint8Array(8)), proof: wire(new Uint8Array([1])), ring: 0, productId: PRODUCT, network: NETWORK },
       });
 
     // The first attempt is refused on its merits (a challenge that is not a challenge), which
@@ -229,7 +236,7 @@ describe('the address ceiling in front of the two public handshake routes', () =
       method: 'POST',
       url: '/api/v1/auth/redeem',
       headers,
-      payload: { challenge: wire(new Uint8Array(8)), proof: wire(new Uint8Array([1])), ring: 0, productId: PRODUCT },
+      payload: { challenge: wire(new Uint8Array(8)), proof: wire(new Uint8Array([1])), ring: 0, productId: PRODUCT, network: NETWORK },
     });
 
     expect(challenge.statusCode).toBe(200);
@@ -285,7 +292,7 @@ describe('the CORS preflight answer', () => {
 
 describe('the per-person rate-limit bucket', () => {
   /** A bearer token for `alias`, minted with the same key the service verifies against. */
-  const tokenFor = (alias: string) => mintToken({ secret: TOKEN_KEY }, alias, PRODUCT, 300);
+  const tokenFor = (alias: string) => mintToken({ secret: TOKEN_KEY }, alias, PRODUCT, 'previewnet', 300);
 
   /** A personhood-mode server with tight ceilings, behind one trusted proxy hop. */
   const serve = async (personMax: number, addressMax = personMax) => {
@@ -340,7 +347,7 @@ describe('the per-person rate-limit bucket', () => {
     // runs. Were it to throw in `onRequest`, every rejected token would skip the limiter and
     // an attacker could probe the verifier for free.
     app = await serve(2);
-    const forged = `Bearer ${await mintToken({ secret: new Uint8Array(32).fill(9) }, '0xada', PRODUCT, 300)}`;
+    const forged = `Bearer ${await mintToken({ secret: new Uint8Array(32).fill(9) }, '0xada', PRODUCT, 'previewnet', 300)}`;
 
     expect((await quote(app, forged)).statusCode).toBe(401);
     expect((await quote(app, forged)).statusCode).toBe(401);
@@ -356,7 +363,7 @@ describe('the per-person rate-limit bucket', () => {
     // `per_address_max`, at the same address, in the same window.
     app = await serve(3, 1);
     const ada = `Bearer ${await tokenFor('0xada')}`;
-    const forged = `Bearer ${await mintToken({ secret: new Uint8Array(32).fill(9) }, '0xada', PRODUCT, 300)}`;
+    const forged = `Bearer ${await mintToken({ secret: new Uint8Array(32).fill(9) }, '0xada', PRODUCT, 'previewnet', 300)}`;
 
     // The address allowance of 1 is spent by a single rejected attempt.
     expect((await quote(app, forged)).statusCode).toBe(401);
@@ -397,7 +404,7 @@ describe('the per-person rate-limit bucket', () => {
   it('does not let a rejected caller spend a proven person\'s budget', async () => {
     // The refused attempts land in the address bucket; the person's own bucket is untouched.
     app = await serve(1);
-    const forged = `Bearer ${await mintToken({ secret: new Uint8Array(32).fill(9) }, '0xada', PRODUCT, 300)}`;
+    const forged = `Bearer ${await mintToken({ secret: new Uint8Array(32).fill(9) }, '0xada', PRODUCT, 'previewnet', 300)}`;
 
     expect((await quote(app, forged)).statusCode).toBe(401);
     expect((await quote(app, `Bearer ${await tokenFor('0xada')}`)).statusCode).toBe(200);

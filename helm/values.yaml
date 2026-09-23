@@ -79,18 +79,39 @@ meld:
 auth:
   mode: personhood
   personhood:
-    # jwt_key and people_rpc_url/collection/ring exponent are set per-env.
-    people_rpc_url: ""
-    # BLOCKED: the collection ids, awaited. A list because personhood is not one
-    # population: a full person and a lite person live in different collections and
-    # pinning one silently refuses everybody in the other. The real ids are ASCII
-    # names space-padded to 32 bytes, so do not trim the trailing 0x20 bytes.
-    # Lite first: Safety Net is a lite-personhood release, so it opens almost every
-    # proof and the second entry is not read in the common case. Order is traffic,
-    # not preference: the redeem path walks the list until one opens.
+    # jwt_key is set per-env. So is every entry below.
+    #
+    # The People networks a proof may be verified against. A caller names one per redeem; a name
+    # absent from this list is refused before any chain read.
+    #
+    # `id` is matched exactly. Use the keys from paritytech/deploy_script networks.json --
+    # previewnet | paseo-next-v2 | polkadot-test -- not the deploy workflow's env names, which
+    # differ (it calls previewnet `preview`). The front end derives the same ids from its hostname.
+    #
+    # Collections are a list because a full person and a lite person live in different ones, and
+    # pinning one silently refuses everybody in the other. Lite first: it opens almost every proof,
+    # so the second entry is rarely read. Order is traffic, not preference. The ids are ASCII names
+    # space-padded to 32 bytes -- do not trim the trailing 0x20.
     #   pop:polkadot.network/people-lite -> 0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652d6c697465
     #   pop:polkadot.network/people      -> 0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652020202020
-    collections: []
+    #
+    # Per network, because the same identifier exists on all three environments with different
+    # roots: a `people` entry live on paseo-next-v2 and empty on previewnet is normal.
+    #
+    # networks:
+    #   - id: paseo-next-v2
+    #     people_rpc_url: wss://paseo-people-next-system-rpc.polkadot.io
+    #     collections:
+    #       - identifier: "0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652d6c697465"
+    #         ring_exponent: 9
+    networks: []
+    # Required true once `networks` names more than one, and refused as a default.
+    #
+    # The gate is only as strong as the weakest network listed: the caller picks which one answers
+    # and every proven person is equal downstream. Nothing here can measure registration
+    # difficulty, so the operator asserts it. Never list a testnet People chain beside a mainnet
+    # one -- the testnet becomes a cheap side entrance. See docs/threat-model.md R13.
+    trusted_equally: false
     challenge_ttl_ms: 60000
     token_ttl_s: 300
 

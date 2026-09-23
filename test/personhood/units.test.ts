@@ -541,6 +541,7 @@ describe('redeemRequest', () => {
     proof: 'b'.repeat(64),
     ring: 0,
     productId: 'app.dot',
+    network: 'previewnet',
   };
 
   it('refuses a body carrying its own collection identifier', () => {
@@ -569,7 +570,7 @@ describe('redeemRequest', () => {
 
 describe('token', () => {
   it('mints a JWT that verifies back to the same claims it was minted with', async () => {
-    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', 300);
+    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', 'previewnet', 300);
     const claims = await verifyToken({ secret: KEY }, token, ['app.dot']);
     expect(claims.sub).toBe('0xalias');
     expect(claims.aud).toBe('app.dot');
@@ -579,7 +580,7 @@ describe('token', () => {
     // The bearer credential for every spending route, and `token_ttl_s` is the only thing bounding
     // a stolen one. Nothing decoded `exp`, so scaling the TTL by a thousand kept the positive test
     // valid and the negative test expired: a five-minute token silently becoming a three-day one.
-    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', 300);
+    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', 'previewnet', 300);
 
     const segment = token.split('.')[1];
     if (segment === undefined) throw new Error('token has no payload segment');
@@ -592,7 +593,7 @@ describe('token', () => {
     // What the discarded `exp`/`iat` claims were standing in for. Nothing read them; the
     // property they hinted at is that expiry is enforced, which is jose's job and is worth
     // asserting directly rather than via a number nobody consumes.
-    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', -1);
+    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', 'previewnet', -1);
 
     await expect(verifyToken({ secret: KEY }, token, ['app.dot'])).rejects.toThrow();
   });
@@ -650,7 +651,7 @@ describe('token', () => {
   });
 
   it('refuses a token signed with a different key', async () => {
-    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', 300);
+    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', 'previewnet', 300);
     await expect(verifyToken({ secret: new Uint8Array(32).fill(9) }, token, ['app.dot'])).rejects.toThrow();
   });
 
@@ -662,8 +663,8 @@ describe('token', () => {
     const rotated = { secret: new Uint8Array(32).fill(7) };
     const previous = { secret: KEY };
 
-    const underRotated = await mintToken(rotated, '0xalias', 'app.dot', 300);
-    const underPrevious = await mintToken(previous, '0xalias', 'app.dot', 300);
+    const underRotated = await mintToken(rotated, '0xalias', 'app.dot', 'previewnet', 300);
+    const underPrevious = await mintToken(previous, '0xalias', 'app.dot', 'previewnet', 300);
 
     // Each verifies under its own key, repeatedly; the second call is the cached path.
     await expect(verifyToken(rotated, underRotated, ['app.dot'])).resolves.toMatchObject({ sub: '0xalias' });
@@ -681,19 +682,19 @@ describe('token', () => {
     const a = { secret: new Uint8Array(32).fill(3) };
     const b = { secret: new Uint8Array(32).fill(3) };
 
-    const token = await mintToken(a, '0xalias', 'app.dot', 300);
+    const token = await mintToken(a, '0xalias', 'app.dot', 'previewnet', 300);
     await expect(verifyToken(b, token, ['app.dot'])).resolves.toMatchObject({ sub: '0xalias' });
   });
 
   it('refuses a token whose audience is not allowlisted', async () => {
-    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', 300);
+    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', 'previewnet', 300);
     await expect(verifyToken({ secret: KEY }, token, ['other.dot'])).rejects.toThrow();
   });
 
   it('refuses a token that has already expired: the single most common bearer failure', async () => {
     // A negative TTL minted an `exp` in the past via `setExpirationTime`, so no clock is needed
     // to make time pass; verifying it is what the "short-lived JWT" claim rests on.
-    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', -10);
+    const token = await mintToken({ secret: KEY }, '0xalias', 'app.dot', 'previewnet', -10);
     await expect(verifyToken({ secret: KEY }, token, ['app.dot'])).rejects.toThrow(/exp/i);
   });
 });
@@ -737,5 +738,49 @@ describe('verifiablejs binding (compatibility probe)', () => {
     }
     // Either it rejected (threw), or it returned nothing usable as an alias.
     if (!threw) expect(outcome).toBeUndefined();
+  });
+});
+
+/**
+ * The `net` claim: the only durable record of which chain admitted a person, the alias being
+ * chain-independent by design. Verified as strictly as `sub` and `aud`.
+ */
+describe('the network claim', () => {
+  const KEY2 = new Uint8Array(32).fill(7);
+
+  it('round-trips the network the token was minted for', async () => {
+    const token = await mintToken({ secret: KEY2 }, '0xalias', 'app.dot', 'polkadot-test', 300);
+    await expect(verifyToken({ secret: KEY2 }, token, ['app.dot'])).resolves.toMatchObject({
+      net: 'polkadot-test',
+    });
+  });
+
+  it('refuses a token carrying no network, rather than defaulting one', async () => {
+    // Such a token verifies cleanly otherwise, so a default would file it under a chain nobody
+    // observed. One TTL of 401s on rollout is the honest cost.
+    const jwk = await importJWK({ kty: 'oct', k: Buffer.from(KEY2).toString('base64url') }, 'HS256');
+    const legacy = await new SignJWT({})
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject('0xalias')
+      .setAudience('app.dot')
+      .setIssuedAt()
+      .setExpirationTime('300s')
+      .sign(jwk);
+
+    await expect(verifyToken({ secret: KEY2 }, legacy, ['app.dot'])).rejects.toThrow(/carries no network/);
+  });
+
+  it('refuses a network claim that is empty or not a string', async () => {
+    const jwk = await importJWK({ kty: 'oct', k: Buffer.from(KEY2).toString('base64url') }, 'HS256');
+    for (const net of ['', 42, null]) {
+      const token = await new SignJWT({ net })
+        .setProtectedHeader({ alg: 'HS256' })
+        .setSubject('0xalias')
+        .setAudience('app.dot')
+        .setIssuedAt()
+        .setExpirationTime('300s')
+        .sign(jwk);
+      await expect(verifyToken({ secret: KEY2 }, token, ['app.dot'])).rejects.toThrow(/carries no network/);
+    }
   });
 });
