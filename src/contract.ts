@@ -308,10 +308,17 @@ export const fundingListQuery = z
  * The redemption body of the personhood handshake.
  *
  * `challenge` and `proof` are base64url (no padding) of the challenges and proofs this service
- * mints/accepts. `ring` is the index within the collection this deployment serves. The collection
- * itself is fixed at boot (config), so the client never names it; a request cannot aim the proof
- * at a foreign ring. `productId` is the product the caller wants to spend as; it is vetted against
+ * mints/accepts. `ring` is the index within the collection. The collections themselves are fixed
+ * at boot (config), so the client never names one; a request cannot aim the proof at a foreign
+ * ring. `productId` is the product the caller wants to spend as; it is vetted against
  * `allowed_products` at redemption, and binds the proof's context and the minted token's audience.
+ *
+ * `network` names which configured People chain verifies the proof, and it has to be on the wire
+ * because nothing else carries it: the collection identifiers are byte-identical across
+ * environments (verified live on all three), so a proof is silent about the chain it was minted
+ * against. The name selects among `auth.personhood.networks` and is refused if absent from it, so
+ * a caller chooses between the operator's chains and cannot introduce one. What that choice costs
+ * is documented on the config field and in threat model R13.
  */
 export const redeemRequest = z
   .object({
@@ -327,6 +334,9 @@ export const redeemRequest = z
     // index checked.
     ring: z.number().int().min(0).max(0xffff_ffff),
     productId: z.string().min(1).max(128),
+    // Bounded to the config field's own ceiling, so an oversized name is refused by the schema
+    // rather than walking the network list as a string nothing could ever match.
+    network: z.string().min(1).max(64),
   })
   .strict();
 

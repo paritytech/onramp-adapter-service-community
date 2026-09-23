@@ -172,6 +172,10 @@ export const COLUMN_LIST = [
   'deposit_conflict_address',
   'deposit_conflict_reason',
   'deposit_conflict_at',
+  // Which People network admitted this row's caller (v8 -> v9). Audit only: it is not in
+  // `funding_by_reference` and not in any scoping predicate below. See `NETWORK_COLUMN` in
+  // `schema.ts` for why adding it to either would be a bug rather than a tightening.
+  'network',
   'status_history',
   'created_at',
   'updated_at',
@@ -816,6 +820,7 @@ interface Row {
   deposit_conflict_address: string | null;
   deposit_conflict_reason: DepositConflictReason | null;
   deposit_conflict_at: number | null;
+  network: string;
   status_history: string;
   created_at: number;
   updated_at: number;
@@ -890,6 +895,7 @@ function recordToRow(r: FundingRecord): unknown[] {
     deposit_conflict_address: r.deposit_conflict_address ?? null,
     deposit_conflict_reason: r.deposit_conflict_reason ?? null,
     deposit_conflict_at: r.deposit_conflict_at ?? null,
+    network: r.network,
     status_history: JSON.stringify(r.status_history),
     created_at: r.created_at,
     updated_at: r.updated_at,

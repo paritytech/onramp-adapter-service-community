@@ -26,21 +26,41 @@ import {
 } from './personhood/register.js';
 import { mintToken, verifyToken, type TokenKey } from './personhood/token.js';
 
+/**
+ * One People network: its own commitment reader and its own collections.
+ *
+ * Commitments are per network rather than shared because the reader is bound to one RPC endpoint,
+ * and because its in-flight ceiling should be too -- a chain that stops answering must not consume
+ * the socket budget the other networks' redeems need. See `commitmentsFrom`.
+ */
+export interface PersonhoodNetwork {
+  /** The name a caller declares at redeem, and the `net` claim the minted token carries. */
+  id: string;
+  commitments: ChainCommitments;
+  /**
+   * The People collections this network accepts, each with its own ring exponent, tried in
+   * order. Plural because personhood is not one population: full and lite persons live in
+   * different collections and a proof opens against exactly one.
+   */
+  rings: ReadonlyArray<{ identifier: string; exponent: number }>;
+}
+
 /** Everything the personhood service needs, injected in `startup.ts` from config. */
 export interface PersonhoodDeps {
   /** The on-chain proof verifier bound to `validate_with_commitment`. */
   validate: Validate;
-  commitments: ChainCommitments;
   challengeKey: Uint8Array;
   tokenKey: TokenKey;
   challengeTtlMs: number;
   tokenTtlSeconds: number;
   /**
-   * The People collections this deployment accepts, each with its own ring exponent, tried in
-   * order. Plural because personhood is not one population: full and lite persons live in
-   * different collections and a proof opens against exactly one.
+   * The People networks this deployment accepts. The caller names one per redeem; the proof is
+   * verified against that network's chain and no other.
+   *
+   * Never empty (the config schema's `.min(1)`), and every id distinct (its superRefine), so
+   * `redeem`'s lookup is a total function over the ids a caller may legitimately send.
    */
-  rings: ReadonlyArray<{ identifier: string; exponent: number }>;
+  networks: readonly PersonhoodNetwork[];
   /** Product ids the caller may redeem into. Curation at the money boundary. */
   allowedProducts: readonly string[];
 }
@@ -55,6 +75,8 @@ interface RedeemInput {
   ring: number; // ring index within the collection
   /** The product the caller wants to spend as; must be allowed. Bound as the proof context + JWT aud. */
   productId: string;
+  /** Which configured People network verifies this proof. Matched exactly against `deps.networks`. */
+  network: string;
 }
 
 interface Redeemed {
@@ -68,6 +90,17 @@ const utf8 = (s: string) => new TextEncoder().encode(s);
 
 export class PersonhoodService {
   constructor(private readonly deps: PersonhoodDeps) {}
+
+  /**
+   * The configured networks, for the boot probe in `startup.ts`.
+   *
+   * Exposed rather than re-derived from config so the probe reads the very objects `redeem` will
+   * use: a probe against a second construction of the same config could pass while the wiring the
+   * service actually holds is wrong.
+   */
+  get networks(): readonly PersonhoodNetwork[] {
+    return this.deps.networks;
+  }
 
   challenge(): IssuedChallenge {
     return { challenge: toWire(mintChallenge(this.deps.challengeKey)) };
@@ -94,6 +127,15 @@ export class PersonhoodService {
       throw unauthorized(`product '${input.productId}' is not authorized on this instance.`);
     }
 
+    // The caller names a network; this service decides whether it serves one by that name. An
+    // unknown name is refused here, before a socket is opened, so a caller cannot reach an
+    // endpoint this deployment did not configure -- the declared name selects among the
+    // operator's networks, it never supplies one.
+    const network = this.deps.networks.find((candidate) => candidate.id === input.network);
+    if (network === undefined) {
+      throw unauthorized(`network '${input.network}' is not served by this instance.`);
+    }
+
     // The proof was minted over `context` = the product, `message` = the challenge bytes. Binding
     // both makes the proof coherent with this handshake and this deployment.
     const context = utf8(input.productId);
@@ -106,11 +148,11 @@ export class PersonhoodService {
     let rejection: ProofRejected | undefined;
     let unavailableDetail: string | undefined;
 
-    for (const ring of this.deps.rings) {
+    for (const ring of network.rings) {
       try {
         person = await verifyRingMembership(
           this.deps.validate,
-          this.deps.commitments,
+          network.commitments,
           ring.exponent,
           { identifier: ring.identifier, ring: input.ring },
           fromWire(input.proof),
@@ -141,11 +183,18 @@ export class PersonhoodService {
       // knowing when the gate starts refusing everyone.
       const reason = rejection === undefined ? 'no collections configured' : ProofRefusal[rejection.reason];
       throw unauthorized(
-        `membership proof rejected by all ${String(this.deps.rings.length)} configured collection(s): ${reason}`,
+        `membership proof rejected by all ${String(network.rings.length)} collection(s) configured ` +
+          `for network '${network.id}': ${reason}`,
       );
     }
 
-    const token = await mintToken(this.deps.tokenKey, person.alias, input.productId, this.deps.tokenTtlSeconds);
+    const token = await mintToken(
+      this.deps.tokenKey,
+      person.alias,
+      input.productId,
+      network.id,
+      this.deps.tokenTtlSeconds,
+    );
     return { token, expiresAtMs: Date.now() + this.deps.tokenTtlSeconds * 1000 };
   }
 
@@ -158,8 +207,8 @@ export class PersonhoodService {
    * own `aud` is trusted only as far as it is still on the allowlist, so dropping a product from
    * config revokes that product's tokens within one TTL.
    */
-  async verify(bearerToken: string): Promise<{ subject: string; productId: string }> {
-    let claims: { sub: string; aud: string };
+  async verify(bearerToken: string): Promise<{ subject: string; productId: string; network: string }> {
+    let claims: { sub: string; aud: string; net: string };
     try {
       claims = await verifyToken(this.deps.tokenKey, bearerToken, this.deps.allowedProducts);
     } catch {
@@ -167,6 +216,12 @@ export class PersonhoodService {
       // a caller mistake, not an internal error. jose's own error types must not reach the wire.
       throw unauthorized('token rejected.');
     }
-    return { subject: claims.sub, productId: claims.aud };
+    // `net` is reported as minted, not re-vetted against the current `networks`, and the asymmetry
+    // with `aud` is deliberate. Dropping a product from the allowlist revokes its tokens because
+    // the product is an authorisation. A network is a statement of fact about a proof that was
+    // already verified, so removing one from config must not rewrite what the audit trail says
+    // happened -- and refusing those tokens would strand proven people for a TTL over a config
+    // edit that says nothing about them.
+    return { subject: claims.sub, productId: claims.aud, network: claims.net };
   }
 }

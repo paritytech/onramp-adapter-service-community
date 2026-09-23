@@ -95,8 +95,15 @@ export const personhoodConfig = (overrides: Record<string, unknown> = {}) =>
       mode: 'personhood',
       personhood: {
         jwt_key: { mode: 'file', path: '/run/secrets/jwt-key' },
-        people_rpc_url: 'wss://127.0.0.1:9944',
-        collections: [{ identifier: '0x' + '11'.repeat(32), ring_exponent: 9 }],
+        // One network, so `trusted_equally` is not needed: the mixed-tier refusal only applies
+        // once a caller has a choice to make.
+        networks: [
+          {
+            id: 'previewnet',
+            people_rpc_url: 'wss://127.0.0.1:9944',
+            collections: [{ identifier: '0x' + '11'.repeat(32), ring_exponent: 9 }],
+          },
+        ],
         challenge_ttl_ms: 60_000,
         token_ttl_s: 300,
       },
@@ -210,6 +217,7 @@ export const fundingRecord = (overrides: Partial<FundingRecord> = {}): FundingRe
   id: 'funding-1',
   subject_alias: 'alias-abc',
   product_id: 'app.dot',
+  network: 'previewnet',
   // A buy, like every row written before the direction column existed and like every fixture
   // that does not say otherwise. `sellRecord` below is the other one.
   direction: 'buy',

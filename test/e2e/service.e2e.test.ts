@@ -763,8 +763,8 @@ describe('the service as a process', () => {
         }),
       });
 
-    const accepted = await quoteAs(await mintToken(keyFor('onramp:jwt'), '0xada', PRODUCT, 300));
-    const refused = await quoteAs(await mintToken(keyFor('onramp:challenge'), '0xmallory', PRODUCT, 300));
+    const accepted = await quoteAs(await mintToken(keyFor('onramp:jwt'), '0xada', PRODUCT, 'previewnet', 300));
+    const refused = await quoteAs(await mintToken(keyFor('onramp:challenge'), '0xmallory', PRODUCT, 'previewnet', 300));
     await stopService(child);
 
     expect(accepted.status).toBe(200);

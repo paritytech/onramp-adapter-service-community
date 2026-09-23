@@ -44,6 +44,14 @@ export interface FundingRecord {
   subject_alias: string;
   product_id: string;
   /**
+   * Which People network's ring root admitted this row's caller, from the token's `net` claim.
+   *
+   * Never absent, but `'unrecorded'` on rows written before the column existed (v8 -> v9) and
+   * `'dev'` under `insecure_dev`. Audit only: nothing selects, scopes or de-duplicates by it. See
+   * `NETWORK_COLUMN` in `schema.ts`.
+   */
+  network: string;
+  /**
    * Which way this request moves value. Never absent: rows written before the column existed are
    * buys, and the column's `DEFAULT 'buy'` says so for them (v5 -> v6).
    */

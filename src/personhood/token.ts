@@ -47,12 +47,28 @@ function keyFor(key: TokenKey): Promise<CryptoKey | Uint8Array> {
 }
 
 /**
- * Mint a JWT naming the proven person (sub = alias) for the given product (aud).
+ * Mint a JWT naming the proven person (sub = alias) for the given product (aud), on the People
+ * network the proof opened against (`net`).
+ *
  * `aud` is the product id, so a token minted for one product cannot be spent by another.
+ *
+ * `net` is carried because nothing downstream can recover it otherwise. The alias is
+ * `alias_in_context(entropy, context)`, which is chain-independent by construction: the same key
+ * proving on two networks yields one alias, which is the property that makes a person one person
+ * wherever they proved. The cost of that is the reverse: an alias names no network, so a token
+ * without this claim reaches the audit trail having forgotten which chain vouched for it. It is a
+ * claim rather than a prefix on `sub` for the same reason: fusing them would split one person into
+ * one identity per network and undo the dedup above.
  */
-export async function mintToken(key: TokenKey, sub: string, aud: string, ttlSeconds: number): Promise<string> {
+export async function mintToken(
+  key: TokenKey,
+  sub: string,
+  aud: string,
+  net: string,
+  ttlSeconds: number,
+): Promise<string> {
   const jwk = await keyFor(key);
-  return new SignJWT({})
+  return new SignJWT({ net })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(sub)
     .setAudience(aud)
@@ -71,7 +87,7 @@ export async function verifyToken(
   key: TokenKey,
   token: string,
   allowedAudiences: readonly string[],
-): Promise<{ sub: string; aud: string }> {
+): Promise<{ sub: string; aud: string; net: string }> {
   const jwk = await keyFor(key);
   const { payload } = await jwtVerify(token, jwk, {
     algorithms: ['HS256'],
@@ -89,7 +105,15 @@ export async function verifyToken(
   if (typeof payload.aud !== 'string') {
     throw new Error('token audience is not a single value');
   }
-  return { sub: payload.sub, aud: payload.aud };
+  // Fail closed for the same reason `sub` and `aud` do, and for one of their own. A token minted
+  // before this claim existed verifies cleanly (same key, same algorithm), so defaulting an absent
+  // `net` would file every such token in the audit trail under whatever the default named. That is
+  // a wrong answer wearing a right one's clothes, and the rollout window is exactly when the
+  // record matters. One TTL of 401s is the honest cost; see the note in docs/api.md.
+  if (typeof payload.net !== 'string' || payload.net === '') {
+    throw new Error('token carries no network');
+  }
+  return { sub: payload.sub, aud: payload.aud, net: payload.net };
 }
 
 /** Return the base64url-encoded raw bytes (what `jose`'s oct key `k` expects). */

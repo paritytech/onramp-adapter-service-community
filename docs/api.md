@@ -436,14 +436,26 @@ so a proof recorded against an earlier challenge cannot be replayed.
   "challenge": "<base64url, from /challenge>",
   "proof": "<base64url ring-VRF proof>",
   "ring": 0,
-  "productId": "another-product.example"
+  "productId": "another-product.example",
+  "network": "paseo-next-v2"
 }
 ```
 
 A stale or inauthentic challenge is rejected first. Then the ring's current `Root` commitment is
-read off the People chain (`people_rpc_url`) and the proof verified against it here, never on a
+read off the declared network's People chain and the proof verified against it here, never on a
 client's word. A valid proof recovers the caller's contextual **alias**, which the JWT binds as
-`sub`, with the product as `aud` and a TTL of `token_ttl_s`.
+`sub`, with the product as `aud`, the network as `net`, and a TTL of `token_ttl_s`.
+
+`network` names one of `auth.personhood.networks[].id`, matched exactly; anything else is refused
+as `401` before a socket is opened. It is on the wire because nothing else carries it: the People
+collection identifiers are byte-identical across environments, so a proof is silent about the chain
+it was minted against. The caller chooses among the operator's networks and cannot introduce one.
+What that choice costs is in threat model R13.
+
+**`net` is required on every token.** A token minted before the claim existed verifies cleanly
+otherwise, so it is refused rather than defaulted -- a default would file rows in the audit trail
+under a chain nobody observed. A deployment rolling this out should expect one `token_ttl_s` window
+of `401`s while outstanding tokens age out, and clients re-run the handshake.
 
 ```json
 { "token": "eyJ...", "expiresAtMs": 1800000000000 }

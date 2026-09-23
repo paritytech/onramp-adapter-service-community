@@ -1253,6 +1253,10 @@ export class Onramp {
       id: terms.id,
       subject_alias: terms.subject.alias,
       product_id: terms.subject.productId,
+      // Which People network admitted this caller, carried from the verified token. Recorded on
+      // the row because the alias cannot say it: the same person proving on two chains is one
+      // alias here, by design. Audit only -- see `NETWORK_COLUMN` in `funding/schema.ts`.
+      network: terms.subject.network,
       direction: terms.direction,
       destination_currency_code: terms.destinationCurrencyCode,
       wallet_address: terms.walletAddress,

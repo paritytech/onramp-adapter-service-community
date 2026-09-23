@@ -329,6 +329,8 @@ const atV5 = (sql: string): string =>
     .replace(' deposit_conflict_address TEXT,', '')
     .replace(' deposit_conflict_reason TEXT,', '')
     .replace(' deposit_conflict_at BIGINT,', '')
+    // v8 -> v9: which People network admitted the caller.
+    .replace(" network TEXT NOT NULL DEFAULT 'unrecorded',", '')
     // Every constraint from v6 onward is contiguous and last, so one cut removes all of them
     // (the v7 one included) and closes the statement.
     .replace(/, CONSTRAINT funding_direction_known .*$/, ')')
@@ -378,8 +380,8 @@ describe('the v5 -> v6 migration', () => {
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Not just [5, 6]: `openIn` always walks to `SCHEMA_VERSION`, so a database stamped at 5
-      // takes the v6, v7 and v8 steps in one boot.
-      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8]);
+      // takes the v6, v7, v8 and v9 steps in one boot.
+      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8, 9]);
     } finally {
       await dropSchema(schema);
     }
@@ -657,7 +659,7 @@ describe('the real migration chain', () => {
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     } finally {
       await dropSchema(schema);
     }
@@ -676,7 +678,10 @@ describe('applying a migration', () => {
   const toCurrent: Migration = {
     from: 0,
     to: SCHEMA_VERSION,
-    sql: ['ALTER TABLE funding_requests ADD COLUMN status_history TEXT NOT NULL DEFAULT \'[]\''],
+    sql: [
+      'ALTER TABLE funding_requests ADD COLUMN status_history TEXT NOT NULL DEFAULT \'[]\'',
+      "ALTER TABLE funding_requests ADD COLUMN network TEXT NOT NULL DEFAULT 'unrecorded'",
+    ],
   };
 
   /**

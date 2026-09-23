@@ -9,6 +9,21 @@ import { loadConfig, originAllowed, parseConfig, toOriginMatcher } from '../src/
 import { personhoodConfig, rawConfig } from './fixtures.js';
 
 /** The personhood auth block, merged into a single-mode config for the tests. */
+/**
+ * Put `collections` on the fixture's first network, leaving everything else as it was.
+ *
+ * Collections hang off a network now, so a test that replaces them by spreading `personhood` and
+ * adding a `collections` key lands one level too high -- and `.strict()` reports that as an
+ * unrecognised key, which passes a `toThrow` for entirely the wrong reason.
+ */
+const nestCollections = (
+  personhood: Record<string, unknown>,
+  collections: unknown,
+): Record<string, unknown> => {
+  const networks = personhood.networks as Array<Record<string, unknown>> | undefined;
+  return { ...personhood, networks: [{ ...(networks?.[0] ?? {}), collections }] };
+};
+
 const personhoodBlock = (): Record<string, unknown> => ({
   auth: (personhoodConfig() as { auth: Record<string, unknown> }).auth,
 });
@@ -249,7 +264,7 @@ describe('parseConfig', () => {
         rawConfig({
           auth: {
             mode: 'personhood',
-            personhood: { ...personhood, collections: [{ identifier: 'nope', ring_exponent: 9 }] },
+            personhood: nestCollections(personhood, [{ identifier: 'nope', ring_exponent: 9 }]),
           },
         }),
       ),
@@ -270,7 +285,7 @@ describe('parseConfig', () => {
         rawConfig({
           auth: {
             mode: 'personhood',
-            personhood: { ...personhood, collections: [{ identifier: id, ring_exponent: 9 }] },
+            personhood: nestCollections(personhood, [{ identifier: id, ring_exponent: 9 }]),
           },
         }),
       ),
@@ -286,17 +301,14 @@ describe('parseConfig', () => {
         rawConfig({
           auth: {
             mode: 'personhood',
-            personhood: {
-              ...personhood,
-              collections: [
-                { identifier: `0x${'11'.repeat(32)}`, ring_exponent: 9 },
-                { identifier: 'nope', ring_exponent: 9 },
-              ],
-            },
+            personhood: nestCollections(personhood, [
+              { identifier: `0x${'11'.repeat(32)}`, ring_exponent: 9 },
+              { identifier: 'nope', ring_exponent: 9 },
+            ]),
           },
         }),
       ),
-    ).toThrow(/collections\.1\.identifier/);
+    ).toThrow(/networks\.0\.collections\.1\.identifier/);
   });
 
   it.each([
@@ -908,10 +920,23 @@ describe('parseConfig', () => {
   });
 
   /** The personhood block with `collections` replaced wholesale. */
+  // Collections now hang off a network rather than off `personhood` directly. The helper keeps
+  // taking a bare collection list, so every test below stays a statement about collections.
   const withCollections = (collections: unknown): Record<string, unknown> => {
     const personhood = (personhoodConfig().auth as { personhood?: Record<string, unknown> }).personhood ?? {};
-    return rawConfig({ auth: { mode: 'personhood', personhood: { ...personhood, collections } } });
+    const networks = personhood.networks as Array<Record<string, unknown>> | undefined;
+    const first = networks?.[0] ?? {};
+    return rawConfig({
+      auth: {
+        mode: 'personhood',
+        personhood: { ...personhood, networks: [{ ...first, collections }] },
+      },
+    });
   };
+
+  /** The first (and, in these fixtures, only) network's collections. */
+  const collectionsOf = (cfg: ReturnType<typeof parseConfig>) =>
+    cfg.auth.personhood?.networks[0]?.collections;
 
   const PEOPLE = '0x' + '11'.repeat(32);
   const PEOPLE_LITE = '0x' + '22'.repeat(32);
@@ -923,7 +948,7 @@ describe('parseConfig', () => {
     // proof fail to open: the personhood gate refusing everybody, at boot, with no message.
     const cfg = parseConfig(withCollections([{ identifier: PEOPLE, ring_exponent: exponent }]));
 
-    expect(cfg.auth.personhood?.collections[0]?.ring_exponent).toBe(exponent);
+    expect(collectionsOf(cfg)?.[0]?.ring_exponent).toBe(exponent);
   });
 
   it.each([[0], [8], [11], [15], [-9]])('refuses ring_exponent %i, which names no ring', (exponent) => {
@@ -950,8 +975,8 @@ describe('parseConfig', () => {
       ]),
     );
 
-    expect(cfg.auth.personhood?.collections).toHaveLength(2);
-    expect(cfg.auth.personhood?.collections[1]?.ring_exponent).toBe(10);
+    expect(collectionsOf(cfg)).toHaveLength(2);
+    expect(collectionsOf(cfg)?.[1]?.ring_exponent).toBe(10);
   });
 
   it('refuses an empty collections list, which would refuse every person', () => {
@@ -1023,8 +1048,13 @@ describe('parseConfig', () => {
               mode: 'personhood',
               personhood: {
                 jwt_key: { mode: 'env', var: 'TEST_PH_KEY' },
-                people_rpc_url: url,
-                collections: [{ identifier: '0x' + '11'.repeat(32), ring_exponent: 9 }],
+                networks: [
+                  {
+                    id: 'previewnet',
+                    people_rpc_url: url,
+                    collections: [{ identifier: '0x' + '11'.repeat(32), ring_exponent: 9 }],
+                  },
+                ],
                 challenge_ttl_ms: 60_000,
                 token_ttl_s: 300,
               },
@@ -1044,8 +1074,13 @@ describe('parseConfig', () => {
             mode: 'personhood',
             personhood: {
               jwt_key: { mode: 'env', var: 'TEST_PH_KEY' },
-              people_rpc_url: 'ws://127.0.0.1:9944',
-              collections: [{ identifier: '0x' + '11'.repeat(32), ring_exponent: 9 }],
+              networks: [
+                {
+                  id: 'previewnet',
+                  people_rpc_url: 'ws://127.0.0.1:9944',
+                  collections: [{ identifier: '0x' + '11'.repeat(32), ring_exponent: 9 }],
+                },
+              ],
               challenge_ttl_ms: 60_000,
               token_ttl_s: 300,
             },
@@ -1059,9 +1094,9 @@ describe('parseConfig', () => {
     ['meld.base_url', (raw: Record<string, unknown>) => {
       (raw.meld as Record<string, unknown>).base_url = '::::';
     }],
-    ['auth.personhood.people_rpc_url', (raw: Record<string, unknown>) => {
-      const auth = raw.auth as { personhood: Record<string, unknown> };
-      auth.personhood.people_rpc_url = '';
+    ['auth.personhood.networks.0.people_rpc_url', (raw: Record<string, unknown>) => {
+      const auth = raw.auth as { personhood: { networks: [Record<string, unknown>] } };
+      auth.personhood.networks[0].people_rpc_url = '';
     }],
   ])('names the field when %s is not a URL, rather than throwing a bare TypeError', (field, mutate) => {
     // `superRefine` runs even when a field failed its own check (zod marks the result dirty
@@ -1083,6 +1118,93 @@ describe('parseConfig', () => {
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain('Invalid configuration');
     expect((error as Error).message).toContain(field);
+  });
+
+  /**
+   * The network list, and the assertion that guards it.
+   *
+   * `trusted_equally` is the only field in this config that records a fact the service cannot
+   * check for itself, so the tests here are about it being unavoidable rather than about it being
+   * correct.
+   */
+  describe('auth.personhood.networks', () => {
+    const NET = (id: string, url = 'wss://127.0.0.1:9944') => ({
+      id,
+      people_rpc_url: url,
+      collections: [{ identifier: `0x${'11'.repeat(32)}`, ring_exponent: 9 }],
+    });
+
+    const withNetworks = (networks: unknown, extra: Record<string, unknown> = {}) => {
+      const personhood = (personhoodConfig().auth as { personhood?: Record<string, unknown> }).personhood ?? {};
+      return rawConfig({
+        auth: { mode: 'personhood', personhood: { ...personhood, networks, ...extra } },
+      });
+    };
+
+    it('accepts one network without an equal-trust assertion, there being no choice to make', () => {
+      expect(() => parseConfig(withNetworks([NET('previewnet')]))).not.toThrow();
+    });
+
+    it('refuses several networks unless the operator asserts they are equally hard to register on', () => {
+      // The gate's strength is the weakest network listed, because the caller picks which one
+      // answers their proof. That cannot be measured here, so it is asserted -- and the assertion
+      // must not be reachable by leaving a field at its default.
+      expect(() => parseConfig(withNetworks([NET('previewnet'), NET('polkadot-test')]))).toThrow(
+        /trusted_equally must be set true/,
+      );
+    });
+
+    it('accepts several networks once the assertion is made', () => {
+      expect(() =>
+        parseConfig(withNetworks([NET('previewnet'), NET('polkadot-test')], { trusted_equally: true })),
+      ).not.toThrow();
+    });
+
+    it('refuses two networks sharing an id, which would make the chain depend on list order', () => {
+      expect(() =>
+        parseConfig(withNetworks([NET('previewnet'), NET('previewnet')], { trusted_equally: true })),
+      ).toThrow(/duplicate network id "previewnet"/);
+    });
+
+    it('accepts the same collection identifier on two networks, which is the live shape', () => {
+      // All three environments publish `people-lite` under a byte-identical id with differing
+      // roots (verified live). Only a repeat *within* one network is a fault.
+      expect(() =>
+        parseConfig(withNetworks([NET('previewnet'), NET('paseo-next-v2')], { trusted_equally: true })),
+      ).not.toThrow();
+    });
+
+    it('names the offending network by index when one endpoint is plaintext', () => {
+      // One plaintext RPC among several wss ones is the whole hole, because the caller chooses
+      // which network answers. The index is what makes a three-entry list actionable.
+      expect(() =>
+        parseConfig(
+          rawConfig({
+            environment: 'production',
+            ...personhoodBlock(),
+            meld: {
+              ...(rawConfig().meld as Record<string, unknown>),
+              base_url: 'https://api.meld.io',
+              api_key: { mode: 'file', path: '/run/secrets/meld' },
+            },
+            auth: {
+              mode: 'personhood',
+              personhood: {
+                jwt_key: { mode: 'file', path: '/run/secrets/jwt-key' },
+                networks: [NET('previewnet'), NET('polkadot-test', 'ws://people:9944')],
+                trusted_equally: true,
+                challenge_ttl_ms: 60_000,
+                token_ttl_s: 300,
+              },
+            },
+          }),
+        ),
+      ).toThrow(/networks\[1\]\.people_rpc_url must use wss/);
+    });
+
+    it('refuses an empty network list, which would refuse every person', () => {
+      expect(() => parseConfig(withNetworks([]))).toThrow();
+    });
   });
 
   it('refuses a CORS origin that is not a URL', () => {

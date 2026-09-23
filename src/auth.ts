@@ -23,6 +23,17 @@ export interface Subject {
    */
   readonly alias: string;
   /**
+   * The People network whose ring root the proof opened against, from the token's `net` claim.
+   *
+   * Recorded, never used to scope. The alias is chain-independent, so one person proving on two
+   * networks is one person here, and scoping their funding rows by network would hide a request
+   * from the person who made it. What this answers is the audit question -- which chain vouched
+   * for the person on this row -- which the alias alone cannot.
+   *
+   * `dev` under `insecure_dev`, where nothing proved anything on any chain.
+   */
+  readonly network: string;
+  /**
    * Whether `alias` names exactly one proven person.
    *
    * True only under `personhood`, where the alias came out of a ring-VRF proof. Under
@@ -73,7 +84,7 @@ function personhood(service: PersonhoodService): CallerAuth {
     const token = bearerToken(request);
     if (token instanceof Refusal) throw token;
     const subject = await service.verify(token);
-    return { productId: subject.productId, alias: subject.subject, proven: true };
+    return { productId: subject.productId, alias: subject.subject, network: subject.network, proven: true };
   };
 }
 
@@ -87,7 +98,9 @@ function insecureDev(allowedProducts: readonly string[]): CallerAuth {
       throw unauthorized(`Dev auth rejected product id ${JSON.stringify(productId)}.`);
     }
 
-    // `proven: false` because the header names a product, and nobody at all within it.
-    return { productId, alias: `dev:${productId}`, proven: false };
+    // `proven: false` because the header names a product, and nobody at all within it. `network`
+    // is `dev` for the same reason: no chain was asked, so naming one would be a claim this mode
+    // is defined by not making.
+    return { productId, alias: `dev:${productId}`, network: 'dev', proven: false };
   };
 }

@@ -22,7 +22,7 @@ import { MeldDiscovery } from './meld/discovery.js';
 import { Onramp } from './onramp.js';
 import { MeldRail } from './meld/rail.js';
 import { DIRECTIONS, type RailName, type RailRegistry } from './rail.js';
-import { PersonhoodService, type PersonhoodDeps } from './personhood.js';
+import { PersonhoodService, type PersonhoodDeps, type PersonhoodNetwork } from './personhood.js';
 import { chainReader } from './personhood/chain.js';
 import { commitmentsFrom } from './personhood/source.js';
 import { validateWithCommitment } from './personhood/verifiablejs.js';
@@ -197,6 +197,16 @@ export async function start(
   //
 
     await verifyKey(meld, cfg, app.log);
+    // The same proof, for the other credential the gate rests on. A Meld key is proven before the
+    // port opens because the worst place to find a wrong one is in front of a buyer; a People
+    // network is proven here for the mirror reason. A wrong chain or a mispasted collection id
+    // refuses every proof while the pod stays green, so the discovery has to happen before there
+    // is a port for anyone to fail against.
+    if (personhood !== undefined) {
+      await probePersonhoodNetworks(personhood.networks, (message) => {
+        server.log.warn(message);
+      });
+    }
     await app.listen({ port: cfg.server.port, host: cfg.server.host });
 
   // The worker advances in-flight requests even when no SPA is open. Observation dispatch is per
@@ -371,16 +381,94 @@ export async function buildPersonhood(cfg: Config): Promise<PersonhoodService> {
   const challengeKey = new Uint8Array(hkdfSync('sha256', jwtSecret.expose(), Buffer.alloc(0), Buffer.from('onramp:challenge'), 32));
   const tokenKey = { secret: new Uint8Array(hkdfSync('sha256', jwtSecret.expose(), Buffer.alloc(0), Buffer.from('onramp:jwt'), 32)) };
 
-  const reader = chainReader(personhood.people_rpc_url);
+  // One reader, and one in-flight ceiling, per network. Sharing either would let a People chain
+  // that stops answering hold sockets the other networks' redeems need, turning one chain's outage
+  // into a gate-wide one -- the failure mode multi-network exists to avoid.
+  const networks = personhood.networks.map((network) => ({
+    id: network.id,
+    commitments: commitmentsFrom(chainReader(network.people_rpc_url), network.collections.length),
+    rings: network.collections.map((c) => ({ identifier: c.identifier, exponent: c.ring_exponent })),
+  }));
+
   const deps: PersonhoodDeps = {
     validate: validateWithCommitment,
-    commitments: commitmentsFrom(reader, personhood.collections.length),
     challengeKey,
     tokenKey,
     challengeTtlMs: personhood.challenge_ttl_ms,
     tokenTtlSeconds: personhood.token_ttl_s,
-    rings: personhood.collections.map((c) => ({ identifier: c.identifier, exponent: c.ring_exponent })),
+    networks,
     allowedProducts: cfg.allowed_products,
   };
   return new PersonhoodService(deps);
+}
+
+/**
+ * Read one `Members.Root` per configured (network, collection) and refuse to start if a network
+ * answers for none of its own.
+ *
+ * The failure this exists to convert: a People RPC pointed at the wrong chain, or a collection
+ * identifier pasted under the wrong network, is invisible at boot and total at runtime. Every
+ * root read comes back `None`, every proof is refused as `UnknownRing`, and the pod stays green
+ * the whole time -- `/health` answers, the container never restarts, and the first signal is
+ * users reporting that login is broken. The same misconfiguration, probed here, is a pod that
+ * will not start and says which network and which identifier.
+ *
+ * Ring 0 is the probe, because a collection that serves anyone has it: rings fill in order, so
+ * ring 0 is absent only when the collection is empty on this chain, which is the state worth
+ * refusing. A network is accepted when any one of its collections answers; requiring all of them
+ * would refuse the live shape this deployment already runs, where `people-lite` carries a root and
+ * `people` does not (verified live on previewnet and polkadot-test).
+ *
+ * A read that fails is not a verdict. An RPC that is merely unreachable at this instant is a
+ * restart loop waiting to happen if it is treated as a wrong answer, so only a network whose reads
+ * all *answered* and all answered `None` is refused. An unreachable one is logged and allowed
+ * through, and its redeems then fail loudly as `503` rather than silently as `401`.
+ */
+export async function probePersonhoodNetworks(
+  networks: readonly PersonhoodNetwork[],
+  log: (message: string) => void,
+): Promise<void> {
+  const dead: string[] = [];
+
+  for (const network of networks) {
+    let answered = false;
+    let reachable = false;
+
+    for (const ring of network.rings) {
+      try {
+        const root = await network.commitments.commitment(ring.identifier, 0);
+        reachable = true;
+        if (root !== null) {
+          answered = true;
+          break;
+        }
+        log(
+          `personhood probe: network '${network.id}' collection ${ring.identifier} has no root at ring 0.`,
+        );
+      } catch (cause) {
+        log(
+          `personhood probe: network '${network.id}' collection ${ring.identifier} could not be read: ` +
+            (cause instanceof Error ? cause.message : 'unknown'),
+        );
+      }
+    }
+
+    if (answered) continue;
+    if (reachable) {
+      dead.push(network.id);
+    } else {
+      log(
+        `personhood probe: network '${network.id}' was unreachable, so its collections are unverified. ` +
+          'Redeems against it will fail as 503 until it answers.',
+      );
+    }
+  }
+
+  if (dead.length > 0) {
+    throw new Error(
+      `auth.personhood.networks ${dead.map((id) => `'${id}'`).join(', ')} answered for none of their ` +
+        'configured collections at ring 0. The RPC is reachable, so this is a wrong chain or a wrong ' +
+        'collection identifier, not an outage: every proof against these networks would be refused.',
+    );
+  }
 }
