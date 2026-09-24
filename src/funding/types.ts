@@ -33,6 +33,12 @@ export interface FundingRecord {
   id: string;
   subject_alias: string;
   product_id: string;
+  /**
+   * Which People network admitted this row's caller, from the token's `net` claim. `'unrecorded'`
+   * on rows predating the column (v5 -> v6), `'dev'` under `insecure_dev`. Audit only: nothing
+   * selects, scopes or de-duplicates by it. See `NETWORK_COLUMN` in `schema.ts`.
+   */
+  network: string;
   destination_currency_code: string;
   wallet_address: string;
   source_amount: string;

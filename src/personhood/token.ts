@@ -47,12 +47,22 @@ function keyFor(key: TokenKey): Promise<CryptoKey | Uint8Array> {
 }
 
 /**
- * Mint a JWT naming the proven person (sub = alias) for the given product (aud).
- * `aud` is the product id, so a token minted for one product cannot be spent by another.
+ * Mint a JWT naming the proven person (sub = alias), the product (aud), and the People network the
+ * proof opened against (net).
+ *
+ * `net` is a claim rather than part of `sub` because the alias is chain-independent by
+ * construction, so one key proving on two networks is one person. Fusing them would undo that; a
+ * separate claim keeps the chain recoverable without splitting the person.
  */
-export async function mintToken(key: TokenKey, sub: string, aud: string, ttlSeconds: number): Promise<string> {
+export async function mintToken(
+  key: TokenKey,
+  sub: string,
+  aud: string,
+  net: string,
+  ttlSeconds: number,
+): Promise<string> {
   const jwk = await keyFor(key);
-  return new SignJWT({})
+  return new SignJWT({ net })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(sub)
     .setAudience(aud)
@@ -71,7 +81,7 @@ export async function verifyToken(
   key: TokenKey,
   token: string,
   allowedAudiences: readonly string[],
-): Promise<{ sub: string; aud: string }> {
+): Promise<{ sub: string; aud: string; net: string }> {
   const jwk = await keyFor(key);
   const { payload } = await jwtVerify(token, jwk, {
     algorithms: ['HS256'],
@@ -89,7 +99,12 @@ export async function verifyToken(
   if (typeof payload.aud !== 'string') {
     throw new Error('token audience is not a single value');
   }
-  return { sub: payload.sub, aud: payload.aud };
+  // A token minted before this claim existed verifies cleanly, so a default would file it in the
+  // audit trail under a chain nobody observed. One TTL of 401s on rollout is the honest cost.
+  if (typeof payload.net !== 'string' || payload.net === '') {
+    throw new Error('token carries no network');
+  }
+  return { sub: payload.sub, aud: payload.aud, net: payload.net };
 }
 
 /** Return the base64url-encoded raw bytes (what `jose`'s oct key `k` expects). */

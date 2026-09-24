@@ -8,8 +8,8 @@ import { Refusal } from '../src/contract.js';
 /** Only the two fields the gate reads. Each call makes a fresh object, so the WeakMap is per request. */
 const request = (ip = '203.0.113.7') => ({ ip, headers: {} }) as unknown as FastifyRequest;
 
-const PERSON: Subject = { productId: 'app.dot', alias: '0xperson', proven: true };
-const DEV: Subject = { productId: 'app.dot', alias: 'dev:app.dot', proven: false };
+const PERSON: Subject = { productId: 'app.dot', alias: '0xperson', network: 'previewnet', proven: true };
+const DEV: Subject = { productId: 'app.dot', alias: 'dev:app.dot', network: 'previewnet', proven: false };
 
 const refusal = () =>
   new Refusal(401, { tag: 'Other', value: { code: 'UNAUTHORIZED', message: 'Not authorized.' } }, 'no');

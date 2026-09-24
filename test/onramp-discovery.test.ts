@@ -16,7 +16,7 @@ import type {
 import { config, createRequest, fakeStore } from './fixtures.js';
 
 /** An `insecure_dev`-shaped caller. The alias is shared per product, so `proven` is false. */
-const SUBJECT = { productId: 'app.dot', alias: 'dev:app.dot', proven: false };
+const SUBJECT = { productId: 'app.dot', alias: 'dev:app.dot', network: 'previewnet', proven: false };
 
 /** A session body for a corridor the caller names, defaulting to the fixture's. */
 const sessionBody = (over: Record<string, unknown> = {}) => createRequest({ destinationCurrencyCode: 'DOT_ASSETHUB', ...over });
