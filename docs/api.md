@@ -163,6 +163,28 @@ exist at session creation and can arrive minutes to hours afterwards. `GET /fund
 carries a `deposit` object (`address`, `amount`, `currency`, `memo` if the asset needs one, and
 `observedAt`); see `GET /funding/:id` below for the exact shape and its disclosure rule.
 
+How it is read, as Meld advises for a sell:
+
+- **The session first.** A sell's transaction is fetched from Meld's per-session path,
+  `GET /payments/transactions/sessions/{sessionId}`, with the session id this service was given at
+  creation. Until the provider has a transaction Meld answers `404`
+  `TRANSACTION_FETCH_BY_SESSION_NOT_YET_CREATED_WITH_PROVIDER`, which reads as "nothing yet"; the
+  worker then falls back to the reference search (`?externalSessionIds=`) a buy is observed on. Any
+  other failure of the session lookup falls back the same way, so only the reference search failing
+  as well fails the poll.
+- **The address under either name.** From `Meld-Version` 2025-03-04 it is
+  `cryptoDetails.destinationWalletAddress`, before that `offrampDestinationWalletAddress`; the worker
+  reads `destinationWalletAddress ?? offrampDestinationWalletAddress`, so the configured version can
+  move without disclosure going quiet. `sourceWalletAddress` and `sessionWalletAddress` are the
+  seller's own wallet and are never read.
+- **The amount the seller committed.** The transaction's `sourceAmount` when it carries one, the row's
+  own `cryptoAmount` when it does not: Meld's instruction is to send exactly the quoted amount.
+- **The preferred flow.** A sell session asks for `redirectFlow: true`, so Alchemy Pay, Banxa and
+  Transak run KYC, take the payout details and send the seller back to `redirectUrl` instead of
+  showing their own deposit address; the caller sends the funds once it reads the address here.
+  `GET /meld/return?flow=sell` is the frameable landing for that, and says the seller is verified
+  rather than that a payment arrived.
+
 **Written once a rail discloses it, never rewritten -- but a disagreement does not freeze the row.**
 If a rail ever reports a *different* address for a row that already has one, or one that does not
 decode as an account at all, the stored address is never overwritten: the seller was shown that one
