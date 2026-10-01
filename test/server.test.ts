@@ -1782,6 +1782,23 @@ describe('the widget return landing', () => {
       expect(body).not.toContain(leak);
     }
   });
+
+  it('tells a seller back from KYC it is verified, not that a payment was received', async () => {
+    // A sale lands here before anything is paid: the funds leave once the app reads the
+    // provider's deposit address. The buy's page and signal are unchanged.
+    const app = await serve();
+
+    const sell = await app.inject({ method: 'GET', url: '/meld/return?flow=sell' });
+    expect(sell.statusCode).toBe(200);
+    expect(sell.headers['x-frame-options']).toBeUndefined();
+    expect(sell.body).toContain('Verification complete');
+    expect(sell.body).toContain('meld:verified');
+    expect(sell.body).not.toContain('Payment received');
+
+    const buy = await app.inject({ method: 'GET', url: '/meld/return?flow=anything-else' });
+    expect(buy.body).toContain('Payment received');
+    expect(buy.body).toContain('meld:paid');
+  });
 });
 
 describe('what the router rejects before the lifecycle begins', () => {
