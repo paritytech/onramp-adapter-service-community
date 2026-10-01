@@ -286,26 +286,41 @@ describe('MeldDiscovery.defaultFiat for sell: the fiat-limits substitute', () =>
     expect(await d.defaultFiat('GB', 'sell')).toBe('GBP');
   });
 
-  it('does not cache a failed call, so a transport blip cannot pin every off-ramp country to no-fiat', async () => {
+  it('throws on a failed call, and caches nothing, so a transport blip cannot read as no-fiat', async () => {
+    // `''` would say the country has no currency, and the refresh would drop every off-ramp
+    // country until its next pass; a throw lets it hold the last known entry, as for a buy.
     let calls = 0;
     const d = new MeldDiscovery(async () => {
       calls += 1;
       throw new Error('meld down');
     }, ttls(3_600_000));
-    expect(await d.defaultFiat('GB', 'sell')).toBe('');
-    expect(await d.defaultFiat('GB', 'sell')).toBe('');
+    await expect(d.defaultFiat('GB', 'sell')).rejects.toThrow('meld down');
+    await expect(d.defaultFiat('GB', 'sell')).rejects.toThrow('meld down');
     expect(calls).toBe(2);
   });
 
-  it('does not cache an unparseable fiat-limits body', async () => {
+  it('throws on an unparseable fiat-limits body, and caches nothing', async () => {
     let calls = 0;
     const d = new MeldDiscovery(async () => {
       calls += 1;
       return 'not an envelope';
     }, ttls(3_600_000));
-    expect(await d.defaultFiat('GB', 'sell')).toBe('');
-    await d.defaultFiat('GB', 'sell');
+    await expect(d.defaultFiat('GB', 'sell')).rejects.toThrow(/unparseable/);
+    await expect(d.defaultFiat('GB', 'sell')).rejects.toThrow(/unparseable/);
     expect(calls).toBe(2);
+  });
+
+  it('still answers the unrouted corridor, not an error, when the fiat cannot be read', async () => {
+    // The per-selection path turns the throw into "nothing routes here" for this one read.
+    const d = new MeldDiscovery(async () => {
+      throw new Error('meld down');
+    }, ttls(3_600_000));
+    await expect(d.corridorForCountry('GB', 'DOT_ASSETHUB', 'sell')).resolves.toEqual({
+      country: 'GB',
+      fiat: '',
+      crypto: 'DOT_ASSETHUB',
+      methods: [],
+    });
   });
 
   it('re-reads once the cached catalog\'s lifetime has passed', async () => {

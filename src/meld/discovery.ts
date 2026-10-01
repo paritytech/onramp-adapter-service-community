@@ -475,26 +475,21 @@ export class MeldDiscovery implements Discovery {
     const hit = this.fresh(this.offrampFiatCatalog, this.ttls.defaults);
     if (hit !== undefined) return hit.get(country) ?? '';
 
-    let catalog = new Map<string, string>();
-    let real = false;
-    try {
-      const env = fiatLimitsEnvelope.safeParse(
-        await this.get(`/network-partner/supported/fiat-limits?category=${CATEGORY.sell}`),
-      );
-      if (env.success) {
-        for (const row of env.data.fiatLimits ?? []) {
-          if (row.countryCode !== undefined && row.countryCode !== null && !catalog.has(row.countryCode)) {
-            catalog.set(row.countryCode, row.currencyCode ?? '');
-          }
-        }
-        real = true;
+    // A failed or unparseable read throws, as `defaultFiat` promises and as the buy side does. An
+    // `''` here would read as "this country has no currency", and the refresh would drop every
+    // off-ramp country until its next pass instead of holding the last known entry.
+    const env = fiatLimitsEnvelope.safeParse(
+      await this.get(`/network-partner/supported/fiat-limits?category=${CATEGORY.sell}`),
+    );
+    if (!env.success) throw new Error('unparseable off-ramp fiat-limits response');
+    const catalog = new Map<string, string>();
+    for (const row of env.data.fiatLimits ?? []) {
+      if (row.countryCode !== undefined && row.countryCode !== null && !catalog.has(row.countryCode)) {
+        catalog.set(row.countryCode, row.currencyCode ?? '');
       }
-    } catch {
-      catalog = new Map();
     }
-    // As with every other cache here, only a real (parsed) answer is memoised, so a transport
-    // failure cannot pin every off-ramp country to "no fiat" for a whole TTL.
-    if (real) this.offrampFiatCatalog = { at: this.clock(), value: catalog };
+    // As with every other cache here, only a real (parsed) answer is memoised.
+    this.offrampFiatCatalog = { at: this.clock(), value: catalog };
     return catalog.get(country) ?? '';
   }
 }
