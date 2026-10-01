@@ -600,10 +600,46 @@ function depositIsNew(record: FundingRecord, deposit: RailDeposit): boolean {
     record.deposit_address === canonical &&
     // `currency` is required on `RailDeposit` (see its doc comment), unlike `amount` and `memo`.
     record.deposit_currency === deposit.currency &&
-    (deposit.amount === undefined || record.deposit_amount === deposit.amount) &&
+    (deposit.amount === undefined || sameAmount(record.deposit_amount, deposit.amount)) &&
     (deposit.memo === undefined || record.deposit_memo === deposit.memo);
   const matchesKnownConflict = record.deposit_conflict_address === deposit.address;
   return !matchesAccepted && !matchesKnownConflict;
+}
+
+/**
+ * A plain non-negative decimal: digits, optionally a point and more digits. The only shape
+ * `sameAmount` reads as a number.
+ */
+const PLAIN_DECIMAL = /^\d+(\.\d+)?$/;
+
+/**
+ * Whether a reported amount names the one already on file, compared exactly and never as a float.
+ *
+ * Two plain decimals are compared by value, so `23.4521`, `23.45210000` and `023.4521` are one
+ * amount. A sell's first disclosure can carry the committed `crypto_amount` (see `depositFrom` in
+ * `meld/rail.ts`), and Meld's own figure for the same amount need not be spelled the same way;
+ * compared as text, the pair reads as new on every poll, which is the perpetual write
+ * `depositIsNew` exists to stop.
+ *
+ * Anything else, an exponent or a sign say, is compared as exact text: reading it as a number would
+ * be a guess, and text costs at most the write it always did. Nothing rides on this answer but that
+ * write, since `mergeDeposit` never revises an amount that has landed.
+ *
+ * Local rather than in `money.ts`, which is the fiat minor-units module; a crypto amount never
+ * becomes minor units (see `CRYPTO_DECIMAL` in `contract.ts`).
+ */
+function sameAmount(stored: string | undefined, reported: string): boolean {
+  // Nothing on file yet: an amount arriving after the address is new, and `mergeDeposit` fills it in.
+  if (stored === undefined) return false;
+  if (!PLAIN_DECIMAL.test(stored) || !PLAIN_DECIMAL.test(reported)) return stored === reported;
+  return plainSpelling(stored) === plainSpelling(reported);
+}
+
+/** A plain decimal without the zeros that do not change its value: `023.45210000` is `23.4521`. */
+function plainSpelling(decimal: string): string {
+  const [whole = '0', fraction = ''] = decimal.split('.');
+  const significant = fraction.replace(/0+$/, '');
+  return whole.replace(/^0+(?=\d)/, '') + (significant === '' ? '' : `.${significant}`);
 }
 
 /**

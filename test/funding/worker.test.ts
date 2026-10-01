@@ -1959,6 +1959,104 @@ describe('a sell whose provider discloses a deposit address', () => {
     await store.close();
   });
 
+  it('does not keep writing when the accepted amount is re-disclosed in another spelling', async () => {
+    // A sell's first disclosure can carry the row's own committed figure, and Meld's later one for
+    // the same amount need not be spelled the same way. Compared as text, every poll would write.
+    for (const amount of ['23.45210000', '023.4521', '23.4521']) {
+      const { store, updated } = tracking([
+        inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
+      ]);
+
+      const advanced = await tick(
+        store,
+        NOW,
+        observations(async () => ({
+          id: 'tx-1',
+          status: 'PENDING',
+          deposit: { address: ALICE, amount, currency: 'DOT_ASSETHUB' },
+        })),
+        MAX_AGE,
+        () => undefined,
+        lease(),
+      );
+
+      expect(advanced).toBe(0);
+      expect(updated).not.toHaveBeenCalled();
+      await store.close();
+    }
+  });
+
+  it('still takes a different amount, or one that is not a plain decimal, as new', async () => {
+    // By value only for plain decimals: another value, and any other shape spelled differently,
+    // reach the store as they always did, where the amount that landed first is kept.
+    for (const [stored, amount] of [
+      ['23.4521', '23.4522'],
+      ['1e1', '10'],
+    ] as const) {
+      const { store, updated } = tracking([
+        inFlight({ deposit_address: ALICE, deposit_amount: stored, deposit_currency: 'DOT_ASSETHUB' }),
+      ]);
+
+      await tick(
+        store,
+        NOW,
+        observations(async () => ({
+          id: 'tx-1',
+          status: 'PENDING',
+          deposit: { address: ALICE, amount, currency: 'DOT_ASSETHUB' },
+        })),
+        MAX_AGE,
+        () => undefined,
+        lease(),
+      );
+
+      expect(updated).toHaveBeenCalledTimes(1);
+      expect((await store.byId('funding-1'))?.deposit_amount).toBe(stored);
+      await store.close();
+    }
+  });
+
+  it('writes an amount that arrives after the address, once', async () => {
+    const { store, updated } = tracking([
+      inFlight({ deposit_address: ALICE, deposit_amount: undefined, deposit_currency: 'DOT_ASSETHUB' }),
+    ]);
+    const disclosed = observations(async () => ({
+      id: 'tx-1',
+      status: 'PENDING',
+      deposit: { address: ALICE, amount: '23.4521', currency: 'DOT_ASSETHUB' },
+    }));
+
+    await tick(store, NOW, disclosed, MAX_AGE, () => undefined, lease());
+    expect(updated).toHaveBeenCalledTimes(1);
+    expect((await store.byId('funding-1'))?.deposit_amount).toBe('23.4521');
+
+    await tick(store, NOW + 1_000, disclosed, MAX_AGE, () => undefined, lease());
+    expect(updated).toHaveBeenCalledTimes(1);
+    await store.close();
+  });
+
+  it('reads a repeated amount that is not a plain decimal as the same only when it is spelled the same', async () => {
+    const { store, updated } = tracking([
+      inFlight({ deposit_address: ALICE, deposit_amount: '1e1', deposit_currency: 'DOT_ASSETHUB' }),
+    ]);
+
+    await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: ALICE, amount: '1e1', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    expect(updated).not.toHaveBeenCalled();
+    await store.close();
+  });
+
   it('logs, on ageing out, that an address was disclosed with no settlement ever observed', async () => {
     const { store } = tracking([
       inFlight({ deposit_address: ALICE, deposit_amount: '1.0', deposit_currency: 'DOT_ASSETHUB' }),
