@@ -81,13 +81,12 @@ const SESSION_TYPE: Readonly<Record<Direction, 'BUY' | 'SELL'>> = Object.freeze(
  *
  * `/payments/crypto/quote` and `/crypto/session/widget` are confirmed by the integrating client.
  *
- * TODO(sandbox): the transaction lookup is reported rather than confirmed here, and there is a
- * known inconsistency to resolve with it: `createWidgetSession` returns Meld's session id,
- * while this is the transaction path. A live-sandbox probe found Meld exposes no per-session
- * lookup and that `?sessionId=` on the collection answers `400`, so the session id is not a
- * usable join even though the transaction record carries one; the reference is. A wrong path here
- * answers 404, but boot never calls it (the probe is a quote), so nothing catches it before a
- * buyer does.
+ * TODO(sandbox): the transaction lookup is reported rather than confirmed here. A live-sandbox
+ * probe found `?sessionId=` on the collection answers `400`, so the query form is no join; the
+ * reference is. Meld does document a per-session path, `/payments/transactions/sessions/{id}`,
+ * which a sell reads first (`transactionBySession`); a buy stays on the reference, which is
+ * observed to round-trip. A wrong path here answers 404, but boot never calls it (the probe is a
+ * quote), so nothing catches it before a buyer does.
  */
 const QUOTE = '/payments/crypto/quote';
 const CREATE_WIDGET_SESSION = '/crypto/session/widget';
@@ -369,15 +368,20 @@ const transactionResponse = z
     destinationAmount: scalarAmount.nullish(),
     serviceProvider: z.string().nullish(),
     /**
-     * The off-ramp deposit address, when Meld has issued one. Confirmed, live: the key exists on
-     * every transaction record probed (buy and sell alike), spelled exactly as here, and is
-     * `null` on every one of them, because every probed record was a buy -- a buy's wallet address
-     * is the caller's own, sent before the session opened, so there is nothing here for it. It has
-     * never been observed populated: no sell has been driven through this account's one onboarded
-     * provider far enough to produce a transaction (see the probe note). `.loose()` on the nested
-     * object rather than a bare string, so a field Meld adds beside it does not break this.
+     * The off-ramp deposit address, when Meld has issued one, under either of its names. Meld:
+     * from `Meld-Version` 2025-03-04 it is `destinationWalletAddress` (the seller's own wallet is
+     * `sourceWalletAddress`), before that `offrampDestinationWalletAddress`; reading
+     * `destinationWalletAddress ?? offrampDestinationWalletAddress` covers both. Only a sell's
+     * record is read for it: on a buy `destinationWalletAddress` is the buyer's own address.
+     * `.loose()` on the nested object, so a field Meld adds beside these does not break this.
      */
-    cryptoDetails: z.object({ offrampDestinationWalletAddress: z.string().nullish() }).loose().nullish(),
+    cryptoDetails: z
+      .object({
+        destinationWalletAddress: z.string().nullish(),
+        offrampDestinationWalletAddress: z.string().nullish(),
+      })
+      .loose()
+      .nullish(),
   })
   .loose();
 
@@ -392,6 +396,20 @@ const transactionSearchResponse = z.union([
   z.array(transactionResponse),
   z.object({ transactions: z.array(transactionResponse) }).loose(),
 ]);
+
+/** The per-session lookup's answer: the one transaction, wrapped. Meld's reference documents it
+ *  as `{ "transaction": { ... } }`. */
+const transactionBySessionResponse = z.object({ transaction: transactionResponse }).loose();
+
+/**
+ * Meld's answer to a per-session lookup made before the provider has a transaction for the
+ * session: `404` with this code. Not a fault: a seller still in KYC has none yet.
+ */
+const TRANSACTION_NOT_YET_CREATED = 'TRANSACTION_FETCH_BY_SESSION_NOT_YET_CREATED_WITH_PROVIDER';
+
+/** The transaction Meld files under a session: its documented force-fetch path. */
+const transactionBySessionPath = (sessionId: string) =>
+  `/payments/transactions/sessions/${encodeURIComponent(sessionId)}`;
 
 // --- client -----------------------------------------------------------------
 
@@ -618,6 +636,13 @@ export class MeldClient {
         // and JSON.stringify drops an undefined value, so a conditional spread would render the
         // identical bytes.
         redirectUrl: params.redirectUrl,
+        // A sell only: Meld's preferred off-ramp flow. The provider runs KYC and takes the payout
+        // details, then sends the seller back to `redirectUrl` instead of showing its own deposit
+        // address, because here the funds are sent for the seller once the address is read off
+        // the transaction. Honoured by Alchemy Pay, Banxa and Transak; the others run their
+        // standard flow, and the address is read the same way. Undefined on a buy, so its bytes
+        // are unchanged.
+        redirectFlow: params.direction === 'sell' ? true : undefined,
       },
       // The join key, at the top level of the request rather than inside `sessionData`: that
       // placement is what makes it round-trip onto the transaction record (observed, not assumed).
@@ -638,6 +663,29 @@ export class MeldClient {
   async transaction(id: string): Promise<MeldTransaction> {
     const body = await this.send('GET', transactionPath(id));
     return this.read(transactionResponse, body, 'transaction');
+  }
+
+  /**
+   * The transaction Meld filed under session `sessionId`, or nothing while the provider has not
+   * created one. Meld's documented lookup for a sell's deposit address, and a direct one: the
+   * session id this service was handed at creation, rather than a search that has to be
+   * re-checked against the reference it filtered on.
+   */
+  async transactionBySession(sessionId: string): Promise<MeldTransaction | undefined> {
+    let body: unknown;
+    try {
+      body = await this.send('GET', transactionBySessionPath(sessionId));
+    } catch (error) {
+      if (
+        error instanceof MeldHttpError &&
+        error.status === 404 &&
+        error.code === TRANSACTION_NOT_YET_CREATED
+      ) {
+        return undefined;
+      }
+      throw error;
+    }
+    return this.read(transactionBySessionResponse, body, 'session transaction').transaction;
   }
 
   /**

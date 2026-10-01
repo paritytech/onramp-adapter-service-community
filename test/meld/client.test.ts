@@ -198,8 +198,9 @@ describe('createWidgetSession', () => {
     // `sessionType` is `SELL` (the enum is `BUY, SELL, TRANSFER`); `sourceCurrencyCode` is the
     // crypto and `destinationCurrencyCode` the fiat, which the server enforces rather than
     // merely accepts; `sourceAmount` is the crypto committed, at a precision the fiat field
-    // could not hold; and there is no `walletAddress` at all, because Meld does not require one
-    // on a SELL and issues the deposit address itself.
+    // could not hold; there is no `walletAddress` at all, because Meld does not require one
+    // on a SELL and issues the deposit address itself; and `redirectFlow` asks the providers
+    // that honour it for Meld's preferred off-ramp flow.
     expect(JSON.parse(sentInit(fetchMock).body as string)).toEqual({
       sessionType: 'SELL',
       sessionData: {
@@ -217,9 +218,24 @@ describe('createWidgetSession', () => {
           'paymentMethodType',
         ],
         externalCustomerId: 'idem-sell-0001',
+        redirectFlow: true,
       },
       externalSessionId: 'idem-sell-0001',
     });
+  });
+
+  it('asks for the preferred off-ramp flow on a sell and never on a buy', async () => {
+    // A buy's bytes must not move: `redirectFlow` is a sell's term, and Meld reads it on a sell.
+    const sellFetch = stub(200, session);
+    await client().createWidgetSession(sellParams());
+    expect((sentBody(sellFetch) as { sessionData: Record<string, unknown> }).sessionData.redirectFlow).toBe(
+      true,
+    );
+    const buyFetch = stub(200, session);
+    await client().createWidgetSession(params());
+    expect((sentBody(buyFetch) as { sessionData: Record<string, unknown> }).sessionData).not.toHaveProperty(
+      'redirectFlow',
+    );
   });
 
   it('omits walletAddress from a sell entirely, rather than sending it empty', async () => {
@@ -992,6 +1008,71 @@ describe('transaction', () => {
 
     const txn = await client().transaction('tx-1');
     expect(txn.cryptoDetails).toBeUndefined();
+  });
+
+  it('reads the deposit address under its 2025-03-04 name as well', async () => {
+    // From that Meld-Version the provider's deposit address is `destinationWalletAddress`, and
+    // the seller's own wallet `sourceWalletAddress`; the schema must keep the first.
+    stub(200, {
+      id: 'tx-1',
+      status: 'PENDING',
+      cryptoDetails: {
+        destinationWalletAddress: '1DepositAddress',
+        sourceWalletAddress: '1SellersOwnWallet',
+      },
+    });
+
+    const txn = await client().transaction('tx-1');
+    expect(txn.cryptoDetails?.destinationWalletAddress).toBe('1DepositAddress');
+  });
+});
+
+describe('transactionBySession', () => {
+  it('reads the transaction Meld wraps under the session', async () => {
+    const fetchMock = stub(200, { transaction: { id: 'tx-1', status: 'PENDING', sourceAmount: '12.5' } });
+
+    await expect(client().transactionBySession('meld-session-1')).resolves.toMatchObject({
+      id: 'tx-1',
+      sourceAmount: '12.5',
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      'https://api-sb.meld.io/payments/transactions/sessions/meld-session-1',
+    );
+    const init = sentInit(fetchMock);
+    expect(init.method).toBe('GET');
+    expect(init.body).toBeUndefined();
+  });
+
+  it('reads nothing yet while the provider has not created the transaction', async () => {
+    // A seller still in KYC: Meld's own answer for it, not a fault.
+    stub(404, {
+      code: 'TRANSACTION_FETCH_BY_SESSION_NOT_YET_CREATED_WITH_PROVIDER',
+      message: 'Transaction associated with this session/order has not been created with the service provider yet',
+    });
+
+    await expect(client().transactionBySession('meld-session-1')).resolves.toBeUndefined();
+  });
+
+  it('passes any other refusal through, a 404 included', async () => {
+    stub(404, { code: 'SOMETHING_ELSE' });
+    await expect(client().transactionBySession('meld-session-1')).rejects.toBeInstanceOf(MeldHttpError);
+
+    stub(401, { code: 'UNAUTHORIZED' });
+    await expect(client().transactionBySession('meld-session-1')).rejects.toBeInstanceOf(MeldHttpError);
+  });
+
+  it('refuses an answer that does not carry the wrapped transaction', async () => {
+    stub(200, { id: 'tx-1', status: 'PENDING' });
+    await expect(client().transactionBySession('meld-session-1')).rejects.toThrow(
+      /unreadable session transaction/,
+    );
+  });
+
+  it('url-encodes the session id rather than interpolating it raw', async () => {
+    const fetchMock = stub(200, { transaction: { id: 'tx-1' } });
+    await client().transactionBySession('a/b ?x');
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('a%2Fb%20%3Fx');
   });
 });
 
