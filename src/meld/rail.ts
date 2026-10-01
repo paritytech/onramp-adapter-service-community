@@ -151,14 +151,27 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
    * How the settlement worker observes this rail.
    *
    * The finder looks the transaction up by the reference the session was filed under: this
-   * record's own id, which is globally unique by construction.
+   * record's own id, which is globally unique by construction. A sell asks Meld's per-session
+   * path first, the lookup Meld documents for reading a sale's deposit address, and falls back to
+   * the reference while that has nothing.
+   *
+   * It falls back the same way when the per-session lookup fails, whatever the failure (a 5xx,
+   * another 4xx, a transport error, a body that does not read): the reference can still answer,
+   * and a throw here would fail the poll and count towards the worker's failure ceiling for every
+   * sell in the tick. Only the reference's own failure propagates, so the finder throws only when
+   * neither lookup could answer. The swallowed failure is not logged: neither this rail nor its
+   * client holds a logger.
    */
   observation(): RailObservation {
     return {
       finder: async (record) => {
+        const bySession =
+          record.direction === 'sell' && record.provider_session_id !== undefined
+            ? await this.client.transactionBySession(record.provider_session_id).catch(() => undefined)
+            : undefined;
         // The record's own id, which is what was filed with Meld (not `client_reference`, the
         // caller's key). See `RailSessionInput.clientReference` for why.
-        const txn = await this.client.transactionByReference(record.id);
+        const txn = bySession ?? (await this.client.transactionByReference(record.id));
         if (txn === undefined) return undefined;
         const deposit = depositFrom(record, txn);
         return { id: txn.id, status: txn.status ?? null, ...(deposit === undefined ? {} : { deposit }) };
@@ -172,13 +185,15 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
  * The off-ramp deposit fact, read off Meld's transaction record. `undefined` on a buy, always,
  * and on a sell until the provider discloses one.
  *
- * **The address**: `cryptoDetails.offrampDestinationWalletAddress`, confirmed to exist on the
- * schema and confirmed `null` on every buy record this account has produced. It has never been
- * observed populated -- no sell has been driven through this account's one onboarded provider far
- * enough to produce a transaction at all (DOT_ASSETHUB is not sellable on it; see the probe). That
- * gap is why this reads the field defensively (nullish, not asserted) rather than trusting it.
+ * **The address**: `cryptoDetails.destinationWalletAddress ?? offrampDestinationWalletAddress`,
+ * as Meld advises for either side of `Meld-Version` 2025-03-04. The old name is confirmed to exist
+ * on the schema and `null` on every buy record this account has produced; neither has been
+ * observed populated, since no sell has been driven through this account's one onboarded provider
+ * far enough to produce a transaction (DOT_ASSETHUB is not sellable on it; see the probe). That
+ * gap is why both are read defensively (nullish, not asserted) rather than trusted.
  *
- * **The amount**: the top-level `sourceAmount`, not `serviceProviderDetails.details.cryptoAmount`.
+ * **The amount**: the top-level `sourceAmount`, not `serviceProviderDetails.details.cryptoAmount`,
+ * and the committed `crypto_amount` when the transaction carries none.
  * Two reasons, not one. First, `sourceAmount` is already this service's name for the crypto leg of
  * a sell everywhere else in this file (`SellQuoteParams`, `SellWidgetSessionParams`) -- it is the
  * exact amount the seller committed, typed and schema-validated, where
@@ -201,11 +216,17 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
  */
 function depositFrom(record: FundingRecord, txn: MeldTransaction): RailDeposit | undefined {
   if (record.direction !== 'sell') return undefined;
-  const address = txn.cryptoDetails?.offrampDestinationWalletAddress ?? undefined;
+  // Meld's own advice for reading it under any Meld-Version: the new name, then the old one.
+  const details = txn.cryptoDetails;
+  const address = details?.destinationWalletAddress ?? details?.offrampDestinationWalletAddress ?? undefined;
   if (address === undefined) return undefined;
+  // The provider's figure when the transaction carries one, the committed one when it does not:
+  // Meld's instruction is to send exactly the quoted amount, and a disclosure held back for want
+  // of a figure this service already has would stop a sale that is ready.
+  const amount = txn.sourceAmount ?? record.crypto_amount;
   return {
     address,
-    ...(txn.sourceAmount === undefined || txn.sourceAmount === null ? {} : { amount: txn.sourceAmount }),
+    ...(amount === undefined ? {} : { amount }),
     currency: record.destination_currency_code,
   };
 }

@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { fundingRecord, railSellSessionInput, railSessionInput, sellRecord } from '../fixtures.js';
 
-import { MeldClient } from '../../src/meld/client.js';
+import { upstreamUnavailable } from '../../src/contract.js';
+import { MeldClient, MeldHttpError } from '../../src/meld/client.js';
 import { Secret } from '../../src/secret.js';
 import { MeldRail } from '../../src/meld/rail.js';
 
@@ -334,32 +335,65 @@ describe('MeldRail.observation', () => {
   );
 
   describe('the deposit disclosure', () => {
+    /** A client whose session lookup and reference search answer from fixed transactions. */
+    const sellClient = (byReference: unknown, bySession?: unknown) => {
+      const transactionByReference = vi.fn(async () => byReference);
+      const transactionBySession = vi.fn(async () => bySession);
+      return {
+        transactionByReference,
+        transactionBySession,
+        rail: new MeldRail({ transactionByReference, transactionBySession } as unknown as MeldClient),
+      };
+    };
+
     it('never surfaces one for a buy, even when the transaction carries the field', async () => {
       // A buy's wallet address is the caller's own, sent before the session opened; there is
       // nothing for a provider to disclose, no matter what the transaction record says.
-      const transactionByReference = vi.fn(async () => ({
+      const { rail, transactionBySession } = sellClient({
         id: 'tx-1',
         status: 'SETTLED',
-        cryptoDetails: { offrampDestinationWalletAddress: '1SomeAddress' },
-      }));
-      const rail = new MeldRail({ transactionByReference } as unknown as MeldClient);
+        cryptoDetails: {
+          offrampDestinationWalletAddress: '1SomeAddress',
+          destinationWalletAddress: '1TheBuyersOwnAddress',
+        },
+      });
 
       const seen = await rail.observation().finder(recordWith('idem-1'));
 
       expect(seen).not.toHaveProperty('deposit');
+      // And a buy is never looked up by session: it stays on the reference it is observed on.
+      expect(transactionBySession).not.toHaveBeenCalled();
     });
 
-    it('surfaces the address and amount for a sell, from the transaction record', async () => {
-      const transactionByReference = vi.fn(async () => ({
+    it('reads a sell by its Meld session first, the lookup Meld documents for it', async () => {
+      const { rail, transactionBySession, transactionByReference } = sellClient(undefined, {
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: '12.3456789012',
+        cryptoDetails: { destinationWalletAddress: '1DepositAddress' },
+      });
+
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+
+      expect(transactionBySession).toHaveBeenCalledWith('meld-1');
+      expect(transactionByReference).not.toHaveBeenCalled();
+      expect(seen?.deposit).toEqual({
+        address: '1DepositAddress',
+        amount: '12.3456789012',
+        currency: 'DOT_ASSETHUB',
+      });
+    });
+
+    it('falls back to the reference while the session has no transaction, or no session is known', async () => {
+      const found = {
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: '12.3456789012',
         cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
-      }));
-      const rail = new MeldRail({ transactionByReference } as unknown as MeldClient);
-
-      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
-
+      };
+      const pending = sellClient(found);
+      const seen = await pending.rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+      expect(pending.transactionByReference).toHaveBeenCalledWith('funding-1');
       expect(seen?.deposit).toEqual({
         address: '1DepositAddress',
         amount: '12.3456789012',
@@ -367,42 +401,116 @@ describe('MeldRail.observation', () => {
         // called.
         currency: 'DOT_ASSETHUB',
       });
+
+      const sessionless = sellClient(found);
+      await sessionless.rail.observation().finder(sellRecord({ provider_session_id: undefined }));
+      expect(sessionless.transactionBySession).not.toHaveBeenCalled();
+      expect(sessionless.transactionByReference).toHaveBeenCalledWith('funding-1');
+    });
+
+    it.each([
+      ['a 5xx', new MeldHttpError(503)],
+      ['a 404 that is not "not yet created"', new MeldHttpError(404, 'SOMETHING_ELSE')],
+      ['a transport failure or a body that does not read', upstreamUnavailable('Meld GET failed: fetch failed')],
+    ])('falls back to the reference when the session lookup fails with %s', async (_kind, failure) => {
+      // The reference can still answer. Thrown out of the finder, this would fail the poll, and
+      // every sell in the tick would count towards the worker's failure ceiling while it did.
+      const { rail, transactionBySession, transactionByReference } = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: '12.3456789012',
+        cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
+      });
+      transactionBySession.mockRejectedValue(failure);
+
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+
+      expect(transactionBySession).toHaveBeenCalledWith('meld-1');
+      expect(transactionByReference).toHaveBeenCalledWith('funding-1');
+      expect(seen).toEqual({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: '1DepositAddress', amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+      });
+    });
+
+    it("propagates the reference's own failure when the session lookup has failed too", async () => {
+      // Neither lookup answered, so there is no "nothing yet" to report: the throw is what lets
+      // the worker conclude `unobserved` past the window rather than `expired`.
+      const { rail, transactionBySession, transactionByReference } = sellClient(undefined);
+      const failure = new MeldHttpError(502);
+      transactionBySession.mockRejectedValue(new MeldHttpError(503));
+      transactionByReference.mockRejectedValue(failure);
+
+      await expect(rail.observation().finder(sellRecord())).rejects.toBe(failure);
+    });
+
+    it('prefers the address under its 2025-03-04 name, and reads the old one without it', async () => {
+      const both = sellClient(undefined, {
+        id: 'tx-1',
+        status: 'PENDING',
+        cryptoDetails: {
+          destinationWalletAddress: '1NewName',
+          offrampDestinationWalletAddress: '1OldName',
+        },
+      });
+      expect((await both.rail.observation().finder(sellRecord()))?.deposit?.address).toBe('1NewName');
+
+      const old = sellClient(undefined, {
+        id: 'tx-1',
+        status: 'PENDING',
+        cryptoDetails: { destinationWalletAddress: null, offrampDestinationWalletAddress: '1OldName' },
+      });
+      expect((await old.rail.observation().finder(sellRecord()))?.deposit?.address).toBe('1OldName');
     });
 
     it('omits the deposit for a sell until the provider discloses an address', async () => {
-      const transactionByReference = vi.fn(async () => ({
+      const { rail } = sellClient({
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: '12.3456789012',
         cryptoDetails: { offrampDestinationWalletAddress: null },
-      }));
-      const rail = new MeldRail({ transactionByReference } as unknown as MeldClient);
+      });
 
       const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
 
       expect(seen).not.toHaveProperty('deposit');
     });
 
-    it('discloses the address alone, rather than nothing, when Meld reports no amount', async () => {
-      // The amount path is unverified; the address must not wait on it. `RailDeposit.amount` is
-      // optional for exactly this.
-      const transactionByReference = vi.fn(async () => ({
+    it('discloses the committed amount when Meld reports none', async () => {
+      // Meld's instruction is to send exactly the quoted figure, and this row holds it: a
+      // disclosure held back for want of a number already known would stop a sale that is ready.
+      const { rail } = sellClient({
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: null,
         cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
-      }));
-      const rail = new MeldRail({ transactionByReference } as unknown as MeldClient);
+      });
 
       const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
 
+      expect(seen?.deposit).toEqual({
+        address: '1DepositAddress',
+        amount: '12.3456789012',
+        currency: 'DOT_ASSETHUB',
+      });
+    });
+
+    it('discloses the address alone when neither Meld nor the row has an amount', async () => {
+      const { rail } = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: null,
+        cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
+      });
+
+      const seen = await rail.observation().finder(sellRecord({ crypto_amount: undefined }));
+
       expect(seen?.deposit).toEqual({ address: '1DepositAddress', currency: 'DOT_ASSETHUB' });
-      expect(seen?.deposit).not.toHaveProperty('amount');
     });
 
     it('omits the deposit for a sell whose transaction carries no cryptoDetails at all', async () => {
-      const transactionByReference = vi.fn(async () => ({ id: 'tx-1', status: 'PENDING' }));
-      const rail = new MeldRail({ transactionByReference } as unknown as MeldClient);
+      const { rail } = sellClient({ id: 'tx-1', status: 'PENDING' });
 
       const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
 
