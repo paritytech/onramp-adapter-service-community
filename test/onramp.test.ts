@@ -1729,6 +1729,53 @@ describe('cancelling a request', () => {
     expect(row?.cancelled_at).toBeUndefined();
   });
 
+  it('refuses to cancel a sell whose provider has opened its order, without claiming a payment is on its way', async () => {
+    // A sell's transaction opens with the seller's KYC, before anything is sent, so the buy's
+    // sentence would claim a transfer that does not exist.
+    const meld = new FakeMeld();
+    const { service, funding } = build(meld);
+    const opened = await service.createSession(
+      SUBJECT,
+      sellRequest({ idempotencyKey: 'idem-cancel-sell-2' }) as unknown as Parameters<Onramp['createSession']>[1],
+      REQUEST_ID,
+    );
+    await funding.update(opened.fundingRequestId, 'transaction_seen', NOW + 1, { providerTransactionId: 'tx-1' });
+
+    const failure = await failureOf(() => service.cancel(SUBJECT, opened.fundingRequestId, REQUEST_ID, NOW + 5));
+
+    expect(failure).toMatchObject({
+      value: {
+        code: 'REQUEST_NOT_CANCELLABLE',
+        message: 'The provider has already opened its order for that request. It cannot be cancelled here.',
+        fundingRequestId: opened.fundingRequestId,
+      },
+    });
+  });
+
+  it('answers a cancel of a concluded sell as concluded, whatever it carries', async () => {
+    const meld = new FakeMeld();
+    const { service, funding } = build(meld);
+    const opened = await service.createSession(
+      SUBJECT,
+      sellRequest({ idempotencyKey: 'idem-cancel-sell-3' }) as unknown as Parameters<Onramp['createSession']>[1],
+      REQUEST_ID,
+    );
+    await funding.update(opened.fundingRequestId, 'transaction_seen', NOW + 1, {
+      providerTransactionId: 'tx-1',
+      deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+    });
+    await funding.update(opened.fundingRequestId, 'failed', NOW + 2, { providerStatus: 'FAILED' });
+
+    const failure = await failureOf(() => service.cancel(SUBJECT, opened.fundingRequestId, REQUEST_ID, NOW + 5));
+
+    expect(failure).toMatchObject({
+      value: {
+        code: 'REQUEST_NOT_CANCELLABLE',
+        message: 'That request has already concluded. There is nothing to cancel.',
+      },
+    });
+  });
+
   it('lets a cancelled request still settle, because the buyer may already have paid', async () => {
     // The whole reason cancelling is a column and not a ninth state. A transfer sent seconds
     // before the cancel arrives afterwards, and it must be recorded against this row rather than

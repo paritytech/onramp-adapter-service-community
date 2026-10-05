@@ -96,19 +96,6 @@ function committedTerm(value: string | undefined, field: string, direction: Dire
 }
 
 /**
- * The pinned terms as a stored row holds them.
- *
- * One projection, used by the replay response, the replay audit line and the cancel audit line,
- * because those three said the same thing three times and a direction-dependent field is exactly
- * the kind that gets added to two of three. Each amount is emitted only where it exists: a buy's
- * body is unchanged, and a sell echoes the crypto it committed rather than a fiat term it did
- * not.
- *
- * The `cryptoAmount` echo is load-bearing on a sell. A resuming client compares it against the
- * sale it believes it is resuming and refuses on a mismatch; on a buy the wallet address does
- * that job, and a sell has none.
- */
-/**
  * The direction, as an audit line carries it: nothing at all on a buy.
  *
  * Omitted rather than emitted as `'buy'`, so every audit line a buy produces is byte-identical
@@ -142,6 +129,19 @@ function auditTerms(terms: CreateSessionResponse['pinned']): Pick<
   };
 }
 
+/**
+ * The pinned terms as a stored row holds them.
+ *
+ * One projection, used by the replay response, the replay audit line and the cancel audit line,
+ * because those three said the same thing three times and a direction-dependent field is exactly
+ * the kind that gets added to two of three. Each amount is emitted only where it exists: a buy's
+ * body is unchanged, and a sell echoes the crypto it committed rather than a fiat term it did
+ * not.
+ *
+ * The `cryptoAmount` echo is load-bearing on a sell. A resuming client compares it against the
+ * sale it believes it is resuming and refuses on a mismatch; on a buy the wallet address does
+ * that job, and a sell has none.
+ */
 function pinnedOf(record: FundingRecord): CreateSessionResponse['pinned'] {
   return {
     destinationCurrencyCode: record.destination_currency_code,
@@ -859,14 +859,17 @@ export class Onramp {
     // one it has no way to observe or undo. Reusing "a payment is already on its way" here would
     // claim a transfer that may not exist yet, and would be wrong on the far more common case: a
     // seller who has not sent anything yet, but could at any moment.
-    const refusal =
-      existing.deposit_address !== undefined
+    // A concluded request says so first, whatever it carries: nothing about it can change now.
+    const refusal = TERMINAL_STATES.includes(existing.status)
+      ? 'That request has already concluded. There is nothing to cancel.'
+      : existing.deposit_address !== undefined
         ? 'A deposit address has already been shown for that request. It cannot be cancelled: the ' +
           'seller may already be sending crypto to it, and this service has no way to see or stop ' +
           'an on-chain transfer once it starts.'
-        : existing.status === 'transaction_seen'
-          ? 'A payment is already on its way for that request. It cannot be cancelled.'
-          : 'That request has already concluded. There is nothing to cancel.';
+        : existing.direction === 'sell'
+          ? // A sell's transaction opens with the seller's KYC, before anything is sent.
+            'The provider has already opened its order for that request. It cannot be cancelled here.'
+          : 'A payment is already on its way for that request. It cannot be cancelled.';
     this.audit.info(
       { ...this.cancelEvent('session.cancel_refused', subject, requestId, existing), reason: existing.status },
       `funding request ${existing.id} could not be withdrawn from ${existing.status}`,
@@ -1270,9 +1273,9 @@ export class Onramp {
       widget_url: undefined,
       hosted_widget_url: undefined,
       expires_at: undefined,
-      // The deposit leg is observed, never requested, and nothing observes it yet: the worker
-      // that reads a provider-issued deposit address is a later step. Written out rather than
-      // omitted, so a row's shape is stated in full at the one place rows are built.
+      // The deposit leg is observed, never requested: the worker fills it from the provider's
+      // transaction (see `meld/rail.ts`). Written out rather than omitted, so a row's shape is
+      // stated in full at the one place rows are built.
       deposit_address: undefined,
       deposit_amount: undefined,
       deposit_currency: undefined,
