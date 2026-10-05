@@ -114,10 +114,11 @@ export interface FundingRecord {
    * The sell deposit leg: where the seller sends the crypto, how much, in what, with what memo,
    * and when this service first read it off the rail.
    *
-   * Written once, by `mergeDeposit` (`funding/merge.ts`), from the first disclosure the worker
-   * observes, and never silently revised after that: a later poll fills in a field still
-   * `undefined` but does not overwrite one already set. `undefined` on every buy, always, and on
-   * a sell until the provider discloses one.
+   * The address is written once, by `mergeDeposit` (`funding/merge.ts`), from the first disclosure
+   * the worker observes, and never revised after that. The amount and the asset follow the
+   * provider: a later poll that restates them for the same address replaces them, and the worker
+   * logs the old and new values. `observedAt` dates the address, not the terms. `undefined` on
+   * every buy, always, and on a sell until the provider discloses one.
    */
   deposit_address?: string | undefined;
   deposit_amount?: string | undefined;
@@ -129,10 +130,9 @@ export interface FundingRecord {
    * thrown: a rail reporting a different address than the one already stored (or one that does
    * not decode as an account at all) is an integrity problem `mergeDeposit` never lets overwrite
    * `deposit_address`, so the rejected value lives here instead, queryable by an operator without
-   * anyone needing to grep logs. Deliberately absent from `FundingRequestDto`: exactly as
-   * `reason` is recorded but not surfaced (see below), whether a caller sees that a rail
-   * disagreed with itself is a product decision this column does not pre-empt, and the seller has
-   * nothing to act on from it in any case -- the address they were shown has not changed.
+   * anyone needing to grep logs. One recorded since the address landed stops the deposit being
+   * shown, and `FundingRequestDto.depositConflictAt` says so; the rejected value itself is not
+   * surfaced.
    */
   deposit_conflict_address?: string | undefined;
   deposit_conflict_reason?: DepositConflictReason | undefined;
@@ -251,6 +251,12 @@ export interface FundingRequestDto {
    * in, has been given something that looks complete and is not. See `toFundingRequestDto`.
    */
   deposit?: FundingRequestDeposit;
+  /**
+   * When the provider named another address, or one that is not an account, after the one it had
+   * disclosed. The deposit is no longer shown from then on: a client that has not sent yet should
+   * end the sale rather than wait for it. Present only while the request is live.
+   */
+  depositConflictAt?: number;
   createdAt: number;
   updatedAt: number;
   history: TimelineEntry[];
@@ -263,7 +269,9 @@ export interface FundingRequestDeposit {
   currency: string;
   /** Present only for an asset that needs one. Absent is the normal, permanent case for most. */
   memo?: string;
-  /** When this service first read the disclosure off the rail, not when Meld itself issued it. */
+  /** When this service first read the address off the rail, not when Meld itself issued it. It
+   *  dates the address only: an amount or asset the provider restates later replaces the one shown
+   *  here without moving it. */
   observedAt: number;
 }
 
@@ -331,8 +339,17 @@ export function toFundingRequestDto(record: FundingRecord, now: number): Funding
  * against a future one that is not, not a guard against something reachable now, and it is why
  * the missing case withholds rather than falls back to `Date.now()` or a passed-in clock -- either
  * would silently reintroduce the fabrication this gate exists to refuse.
+ *
+ * A conflict recorded since the address landed withholds it too, and `depositConflictAt` says so.
+ * The provider has since named another address, or one that is not an account, and nothing here
+ * can tell which it stands behind; a client that has not sent yet must not be sent to the old one.
+ * A conflict from before the address landed (a malformed first report the provider then
+ * corrected) does not.
  */
-function depositDisclosure(record: FundingRecord): { deposit?: FundingRequestDeposit } {
+function depositDisclosure(record: FundingRecord): {
+  deposit?: FundingRequestDeposit;
+  depositConflictAt?: number;
+} {
   const {
     deposit_address: address,
     deposit_amount: amount,
@@ -340,6 +357,8 @@ function depositDisclosure(record: FundingRecord): { deposit?: FundingRequestDep
     deposit_observed_at: observedAt,
   } = record;
   if (address === undefined || amount === undefined || currency === undefined || observedAt === undefined) return {};
+  const conflictAt = record.deposit_conflict_at;
+  if (conflictAt !== undefined && conflictAt >= observedAt) return { depositConflictAt: conflictAt };
   return {
     deposit: {
       address,

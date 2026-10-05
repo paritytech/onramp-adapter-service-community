@@ -978,19 +978,19 @@ describe('FundingStore', () => {
       });
     });
 
-    it('fills in a deposit amount that arrives after the address, without disturbing the address', async () => {
+    it('takes an amount the provider restates for the same address, without disturbing the address', async () => {
       await withStore(async (store) => {
         await store.create(sell({ status: 'transaction_seen' }));
         await store.update('funding-1', 'transaction_seen', 1_700_000_000_100, {
-          deposit: { address: ALICE, currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
         });
         await store.update('funding-1', 'transaction_seen', 1_700_000_000_200, {
-          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3', currency: 'DOT_ASSETHUB' },
         });
 
         const persisted = await store.byId('funding-1');
         expect(persisted?.deposit_address).toBe(ALICE);
-        expect(persisted?.deposit_amount).toBe('12.3456789012');
+        expect(persisted?.deposit_amount).toBe('12.3');
         // `deposit_observed_at` marks the first sighting of the fact, not the last: it must not
         // jump to the second update's timestamp.
         expect(persisted?.deposit_observed_at).toBe(1_700_000_000_100);

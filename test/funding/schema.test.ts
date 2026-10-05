@@ -646,8 +646,12 @@ describe('the real migration chain', () => {
       expect(sold?.crypto_amount).toBe('12.3456789012');
       // v7: a deposit-address disclosure conflict is reachable through `store.update`, not just
       // present in the table, and the accepted address is left exactly as it was.
-      await store.update('sold', 'transaction_seen', 2, { deposit: { address: ALICE, currency: 'DOT_ASSETHUB' } });
-      await store.update('sold', 'transaction_seen', 3, { deposit: { address: BOB, currency: 'DOT_ASSETHUB' } });
+      await store.update('sold', 'transaction_seen', 2, {
+        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+      });
+      await store.update('sold', 'transaction_seen', 3, {
+        deposit: { address: BOB, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+      });
       const disputed = await store.byId('sold');
       expect(disputed?.deposit_address).toBe(ALICE);
       expect(disputed?.deposit_conflict_address).toBe(BOB);

@@ -78,7 +78,7 @@ export function mergeAdvance(
   };
 }
 
-/** The nine deposit-shaped columns `mergeDeposit` decides, together, in one place. */
+/** The eight deposit-shaped columns `mergeDeposit` decides, together, in one place. */
 interface DepositFields {
   deposit_address: string | undefined;
   deposit_amount: string | undefined;
@@ -98,9 +98,11 @@ interface DepositFields {
  * 1. **Nothing disclosed this poll** (`incoming` is `undefined`): every field carries over
  *    unchanged. The common case for a buy, forever, and for a sell before the provider has said
  *    anything.
- * 2. **A first disclosure, or the same address repeated**: written (first time) or left alone
- *    (repeat), and any field still missing is filled in from this poll without disturbing one
- *    already landed -- an amount that arrives after the address, say.
+ * 2. **A first disclosure, or the same address repeated**: written (first time), or, on a
+ *    repeat, the address stays exactly as it landed while the terms follow the provider: an
+ *    amount or an asset it now states differently replaces the one on file, so the disclosure
+ *    always carries what the provider expects and a client holding its own terms can refuse the
+ *    difference. A field the provider leaves out keeps what landed.
  * 3. **A conflict** -- a different, well-formed address than the one already stored, or a value
  *    that does not decode as an account at all: `deposit_address` and its siblings are left
  *    completely untouched. **This is the fix over the first version of this function**, which
@@ -108,12 +110,14 @@ interface DepositFields {
  *    failure) riding alongside the conflicting fact. A provider that keeps disclosing a wrong
  *    address must not also be able to freeze a row that would otherwise correctly conclude: the
  *    seller was shown the *original* address and may already have sent to it, so keeping that
- *    address disclosed and correct is the one thing this function must still guarantee, but a
+ *    address exactly as it landed is the one thing this function must still guarantee, but a
  *    conflicting fact riding along with an unrelated, legitimate transition is not a reason to
  *    refuse the transition. The conflict is recorded instead (`deposit_conflict_*`), which is
  *    what makes it loud without making it destructive: `funding/worker.ts` reads the change in
  *    `deposit_conflict_at` and logs it at its own level, and the row stays queryable by an
- *    operator without anyone needing to grep for a thrown error's message text.
+ *    operator without anyone needing to grep for a thrown error's message text. From then on the
+ *    deposit is no longer disclosed (see `depositDisclosure` in `types.ts`): an address the
+ *    provider has moved away from is not one to keep sending a client to.
  *
  * The comparison that decides between (2) and (3) is on the **canonical** form
  * (`canonicalizeDisclosedAddress`), not the raw string a rail hands over. The same account
@@ -175,13 +179,12 @@ function mergeDeposit(previous: FundingRecord, incoming: RailDeposit | undefined
     };
   }
 
-  // The same address, reported again: fill in whatever is still missing, never revise what
-  // already landed.
+  // The same address, reported again: pinned as it landed, while the terms follow the provider.
   return {
     ...carried,
-    deposit_amount: carried.deposit_amount ?? incoming.amount,
-    deposit_currency: carried.deposit_currency ?? incoming.currency,
-    deposit_memo: carried.deposit_memo ?? incoming.memo,
+    deposit_amount: incoming.amount,
+    deposit_currency: incoming.currency,
+    deposit_memo: incoming.memo ?? carried.deposit_memo,
   };
 }
 
@@ -224,8 +227,9 @@ export interface UpdateExtra {
       claimedBy?: string;
       /**
        * A provider-issued fact disclosed on this poll, independent of `to`. See `RailDeposit` and
-       * `mergeDeposit`, the rule this function enforces around it: written once, never silently
-       * revised, and a conflicting report is recorded rather than rejecting the whole advance.
+       * `mergeDeposit`, the rule this function enforces around it: the address written once and
+       * never revised, the terms following the provider, and a conflicting report recorded rather
+       * than rejecting the whole advance.
        */
       deposit?: RailDeposit;
 }

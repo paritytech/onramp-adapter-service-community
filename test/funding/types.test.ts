@@ -209,6 +209,45 @@ describe('toFundingRequestDto: the deposit disclosure', () => {
     expect(dto).not.toHaveProperty('deposit');
   });
 
+  it('withholds the deposit once the provider has named another address since it landed', () => {
+    // The provider no longer stands behind the address on file, and nothing here can tell which
+    // one it does: a caller that has not sent yet must not be sent to the old one.
+    for (const reason of ['address_changed', 'address_malformed'] as const) {
+      const moved = {
+        ...disclosed,
+        deposit_conflict_address: '1AnotherAddress',
+        deposit_conflict_reason: reason,
+        deposit_conflict_at: 1_700_000_000_150 + 1_000,
+      };
+      const dto = toFundingRequestDto(moved, BEFORE);
+      expect(dto.deposit).toBeUndefined();
+      // Said, so a caller that has not sent ends the sale instead of waiting for it.
+      expect(dto.depositConflictAt).toBe(1_700_000_000_150 + 1_000);
+    }
+    // Not once the request is over: there is nothing left to end.
+    const concluded = {
+      ...disclosed,
+      status: 'failed' as const,
+      deposit_conflict_address: '1AnotherAddress',
+      deposit_conflict_reason: 'address_changed' as const,
+      deposit_conflict_at: 1_700_000_000_150 + 1_000,
+    };
+    expect(toFundingRequestDto(concluded, BEFORE)).not.toHaveProperty('depositConflictAt');
+  });
+
+  it('still discloses an address whose only conflict came before it landed', () => {
+    // A malformed first report the provider then corrected says nothing about the address it
+    // named afterwards.
+    const corrected = {
+      ...disclosed,
+      deposit_conflict_address: 'not-an-account',
+      deposit_conflict_reason: 'address_malformed' as const,
+      deposit_conflict_at: 1_700_000_000_150 - 1_000,
+    };
+    expect(toFundingRequestDto(corrected, BEFORE).deposit?.address).toBe('1DepositAddress');
+    expect(toFundingRequestDto(corrected, BEFORE)).not.toHaveProperty('depositConflictAt');
+  });
+
   it('never surfaces a deposit on a buy row, which has none to disclose', () => {
     const dto = toFundingRequestDto(record, BEFORE);
     expect(dto).not.toHaveProperty('deposit');

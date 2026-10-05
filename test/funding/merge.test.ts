@@ -89,21 +89,37 @@ describe('mergeAdvance: the deposit disclosure', () => {
     expect(next.deposit_address).toBe(ALICE);
   });
 
-  it('fills in a field still missing, without touching one already set', () => {
-    // The provider may disclose the address before the amount (unverified either way). A later
-    // poll can complete what is missing.
-    const withAddressOnly = mergeAdvance(inFlight(), 'transaction_seen', NOW, {
-      deposit: { address: ALICE, currency: 'DOT_ASSETHUB' },
-    });
-    expect(withAddressOnly.deposit_amount).toBeUndefined();
+  it('fills in a memo that arrives later, and keeps one a later poll leaves out', () => {
+    // The memo is the one optional part of a disclosure: a later poll can complete it, and one that
+    // names none takes nothing away.
+    const without = mergeAdvance(inFlight(), 'transaction_seen', NOW, { deposit: deposit() });
+    expect(without.deposit_memo).toBeUndefined();
 
-    const filled = mergeAdvance(withAddressOnly, 'transaction_seen', NOW + 100, {
-      deposit: deposit(),
+    const tagged = mergeAdvance(without, 'transaction_seen', NOW + 100, {
+      deposit: { ...deposit(), memo: 'tag-1' },
     });
-    expect(filled.deposit_address).toBe(ALICE);
-    expect(filled.deposit_amount).toBe('12.3456789012');
+    expect(tagged.deposit_address).toBe(ALICE);
+    expect(tagged.deposit_memo).toBe('tag-1');
     // The first sighting, not the second: observed_at does not move once set.
-    expect(filled.deposit_observed_at).toBe(NOW);
+    expect(tagged.deposit_observed_at).toBe(NOW);
+
+    const silent = mergeAdvance(tagged, 'transaction_seen', NOW + 200, { deposit: deposit() });
+    expect(silent.deposit_memo).toBe('tag-1');
+  });
+
+  it('pins the address and lets the terms follow the provider for the same address', () => {
+    // The address is what a seller may already have sent to; the amount and the asset are what the
+    // provider expects now, and a client can only refuse a difference it is shown.
+    const first = mergeAdvance(inFlight(), 'transaction_seen', NOW, { deposit: deposit() });
+    const restated = mergeAdvance(first, 'transaction_seen', NOW + 1000, {
+      deposit: { address: ALICE_PREFIX_42, amount: '11', currency: 'USDT_ASSETHUB' },
+    });
+
+    expect(restated.deposit_address).toBe(first.deposit_address);
+    expect(restated.deposit_amount).toBe('11');
+    expect(restated.deposit_currency).toBe('USDT_ASSETHUB');
+    expect(restated.deposit_observed_at).toBe(NOW);
+    expect(restated.deposit_conflict_at).toBeUndefined();
   });
 
   it('ignores a repeat of the same address rather than treating it as new information', () => {
