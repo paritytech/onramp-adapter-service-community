@@ -1802,6 +1802,41 @@ describe('a sell whose provider discloses a deposit address', () => {
     await store.close();
   });
 
+  it('carries no deposit when the transaction it first sees has already ended', async () => {
+    // This edge can only reach `transaction_seen`, which reads as live until the next tick
+    // concludes it, so a deposit carried here would be shown for an order that takes no deposit.
+    const opening = record({
+      direction: 'sell',
+      destination_currency_code: 'DOT_ASSETHUB',
+      wallet_address: undefined,
+      source_amount: undefined,
+      crypto_amount: '12.3456789012',
+      status: 'session_opened',
+    });
+    const { store } = tracking([opening]);
+
+    await tick(
+      store,
+      NOW,
+      observations(
+        async () => ({
+          id: 'tx-1',
+          status: 'FAILED',
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        }),
+        (status) => (status === 'FAILED' ? 'failed' : 'transaction_seen'),
+      ),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    const row = await store.byId('funding-1');
+    expect(row?.status).toBe('transaction_seen');
+    expect(row?.deposit_address).toBeUndefined();
+    await store.close();
+  });
+
   it('does not write anything when re-observation finds the same status and no new fact', async () => {
     // The unchanged half of the same branch: nothing regressed for the ordinary "still pending,
     // nothing new" tick once the skip condition grew a second clause.
@@ -1875,7 +1910,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       observations(
         async (rec) =>
           rec.id === 'bad'
-            ? { id: 'tx-1', status: 'PENDING', deposit: { address: BOB, currency: 'DOT_ASSETHUB' } }
+            ? { id: 'tx-1', status: 'PENDING', deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' } }
             : { id: 'tx-2', status: 'SETTLED' },
         (status) => (status === 'SETTLED' ? 'settled' : 'transaction_seen'),
       ),
@@ -1911,7 +1946,11 @@ describe('a sell whose provider discloses a deposit address', () => {
     const advanced = await tick(
       store,
       NOW,
-      observations(async () => ({ id: 'tx-1', status: 'PENDING', deposit: { address: BOB, currency: 'DOT_ASSETHUB' } })),
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' },
+      })),
       MAX_AGE,
       () => undefined,
       lease(),
@@ -1986,9 +2025,10 @@ describe('a sell whose provider discloses a deposit address', () => {
     }
   });
 
-  it('still takes a different amount, or one that is not a plain decimal, as new', async () => {
+  it('takes a different amount, or one that is not a plain decimal, as new, once', async () => {
     // By value only for plain decimals: another value, and any other shape spelled differently,
-    // reach the store as they always did, where the amount that landed first is kept.
+    // reach the store, where the terms follow the provider. The next poll with the same figure is
+    // nothing new, so a provider that restated its amount causes one write, not one per tick.
     for (const [stored, amount] of [
       ['23.4521', '23.4522'],
       ['1e1', '10'],
@@ -1996,24 +2036,56 @@ describe('a sell whose provider discloses a deposit address', () => {
       const { store, updated } = tracking([
         inFlight({ deposit_address: ALICE, deposit_amount: stored, deposit_currency: 'DOT_ASSETHUB' }),
       ]);
+      const restated = observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: ALICE, amount, currency: 'DOT_ASSETHUB' },
+      }));
 
-      await tick(
-        store,
-        NOW,
-        observations(async () => ({
-          id: 'tx-1',
-          status: 'PENDING',
-          deposit: { address: ALICE, amount, currency: 'DOT_ASSETHUB' },
-        })),
-        MAX_AGE,
-        () => undefined,
-        lease(),
-      );
-
+      await tick(store, NOW, restated, MAX_AGE, () => undefined, lease());
       expect(updated).toHaveBeenCalledTimes(1);
-      expect((await store.byId('funding-1'))?.deposit_amount).toBe(stored);
+      expect((await store.byId('funding-1'))?.deposit_amount).toBe(amount);
+
+      await tick(store, NOW + 1_000, restated, MAX_AGE, () => undefined, lease());
+      expect(updated).toHaveBeenCalledTimes(1);
       await store.close();
     }
+  });
+
+  it('takes an asset the provider restates for the same address, once', async () => {
+    const { store, updated } = tracking([
+      inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
+    ]);
+    const restated = observations(async () => ({
+      id: 'tx-1',
+      status: 'PENDING',
+      deposit: { address: ALICE, amount: '23.4521', currency: 'USDT_ASSETHUB' },
+    }));
+
+    await tick(store, NOW, restated, MAX_AGE, () => undefined, lease());
+    await tick(store, NOW + 1_000, restated, MAX_AGE, () => undefined, lease());
+
+    expect(updated).toHaveBeenCalledTimes(1);
+    expect((await store.byId('funding-1'))?.deposit_currency).toBe('USDT_ASSETHUB');
+    await store.close();
+  });
+
+  it('ages a row out from when it reached transaction_seen, however often its terms were written since', async () => {
+    // Each deposit write moves `updated_at`; measured from there, a provider restating its terms
+    // would keep the row asked for ever.
+    const { store } = tracking([
+      inFlight({
+        deposit_address: ALICE,
+        deposit_amount: '1.0',
+        deposit_currency: 'DOT_ASSETHUB',
+        updated_at: NOW + MAX_AGE,
+      }),
+    ]);
+
+    await tick(store, NOW + MAX_AGE + 1, observations(async () => undefined), MAX_AGE, () => undefined, lease());
+
+    expect((await store.byId('funding-1'))?.status).toBe('unobserved');
+    await store.close();
   });
 
   it('writes an amount that arrives after the address, once', async () => {
@@ -2054,6 +2126,90 @@ describe('a sell whose provider discloses a deposit address', () => {
     );
 
     expect(updated).not.toHaveBeenCalled();
+    await store.close();
+  });
+
+  it('logs a restated term with the figure it replaces', async () => {
+    const { store } = tracking([
+      inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
+    ]);
+    const { lines, log } = notes();
+
+    await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: ALICE, amount: '20', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      log,
+      lease(),
+    );
+
+    const line = lines.find((entry) => entry.includes('funding-1') && entry.includes('restated'));
+    expect(line).toContain('23.4521 DOT_ASSETHUB');
+    expect(line).toContain('20 DOT_ASSETHUB');
+    await store.close();
+  });
+
+  it('writes no deposit onto the move that concludes the order', async () => {
+    // A deposit is a fact about a live order; a concluded row carrying one would read as an
+    // address someone was shown.
+    const { store } = tracking([inFlight()]);
+
+    await tick(
+      store,
+      NOW,
+      observations(
+        async () => ({
+          id: 'tx-1',
+          status: 'FAILED',
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        }),
+        (status) => (status === 'FAILED' ? 'failed' : 'transaction_seen'),
+      ),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    const row = await store.byId('funding-1');
+    expect(row?.status).toBe('failed');
+    expect(row?.deposit_address).toBeUndefined();
+    await store.close();
+  });
+
+  it('takes a malformed report from before the address landed, repeated after it, as a new conflict', async () => {
+    const { store } = tracking([
+      inFlight({
+        deposit_address: ALICE,
+        deposit_amount: '1.0',
+        deposit_currency: 'DOT_ASSETHUB',
+        deposit_observed_at: NOW - 1_000,
+        deposit_conflict_address: 'not-an-account',
+        deposit_conflict_reason: 'address_malformed',
+        deposit_conflict_at: NOW - 2_000,
+      }),
+    ]);
+
+    await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: 'not-an-account', amount: '1.0', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    const row = await store.byId('funding-1');
+    expect(row?.deposit_conflict_at).toBe(NOW);
+    expect(row?.deposit_address).toBe(ALICE);
     await store.close();
   });
 

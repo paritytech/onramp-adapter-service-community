@@ -27,7 +27,7 @@ import { randomUUID } from "node:crypto";
 import { canonicalizeDisclosedAddress } from "../address.js";
 import type { Clock } from "../onramp.js";
 import type { RailDeposit, RailName } from "../rail.js";
-import type { FundingState } from "./state.js";
+import { TERMINAL_STATES, type FundingState } from "./state.js";
 import type { FundingStore } from "./store.js";
 import type { FundingRecord } from "./types.js";
 
@@ -199,8 +199,25 @@ export async function tick(
           log(
             `funding worker: request ${record.id} received a conflicting deposit disclosure ` +
               `(${refreshed.deposit_conflict_reason ?? 'unknown reason'}: "${refreshed.deposit_conflict_address ?? 'unknown value'}"); ` +
-              `the previously disclosed address is unchanged and was kept. This needs a person, not a retry.`,
+              `the previously disclosed address is unchanged and is no longer shown. This needs a person, not a retry.`,
             'error',
+          );
+        }
+        // The terms follow the provider for the address already landed (see `mergeDeposit`), so a
+        // restated amount or asset rewrites them. Logged with both values: the figure a seller may
+        // already have acted on is otherwise gone from the row.
+        if (
+          refreshed !== undefined &&
+          record.deposit_address !== undefined &&
+          refreshed.deposit_address === record.deposit_address &&
+          (refreshed.deposit_amount !== record.deposit_amount ||
+            refreshed.deposit_currency !== record.deposit_currency)
+        ) {
+          log(
+            `funding worker: request ${record.id} had its deposit terms restated by the provider, ` +
+              `from ${record.deposit_amount ?? 'no amount'} ${record.deposit_currency ?? 'no asset'} ` +
+              `to ${refreshed.deposit_amount ?? 'no amount'} ${refreshed.deposit_currency ?? 'no asset'}.`,
+            'warn',
           );
         }
         consecutiveFailures = 0;
@@ -465,13 +482,19 @@ async function advanceOne(
       // A payment was observed: capture the transaction and its status for a later conclusion,
       // and any provider-issued fact disclosed the same moment. On a sell, Meld's own deposit
       // address lives on the transaction record (see `meld/rail.ts`), so it can already be
-      // populated the very first time a transaction is seen at all.
+      // populated the very first time a transaction is seen at all -- unless that transaction has
+      // already ended. This edge can only reach `transaction_seen`, which reads as live, so the
+      // next tick is what concludes it; until then its address would be shown for an order that
+      // can no longer take a deposit.
+      const ended = TERMINAL_STATES.includes(obs.mapper(txn.status ?? undefined));
       return {
         state: "transaction_seen",
         discovered: {
           providerTransactionId: txn.id,
           providerStatus: txn.status ?? null,
-          ...(txn.deposit !== undefined && depositIsNew(record, txn.deposit) ? { deposit: txn.deposit } : {}),
+          ...(txn.deposit !== undefined && !ended && depositIsNew(record, txn.deposit)
+            ? { deposit: txn.deposit }
+            : {}),
         },
       };
     }
@@ -501,9 +524,11 @@ async function advanceOne(
   // non-terminal and rescanned for ever; and rather than `expired`, which would assert the buyer
   // did not pay when a transaction was seen. The transaction id and the timeline are kept.
   //
-  // The window runs from `updated_at`, the instant this row reached `transaction_seen`, which does
-  // not move again while it stays there. Measuring from `created_at` would leave a payment seen
-  // late in a request's life only the remainder of that life to conclude in.
+  // The window runs from the instant this row reached `transaction_seen`, its timeline entry.
+  // Not `updated_at`: a sell's deposit facts are written while the row sits here unmoved, and each
+  // write moves `updated_at`, so a provider that kept restating its terms would keep the row
+  // asked for ever. Not `created_at` either, which would leave a payment seen late in a request's
+  // life only the remainder of that life to conclude in.
   //
   // Logged, unlike the `session_opened` timeout above it: a request that never got as far as a
   // transaction ageing out is the ordinary shape of an abandoned purchase, but one that DID reach
@@ -511,7 +536,7 @@ async function advanceOne(
   // mapper's fall-through is what makes that possible at all -- see `MELD_STATUS_TO_STATE`) or,
   // worse on a sell, a deposit address the seller was shown with no settlement ever observed
   // against it. Neither should conclude without a trace an operator can find.
-  if (now > record.updated_at + sessionMaxAgeMs) {
+  if (now > seenSince(record) + sessionMaxAgeMs) {
     const detail =
       record.deposit_address === undefined
         ? `its status stayed "${record.provider_status ?? 'unknown'}"`
@@ -538,6 +563,9 @@ async function advanceOne(
   const txn = await obs.finder(record);
   const status = txn?.status ?? record.provider_status;
   const state = obs.mapper(status ?? undefined);
+  // A deposit is a fact about a live order: one riding on the move that concludes it is not
+  // written, so a concluded row never carries an address nobody was shown.
+  const ended = TERMINAL_STATES.includes(state);
   // The refreshed facts ride along with the state move, so a conclusion records the status it
   // concluded on. The id/status pair is written only when the state actually changes (`tick`
   // skips the write otherwise), which is why the re-observation above, not the stored value, is
@@ -551,9 +579,20 @@ async function advanceOne(
         discovered: {
           providerTransactionId: txn.id,
           providerStatus: txn.status ?? null,
-          ...(txn.deposit !== undefined && depositIsNew(record, txn.deposit) ? { deposit: txn.deposit } : {}),
+          ...(txn.deposit !== undefined && !ended && depositIsNew(record, txn.deposit)
+            ? { deposit: txn.deposit }
+            : {}),
         },
       };
+}
+
+/**
+ * When `record` reached `transaction_seen`: its timeline entry, or `updated_at` for a row whose
+ * timeline does not carry one.
+ */
+function seenSince(record: FundingRecord): number {
+  const entry = [...record.status_history].reverse().find((step) => step.status === 'transaction_seen');
+  return entry?.at ?? record.updated_at;
 }
 
 /**
@@ -562,11 +601,8 @@ async function advanceOne(
  * Without this, `tick` would write every tick for the life of a disclosed sell: `depositFrom`
  * (`meld/rail.ts`) reports the same address on every poll once the provider has populated the
  * field on the transaction record, not only the first time it appears, so a naive "a deposit is
- * present" check never goes back to "nothing to do" once one exists. Every such write bumps
- * `updated_at`, which is exactly the column `deadlineFor`'s `transaction_seen` branch measures
- * its window from -- so a clean, settled disclosure would otherwise keep this row's deadline
- * sliding forward for ever, and the `session_max_age_ms` safety valve (and the claim slot it
- * frees on ageing out) would never fire for a sell that never settles.
+ * present" check never goes back to "nothing to do" once one exists. Every such write is a
+ * metered upstream answer turned into a database write, for nothing.
  *
  * Two things count as "not new", both compared against the record as it stood before this poll:
  *
@@ -598,11 +634,17 @@ function depositIsNew(record: FundingRecord, deposit: RailDeposit): boolean {
   const matchesAccepted =
     canonical !== undefined &&
     record.deposit_address === canonical &&
-    // `currency` is required on `RailDeposit` (see its doc comment), unlike `amount` and `memo`.
+    // `amount` and `currency` are required on `RailDeposit` (see its doc comment), unlike `memo`.
     record.deposit_currency === deposit.currency &&
-    (deposit.amount === undefined || sameAmount(record.deposit_amount, deposit.amount)) &&
+    sameAmount(record.deposit_amount, deposit.amount) &&
     (deposit.memo === undefined || record.deposit_memo === deposit.memo);
-  const matchesKnownConflict = record.deposit_conflict_address === deposit.address;
+  // Only a conflict recorded since the address landed is one already acted on. A repeat of a
+  // report from before it landed (a malformed first answer) is a new disagreement now, and is
+  // written so the deposit stops being shown.
+  const matchesKnownConflict =
+    record.deposit_conflict_address === deposit.address &&
+    (record.deposit_observed_at === undefined ||
+      (record.deposit_conflict_at ?? 0) >= record.deposit_observed_at);
   return !matchesAccepted && !matchesKnownConflict;
 }
 
@@ -616,20 +658,20 @@ const PLAIN_DECIMAL = /^\d+(\.\d+)?$/;
  * Whether a reported amount names the one already on file, compared exactly and never as a float.
  *
  * Two plain decimals are compared by value, so `23.4521`, `23.45210000` and `023.4521` are one
- * amount. A sell's first disclosure can carry the committed `crypto_amount` (see `depositFrom` in
- * `meld/rail.ts`), and Meld's own figure for the same amount need not be spelled the same way;
- * compared as text, the pair reads as new on every poll, which is the perpetual write
+ * amount. Meld's figure for one amount need not be spelled the same way from one poll to the next;
+ * compared as text, the two would read as new on every poll, which is the perpetual write
  * `depositIsNew` exists to stop.
  *
  * Anything else, an exponent or a sign say, is compared as exact text: reading it as a number would
- * be a guess, and text costs at most the write it always did. Nothing rides on this answer but that
- * write, since `mergeDeposit` never revises an amount that has landed.
+ * be a guess, and text costs at most one write. A different value is new, and `mergeDeposit` takes
+ * it, since the terms follow the provider.
  *
  * Local rather than in `money.ts`, which is the fiat minor-units module; a crypto amount never
  * becomes minor units (see `CRYPTO_DECIMAL` in `contract.ts`).
  */
 function sameAmount(stored: string | undefined, reported: string): boolean {
-  // Nothing on file yet: an amount arriving after the address is new, and `mergeDeposit` fills it in.
+  // An address on file with no amount is a row no rail writes (the column is nullable, the
+  // disclosure is not): it reads as new, and `mergeDeposit` writes the amount reported.
   if (stored === undefined) return false;
   if (!PLAIN_DECIMAL.test(stored) || !PLAIN_DECIMAL.test(reported)) return stored === reported;
   return plainSpelling(stored) === plainSpelling(reported);
