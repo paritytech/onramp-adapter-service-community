@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { fundingRecord, railSellSessionInput, railSessionInput, sellRecord } from '../fixtures.js';
+import {
+  ALICE,
+  ALICE_PREFIX_42,
+  BOB,
+  fundingRecord,
+  railSellSessionInput,
+  railSessionInput,
+  sellRecord,
+} from '../fixtures.js';
 
 import { upstreamUnavailable } from '../../src/contract.js';
 import { MeldClient, MeldHttpError } from '../../src/meld/client.js';
@@ -370,6 +378,7 @@ describe('MeldRail.observation', () => {
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: '12.3456789012',
+        sourceCurrencyCode: 'DOT_ASSETHUB',
         cryptoDetails: { destinationWalletAddress: '1DepositAddress' },
       });
 
@@ -389,6 +398,7 @@ describe('MeldRail.observation', () => {
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: '12.3456789012',
+        sourceCurrencyCode: 'DOT_ASSETHUB',
         cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
       };
       const pending = sellClient(found);
@@ -397,8 +407,6 @@ describe('MeldRail.observation', () => {
       expect(seen?.deposit).toEqual({
         address: '1DepositAddress',
         amount: '12.3456789012',
-        // Never read off Meld: the record's own committed asset, pinned before the rail was ever
-        // called.
         currency: 'DOT_ASSETHUB',
       });
 
@@ -419,6 +427,7 @@ describe('MeldRail.observation', () => {
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: '12.3456789012',
+        sourceCurrencyCode: 'DOT_ASSETHUB',
         cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
       });
       transactionBySession.mockRejectedValue(failure);
@@ -446,19 +455,23 @@ describe('MeldRail.observation', () => {
     });
 
     it('prefers the address under its 2025-03-04 name, and reads the old one without it', async () => {
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT_ASSETHUB' };
+      // Both present for one account: the new name's spelling is the one disclosed.
       const both = sellClient(undefined, {
         id: 'tx-1',
         status: 'PENDING',
+        ...terms,
         cryptoDetails: {
-          destinationWalletAddress: '1NewName',
-          offrampDestinationWalletAddress: '1OldName',
+          destinationWalletAddress: ALICE_PREFIX_42,
+          offrampDestinationWalletAddress: ALICE,
         },
       });
-      expect((await both.rail.observation().finder(sellRecord()))?.deposit?.address).toBe('1NewName');
+      expect((await both.rail.observation().finder(sellRecord()))?.deposit?.address).toBe(ALICE_PREFIX_42);
 
       const old = sellClient(undefined, {
         id: 'tx-1',
         status: 'PENDING',
+        ...terms,
         cryptoDetails: { destinationWalletAddress: null, offrampDestinationWalletAddress: '1OldName' },
       });
       expect((await old.rail.observation().finder(sellRecord()))?.deposit?.address).toBe('1OldName');
@@ -477,36 +490,92 @@ describe('MeldRail.observation', () => {
       expect(seen).not.toHaveProperty('deposit');
     });
 
-    it('discloses the committed amount when Meld reports none', async () => {
-      // Meld's instruction is to send exactly the quoted figure, and this row holds it: a
-      // disclosure held back for want of a number already known would stop a sale that is ready.
+    it('withholds the deposit while Meld names no amount, never filling in the committed one', async () => {
+      // The committed figure would always agree with itself: a client holding its own terms could
+      // never see that the provider expects something else.
       const { rail } = sellClient({
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: null,
+        sourceCurrencyCode: 'DOT_ASSETHUB',
         cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
       });
 
       const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
 
-      expect(seen?.deposit).toEqual({
-        address: '1DepositAddress',
-        amount: '12.3456789012',
-        currency: 'DOT_ASSETHUB',
-      });
+      expect(seen).toEqual({ id: 'tx-1', status: 'PENDING' });
     });
 
-    it('discloses the address alone when neither Meld nor the row has an amount', async () => {
+    it("withholds the deposit while Meld names no asset, never standing in the row's own", async () => {
       const { rail } = sellClient({
         id: 'tx-1',
         status: 'PENDING',
-        sourceAmount: null,
+        sourceAmount: '12.3456789012',
         cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
       });
 
-      const seen = await rail.observation().finder(sellRecord({ crypto_amount: undefined }));
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
 
-      expect(seen?.deposit).toEqual({ address: '1DepositAddress', currency: 'DOT_ASSETHUB' });
+      expect(seen).not.toHaveProperty('deposit');
+    });
+
+    it('discloses the asset and the amount as the provider states them, even where they differ from the committed terms', async () => {
+      // Whether the provider honours the locked asset and amount on a sell is unverified. Shown
+      // as stated, a difference is the client's to refuse.
+      const { rail } = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: '11',
+        sourceCurrencyCode: 'USDT_ASSETHUB',
+        cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
+      });
+
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+
+      expect(seen?.deposit).toEqual({ address: '1DepositAddress', amount: '11', currency: 'USDT_ASSETHUB' });
+    });
+
+    it('reads a blank field as absent', async () => {
+      // A blank new name would otherwise shadow the old one, and a blank amount would pass as one.
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT_ASSETHUB' };
+      const fallback = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        ...terms,
+        cryptoDetails: { destinationWalletAddress: '', offrampDestinationWalletAddress: ALICE },
+      });
+      expect((await fallback.rail.observation().finder(sellRecord()))?.deposit?.address).toBe(ALICE);
+
+      for (const blank of [{ sourceAmount: ' ' }, { sourceCurrencyCode: '' }]) {
+        const { rail } = sellClient({
+          id: 'tx-1',
+          status: 'PENDING',
+          ...terms,
+          ...blank,
+          cryptoDetails: { destinationWalletAddress: ALICE },
+        });
+        expect(await rail.observation().finder(sellRecord())).not.toHaveProperty('deposit');
+      }
+    });
+
+    it('discloses nothing when the two address fields name different accounts', async () => {
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT_ASSETHUB' };
+      const split = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        ...terms,
+        cryptoDetails: { destinationWalletAddress: ALICE, offrampDestinationWalletAddress: BOB },
+      });
+      expect(await split.rail.observation().finder(sellRecord())).not.toHaveProperty('deposit');
+
+      // One account under two prefixes is one address.
+      const agreed = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        ...terms,
+        cryptoDetails: { destinationWalletAddress: ALICE_PREFIX_42, offrampDestinationWalletAddress: ALICE },
+      });
+      expect((await agreed.rail.observation().finder(sellRecord()))?.deposit?.address).toBe(ALICE_PREFIX_42);
     });
 
     it('omits the deposit for a sell whose transaction carries no cryptoDetails at all', async () => {

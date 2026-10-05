@@ -237,18 +237,15 @@ export interface RailDeposit {
    */
   address: string;
   /**
-   * The exact amount expected, in the row's own committed crypto. Optional because the provider
-   * may disclose the address before the amount, or not disclose an amount at all -- unverified
-   * either way (no sandbox sell has ever reached this point; see the probe). Absent must be
-   * treated as absent, never coerced to a guess.
+   * The exact amount the provider expects, as the provider states it. A rail discloses nothing
+   * until it can name it (Meld's sell waits for its transaction's `sourceAmount`), and never
+   * fills it in from the row's own terms.
    */
-  amount?: string;
+  amount: string;
   /**
-   * The asset the address expects. Always the funding record's own `destination_currency_code`,
-   * derived by the rail rather than read off the provider: it was pinned before the rail was ever
-   * called and cannot legitimately differ from what a sell's deposit address receives, so asking
-   * the provider to repeat it back would only be one more value to cross-check against one
-   * already known, for no benefit.
+   * The asset the provider expects at the address, as the provider states it, never the row's own
+   * `destination_currency_code` standing in for it: a client compares the two and refuses a
+   * difference, which a value copied from the row could never show.
    */
   currency: string;
   /**

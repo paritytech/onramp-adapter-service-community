@@ -94,8 +94,9 @@ const transactionPath = (id: string) => `/payments/transactions/${encodeURICompo
 /**
  * Search by the reference the session was filed under.
  *
- * A transaction only exists once the buyer pays and is not keyed by the session id, so the
- * external reference sent at session creation is the only join key back to it.
+ * On a buy a transaction only exists once the buyer pays, and the external reference sent at
+ * session creation is the join key back to it. A sell reads Meld's per-session path first
+ * (`transactionBySession`) and falls back to this one.
  *
  * The parameter is `externalSessionIds`, plural. The alternatives were probed against
  * `api-sb.meld.io` and reported `?externalSessionId=`, `?sessionId=` and `?offset=` all answering
@@ -366,6 +367,8 @@ const transactionResponse = z
     externalCustomerId: z.string().nullish(),
     sourceAmount: scalarAmount.nullish(),
     destinationAmount: scalarAmount.nullish(),
+    /** The asset the transaction moves; on a sell, the crypto the provider expects. */
+    sourceCurrencyCode: z.string().nullish(),
     serviceProvider: z.string().nullish(),
     /**
      * The off-ramp deposit address, when Meld has issued one, under either of its names. Meld:

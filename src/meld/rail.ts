@@ -26,6 +26,7 @@
  */
 
 import type { MeldClient, MeldTransaction } from './client.js';
+import { canonicalizeDisclosedAddress } from '../address.js';
 import type { FundingRecord } from '../funding/types.js';
 import type { RailObservation, TransactionMapper } from '../funding/worker.js';
 import type {
@@ -183,32 +184,25 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
 
 /**
  * The off-ramp deposit fact, read off Meld's transaction record. `undefined` on a buy, always,
- * and on a sell until the provider discloses one.
+ * and on a sell until the provider's transaction names all three of where, how much and what.
+ *
+ * Meld's preferred off-ramp flow is to read the token (`sourceCurrencyCode`), the amount
+ * (`sourceAmount`) and the deposit address off the transaction and send exactly that, so all three
+ * come from the provider and none from this row. A client holds them against the terms it agreed
+ * to and refuses a difference, which only works if the disclosure carries the provider's word: an
+ * asset or an amount filled in from this row would always agree with itself.
  *
  * **The address**: `cryptoDetails.destinationWalletAddress ?? offrampDestinationWalletAddress`,
- * as Meld advises for either side of `Meld-Version` 2025-03-04. The old name is confirmed to exist
- * on the schema and `null` on every buy record this account has produced; neither has been
- * observed populated, since no sell has been driven through this account's one onboarded provider
- * far enough to produce a transaction (DOT_ASSETHUB is not sellable on it; see the probe). That
- * gap is why both are read defensively (nullish, not asserted) rather than trusted.
+ * as Meld advises for either side of `Meld-Version` 2025-03-04, a blank one read as absent. Both
+ * present and naming different accounts discloses nothing. Never `sourceWalletAddress`,
+ * `sessionWalletAddress` or `walletAddress`, which are the seller's own.
  *
  * **The amount**: the top-level `sourceAmount`, not `serviceProviderDetails.details.cryptoAmount`,
- * and the committed `crypto_amount` when the transaction carries none.
- * Two reasons, not one. First, `sourceAmount` is already this service's name for the crypto leg of
- * a sell everywhere else in this file (`SellQuoteParams`, `SellWidgetSessionParams`) -- it is the
- * exact amount the seller committed, typed and schema-validated, where
- * `serviceProviderDetails.details` is untyped, per-provider passthrough this service has never
- * had reason to trust. Second, and more directly: this service already knows what the seller
- * committed, from its own row (`FundingRecord.crypto_amount`), and if the two ever disagree the
- * question is not "which field do I read" but "why did the amount change after commitment" -- a
- * question this step does not answer, because no sell has reached this line to raise it. Reusing a
- * field this codebase already reads for the same leg is what makes the wrong guess cheap to
- * correct: if a real sell shows the figure belongs elsewhere, this is the one line that moves,
- * and nothing in `merge.ts`, `store.ts` or the DTO depends on which field feeds it.
+ * which is untyped per-provider passthrough. Withheld while the transaction carries none.
  *
- * **The currency**: never read off Meld. It is `record.destination_currency_code`, pinned before
- * the rail was ever called and incapable of legitimately differing from what a sell's deposit
- * address receives, so there is nothing to cross-check by asking the provider to repeat it.
+ * **The currency**: the top-level `sourceCurrencyCode`. Withheld while the transaction carries
+ * none. Whether the provider honours the locked asset on a sell is unverified, so the row's own
+ * `destination_currency_code` is not a stand-in for it.
  *
  * **The memo**: always `undefined`. No candidate field exists anywhere in the probed schema (see
  * the probe's §4); Asset Hub does not need one, and a guessed field name would be worse than an
@@ -216,17 +210,27 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
  */
 function depositFrom(record: FundingRecord, txn: MeldTransaction): RailDeposit | undefined {
   if (record.direction !== 'sell') return undefined;
-  // Meld's own advice for reading it under any Meld-Version: the new name, then the old one.
+  // Meld's own advice for reading it under any Meld-Version: the new name, then the old one. A blank
+  // field is an absent one. Two fields that name different accounts leave nothing to choose by, so
+  // neither is disclosed.
   const details = txn.cryptoDetails;
-  const address = details?.destinationWalletAddress ?? details?.offrampDestinationWalletAddress ?? undefined;
-  if (address === undefined) return undefined;
-  // The provider's figure when the transaction carries one, the committed one when it does not:
-  // Meld's instruction is to send exactly the quoted amount, and a disclosure held back for want
-  // of a figure this service already has would stop a sale that is ready.
-  const amount = txn.sourceAmount ?? record.crypto_amount;
-  return {
-    address,
-    ...(amount === undefined ? {} : { amount }),
-    currency: record.destination_currency_code,
-  };
+  const named = given(details?.destinationWalletAddress);
+  const former = given(details?.offrampDestinationWalletAddress);
+  if (named !== undefined && former !== undefined && !sameAccount(named, former)) return undefined;
+  const address = named ?? former;
+  const amount = given(txn.sourceAmount);
+  const currency = given(txn.sourceCurrencyCode);
+  if (address === undefined || amount === undefined || currency === undefined) return undefined;
+  return { address, amount, currency };
+}
+
+/** What Meld sent in a field, or `undefined` for one that is missing or blank. */
+function given(value: string | null | undefined): string | undefined {
+  return value === null || value === undefined || value.trim() === '' ? undefined : value;
+}
+
+/** Whether two disclosed addresses are one account, whatever their SS58 prefix. */
+function sameAccount(a: string, b: string): boolean {
+  const canonical = canonicalizeDisclosedAddress(a);
+  return canonical !== undefined && canonical === canonicalizeDisclosedAddress(b);
 }
