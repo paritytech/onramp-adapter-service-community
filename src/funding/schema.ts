@@ -229,7 +229,7 @@ const DEPOSIT_CONFLICT_CONSTRAINT =
  *
  * A fresh database is created at `SCHEMA_VERSION` directly by `freshSchema()`, so this list is
  * what an existing database walks through, one step at a time. The next migration appends
- * `{ from: 6, to: 7, sql: [...] }` and bumps `SCHEMA_VERSION`; `store.ts` needs no change.
+ * `{ from: 8, to: 9, sql: [...] }` and bumps `SCHEMA_VERSION`; `store.ts` needs no change.
  *
  * This chain is one-way. A build expecting v1 refuses a v2 database: the version check is
  * `!==`, deliberately, because reading a shape you do not understand is worse than not starting.

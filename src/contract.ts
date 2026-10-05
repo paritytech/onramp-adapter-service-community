@@ -227,10 +227,8 @@ const CRYPTO_DECIMAL = /^\d{1,30}(\.\d{1,30})?$/;
  * gate, by design — the corridor's published limits are fiat and the committed amount is crypto
  * — so on a sell this is the only thing standing between a caller and a zero-amount sale.
  *
- * It matters now rather than later. Today every rail refuses every sell, but the durable row is
- * written before the rail is called, so a zero would already be persisted as a committed term;
- * and the day the real sell path lands, a zero would reach the provider ungated. The release
- * that introduces the field is the one that owns its validity.
+ * The durable row is written before the rail is called, so a zero here would be persisted as a
+ * committed term and then reach the provider ungated.
  */
 const cryptoAmount = z
   .string()

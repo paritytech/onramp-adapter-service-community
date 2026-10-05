@@ -20,8 +20,8 @@ import type { FundingRail, RailQuote, RailSession, RailSessionInput } from '../r
  *
  * Chainflip's missing fiat leg cuts both ways: it cannot charge a card for crypto, and it cannot
  * pay a seller in fiat for crypto either. Selling into Chainflip is a swap, which is what it does
- * and is not what this service's sell means. So this is not "not built yet" as it is on Meld, and
- * the distinction matters to the caller: no amount of waiting makes this rail sell.
+ * and is not what this service's sell means. Meld serves a sell; this rail never will, and the
+ * distinction matters to the caller: no amount of waiting makes this rail sell.
  *
  * Checked first because the direction is the larger objection. Answering a sell with the quote
  * leg's "the price is set on-chain at swap time" would send a caller looking for a price that,

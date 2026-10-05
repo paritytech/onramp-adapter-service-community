@@ -22,7 +22,7 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | `GET /funding/:id` | none | One funding request's status + timeline + terms, and, on a live sell whose provider has disclosed one, the deposit address, amount and currency to send to. |
 | `POST /funding/:id/cancel` | none | Withdraw a request the buyer no longer wants. Takes away the settlement surface; **does not conclude the request**, so a payment already in flight is still observed and still settles. Refused once a payment has been seen, or, on a sell, once a deposit address has been disclosed. Idempotent. |
 | `GET /health` | none | Liveness. No auth. |
-| `GET /meld/return` | none | The completion page the widget redirects to, served from this origin so it frames cleanly. Carries no status and needs no auth; the caller's own `GET /funding/:id` poll stays authoritative. |
+| `GET /meld/return` | `?flow=sell` | The completion page the widget redirects to, served from this origin so it frames cleanly. Posts `meld:paid` to its parent frame, or `meld:verified` with `?flow=sell` (the seller is back from KYC, nothing was paid). Carries no status and needs no auth; the caller's own `GET /funding/:id` poll stays authoritative. |
 
 The discovery pair is proxied rather than left to the client because a keyed read is scoped to the
 providers this account has onboarded, which is the set `POST /quote` will price, so the catalog
@@ -177,48 +177,47 @@ How it is read, as Meld advises for a sell:
   reads `destinationWalletAddress ?? offrampDestinationWalletAddress`, so the configured version can
   move without disclosure going quiet. `sourceWalletAddress` and `sessionWalletAddress` are the
   seller's own wallet and are never read.
-- **The amount the seller committed.** The transaction's `sourceAmount` when it carries one, the row's
-  own `cryptoAmount` when it does not: Meld's instruction is to send exactly the quoted amount.
+- **The amount and the asset as the provider states them.** The transaction's `sourceAmount` and
+  `sourceCurrencyCode`, never the row's own terms standing in for them: Meld's instruction is to read
+  the token, the amount and the address off the transaction and send exactly that, and a caller
+  holding the terms it agreed to can only refuse a difference it is shown. Nothing is disclosed
+  until the transaction names all three, and a transaction that has already ended when it is first
+  seen discloses nothing.
 - **The preferred flow.** A sell session asks for `redirectFlow: true`, so Alchemy Pay, Banxa and
   Transak run KYC, take the payout details and send the seller back to `redirectUrl` instead of
   showing their own deposit address; the caller sends the funds once it reads the address here.
   `GET /meld/return?flow=sell` is the frameable landing for that, and says the seller is verified
   rather than that a payment arrived.
 
-**Written once a rail discloses it, never rewritten -- but a disagreement does not freeze the row.**
-If a rail ever reports a *different* address for a row that already has one, or one that does not
-decode as an account at all, the stored address is never overwritten: the seller was shown that one
-and may already have sent to it, and there is no safe way to pick a winner from here. The
-disagreement is recorded (not thrown away), and an operator can find it on the row rather than
-grepping logs for it. What changed from the first version of this behaviour: a conflicting
-disclosure used to roll back the *entire* advance it arrived with, which meant a provider that kept
-disclosing a wrong address could also stop a row that would otherwise correctly settle or fail from
-ever concluding. It no longer does -- the conflict is recorded, and a real, unrelated state move
-riding alongside it still applies. Each new disagreement is still logged loudly, at its own level.
+**The address is written once, never rewritten; the terms follow the provider.** If a rail ever
+reports a *different* address for a row that already has one, or one that does not decode as an
+account at all, the stored address is never overwritten, and from then on the deposit is **no
+longer disclosed**: the provider has moved away from the address it named, nothing here can tell
+which one it stands behind, and a caller that has not sent yet must not be sent to the old one. The
+disagreement is recorded (not thrown away), an operator can find it on the row rather than grepping
+logs for it, and a real, unrelated state move riding alongside it still applies. Each new
+disagreement is still logged loudly, at its own level. A malformed report *before* any address
+landed does not withhold one the provider names later. An amount or an asset the provider restates
+for the same address replaces the one on file, once, so the disclosure always carries what the
+provider expects now.
 
 **Cancelling is refused once an address has been disclosed.** See `POST /funding/:id/cancel` below.
 
-**What remains unverified.** No sandbox sell has ever reached the point of having a transaction, let
-alone a disclosed address (DOT_ASSETHUB is not sellable on the account this was built against).
-Specifically unverified: the status at which Meld first discloses an address; whether the amount
-this service reads (the transaction's top-level `sourceAmount`, sibling of `cryptoDetails`) is in
-fact the right field, though it is already this service's name for a sell's crypto leg everywhere
-else on this surface; and whether any asset this service delivers needs the `memo` field, which no
-observed schema has a candidate for at all. None of this has been exercised against a real off-ramp
-corridor, only against the fake store and the unit suite.
+**What remains unverified.** Meld's preferred off-ramp flow names the fields read here
+(`sourceCurrencyCode`, `sourceAmount`, `cryptoDetails.destinationWalletAddress`), but no sell has
+yet been driven through this account far enough to produce a transaction: the sandbox never
+settles a sell, since no provider receives crypto there, and the account this was built against
+was reported to off-ramp no `*_ASSETHUB` asset. Unverified in practice: the status at which Meld
+first discloses an address, the exact asset code it puts on a sell's transaction, and whether any
+asset this service delivers needs the `memo` field, which no observed schema has a candidate for.
 
-**The `sourceAmount` choice is a documented guess, not a confirmed fact, and treating it as
-confirmed is an operational decision, not merely a code comment someone might not read.** Before
-this service enables an off-ramp corridor for real money -- DOT_ASSETHUB or any other asset -- the
-amount this endpoint discloses to a seller must be confirmed against at least one real, settled
-sandbox sell for that asset. Until that confirmation happens, going live is going live on a guess
-about which field carries the figure a seller is told to expect, for the single most
-safety-critical value this service hands out. This is a release gate, to be checked off before a
-sell corridor carries real money, not a fact that reading `meld/rail.ts` is sufficient to
-establish. It is a gate on *settlement*, not on *discovery*: `GET /supported*` answering a sell
-corridor (below) is a separate, already-complete step, and answering one honestly is exactly what
-lets an integrator see a corridor is offered without that being mistaken for a promise that a sale
-through it has ever been observed to complete.
+**A release gate for real money.** Before a sell corridor carries real money, one small production
+sale for that asset must confirm that the disclosure carries the provider's asset code and amount
+as getcash expects them. Until then a mismatch fails safe: a caller holding its own terms refuses
+the disclosure and nothing is sent, but every sale through that corridor would end that way. It is
+a gate on *settlement*, not on *discovery*: `GET /supported*` answering a sell corridor (below) is
+a separate step, and answering one honestly lets an integrator see a corridor is offered without
+that being mistaken for a promise that a sale through it has ever completed.
 
 ### Off-ramp corridor discovery
 
@@ -487,7 +486,10 @@ Refused as `REQUEST_NOT_CANCELLABLE` in three cases, and the message says which:
   whether an address exists, not against `status`, because the status at which Meld first
   discloses one on a sell is unverified.
 - The request is `transaction_seen`, because a buyer whose money is in flight must not be told it
-  is cancelled.
+  is cancelled. On a sell the provider's order is open by then, and a provider that runs its own
+  widget may already have shown the seller where to send, before any address reaches this
+  service; the message says the provider has opened its order. A caller that holds the funds
+  itself can simply not send them, and the order runs out at the provider.
 - The request has already concluded, because there is nothing left to withdraw.
 
 404 for an unknown id and for another caller's alike, so it is not an existence oracle.
@@ -544,10 +546,20 @@ On a sell whose provider has disclosed a deposit address, the object also carrie
 `memo` joins the four above only for an asset that needs one; no asset this service delivers has
 been observed to. **All four of `address`, `amount`, `currency` and `observedAt` are sent together
 or not at all** -- a half-disclosure (an address with no amount, say) is worse than none, because it
-looks complete. And `deposit` is gated exactly as the settlement surface below it is: only while the
-request is non-terminal, the rail's expiry has not passed, and the caller has not cancelled. Handing
-a seller a deposit address for a concluded or cancelled request is an invitation to an unrecoverable
-on-chain send to a place nobody is watching for it any more.
+looks complete. `amount` and `currency` are the provider's own, read off its transaction; compare
+them with the terms you agreed to before sending. They follow the provider: a restated amount or
+asset for the same address replaces the one shown. `observedAt` is when this service first read the
+address and does not move with them, so compare the terms themselves, not the timestamp. And
+`deposit` is gated exactly as the settlement
+surface below it is: only while the request is non-terminal, the rail's expiry has not passed, and
+the caller has not cancelled, and additionally never once the provider has named a different
+address (see "The deposit address" above). Handing a seller a deposit address for a concluded or
+cancelled request is an invitation to an unrecoverable on-chain send to a place nobody is watching
+for it any more.
+
+When the deposit is withheld because the provider named a different address after the one it
+disclosed, the object carries `depositConflictAt` (epoch ms) instead: the sale cannot be paid as
+disclosed, and a caller that has not sent should end it rather than wait.
 
 `status` is this service's lifecycle, not Meld's: `created` -> `session_opened` ->
 `transaction_seen` -> `settled` / `failed`, plus `expired` (the rail answered and no payment
@@ -615,7 +627,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 409 | `Other{ REQUEST_SURFACE_EXPIRED }` | The rail's payment page for that request has closed, but the request has **not** concluded: a transfer may still be in flight, and the worker is still watching. Do **not** start another: poll `GET /funding/:id` and act on the conclusion when it arrives. Cleared by the worker concluding the row, so a stopped worker leaves a caller on this code indefinitely. |
 | 409 | `Other{ REQUEST_CANCELLED }` | The key belongs to a request the caller withdrew. Nothing was paid and starting again is safe, with a new key. A transfer already in flight when it was cancelled can still settle against the old request, so this is not a promise that nothing will arrive. |
 | 409 | `Other{ REQUEST_NOT_CANCELLABLE }` | `POST /funding/:id/cancel` on a request that cannot be withdrawn: a deposit address has already been disclosed to the seller, a payment is already on its way for it, or it has already concluded. |
-| 409 | `Other{ REQUEST_CONCLUDED }` | The key belongs to a request that ended as `expired` or `failed`: the rail answered and nothing was paid. Start a new one with a new key. (`refused` shares this code but never reaches the path: a refused row holds no key.) |
+| 409 | `Other{ REQUEST_CONCLUDED }` | The key belongs to a request that ended as `expired` or `failed`. On a buy the rail answered and nothing was paid; start a new one with a new key. On a sell, `failed` can follow a deposit the seller already sent (the provider failed or refunded the payout), so this is not a promise that nothing left the seller: read the request before opening another sale for the same funds. (`refused` shares this code but never reaches the path: a refused row holds no key.) |
 | 409 | `Other{ REQUEST_ALREADY_SETTLED }` | The key belongs to a request the buyer **already paid**. Do not start another for it. Split out of `REQUEST_CONCLUDED` because a client cannot act on one code for both: told "start a new one" after a settled purchase, it opens a second payable surface for money already taken. |
 | 409 | `Other{ REQUEST_OUTCOME_UNKNOWN }` | The key belongs to a request that concluded as `unobserved`: we stopped being able to ask the rail and never learned whether the buyer paid. Distinct from **both** other 409 conclusions: `REQUEST_CONCLUDED` says it finished and nothing was paid, `REQUEST_ALREADY_SETTLED` says it finished and *was* paid, this one says nobody knows which. Starting a new request means accepting the risk of paying twice. |
 | 400 | `RegionUnavailable` | A real destination this deployment has not configured. |
