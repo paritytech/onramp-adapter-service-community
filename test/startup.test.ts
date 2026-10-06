@@ -884,8 +884,13 @@ describe('buildPersonhood key derivation', () => {
             mode: 'personhood',
             personhood: {
               jwt_key: { mode: 'env', var: 'TEST_PH_KEY' },
-              people_rpc_url: 'wss://127.0.0.1:9944',
-              collections: [{ identifier: `0x${'11'.repeat(32)}`, ring_exponent: 9 }],
+              networks: [
+                {
+                  id: 'previewnet',
+                  people_rpc_url: 'wss://127.0.0.1:9944',
+                  collections: [{ identifier: `0x${'11'.repeat(32)}`, ring_exponent: 9 }],
+                },
+              ],
               challenge_ttl_ms: 60_000,
               token_ttl_s: 300,
             },
@@ -914,6 +919,7 @@ describe('buildPersonhood key derivation', () => {
         challenge: wire(mintChallenge(derive('onramp:challenge'))),
         proof: wire(new Uint8Array([1, 2, 3])),
         ring: 0,
+        network: 'previewnet',
         productId: PRODUCT,
       }),
     );
@@ -948,14 +954,14 @@ describe('buildPersonhood key derivation', () => {
     const built = await service();
 
     // The positive half: a token minted under `onramp:jwt` is this service's own token.
-    const mine = await mintToken({ secret: derive('onramp:jwt') }, '0xada', PRODUCT, 300);
-    await expect(built.verify(mine)).resolves.toEqual({ subject: '0xada', productId: PRODUCT });
+    const mine = await mintToken({ secret: derive('onramp:jwt') }, '0xada', PRODUCT, 'previewnet', 300);
+    await expect(built.verify(mine)).resolves.toEqual({ subject: '0xada', productId: PRODUCT, network: 'previewnet' });
 
     // The half that matters. A token signed with the challenge key must be a forgery, which
     // it only is while the two keys differ. Collapse the labels and this token verifies, and
     // then anyone who can call the public challenge route can mint a bearer token for any alias
     // and any allowed product.
-    const forged = await mintToken({ secret: derive('onramp:challenge') }, '0xmallory', PRODUCT, 300);
+    const forged = await mintToken({ secret: derive('onramp:challenge') }, '0xmallory', PRODUCT, 'previewnet', 300);
     await expect(built.verify(forged)).rejects.toThrow(/token rejected/);
   });
 
@@ -966,6 +972,7 @@ describe('buildPersonhood key derivation', () => {
         challenge: wire(mintChallenge(challengeKey)),
         proof: wire(new Uint8Array([1, 2, 3])),
         ring: 0,
+        network: 'previewnet',
         // Deliberately not an allowed product: the allowlist check is the next step after the
         // challenge MAC, so this refusal is proof the challenge itself verified, and it stops
         // the call before the People-chain read, which has no node behind it here.

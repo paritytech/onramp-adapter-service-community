@@ -32,17 +32,23 @@
         "mode": "file",
         "path": "/run/secrets/jwt-key"
       },
-      "people_rpc_url": "wss://paseo-people-next-system-rpc.polkadot.io",
-      "collections": [
+      "networks": [
         {
-          "identifier": "0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652d6c697465",
-          "ring_exponent": 9
-        },
-        {
-          "identifier": "0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652020202020",
-          "ring_exponent": 9
+          "id": "paseo-next-v2",
+          "people_rpc_url": "wss://paseo-people-next-system-rpc.polkadot.io",
+          "collections": [
+            {
+              "identifier": "0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652d6c697465",
+              "ring_exponent": 9
+            },
+            {
+              "identifier": "0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652020202020",
+              "ring_exponent": 9
+            }
+          ]
         }
       ],
+      "trusted_equally": false,
       "challenge_ttl_ms": 60000,
       "token_ttl_s": 300
     }

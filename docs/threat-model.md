@@ -145,10 +145,34 @@ holding a Meld transaction id can read that transaction. A row does acquire
 seen, which is the window a caller polls in. Bounded rather than silent: it needs a current
 person in the ring, and Meld ids are high-entropy.
 
-**R13: a person holds one bucket and one funding scope per allowed product, and per collection.**
-The alias is contextual on the product id, so one human proving against two allowed products
-recovers two aliases legitimately. Membership of more than one People collection adds a second
-multiplier, so the bound is `allowed_products.length x collections.length`.
+**R13: a person holds one bucket and one funding scope per allowed product, per collection, and
+per People network they separately register on.** The alias is contextual on the product id, so one
+human proving against two allowed products recovers two aliases legitimately. Membership of more
+than one People collection adds a second multiplier.
+
+`auth.personhood.networks` adds a third, and it behaves unlike the other two. The alias is
+`alias_in_context(entropy, context)`, which takes no ring, so **one key proving on every configured
+network yields one alias** -- the network multiplies nothing for a person who reuses their key, and
+that is why the network is a separate `net` claim rather than part of `sub`. What is not bounded is
+a human registering *different* keys on different networks: those aliases are unlinkable by
+construction (a privacy property of ring-VRF, not an oversight), so nothing in this service can
+collapse them. The ceiling is therefore `allowed_products.length x collections.length x
+networks.length`, with the last factor reached only by deliberate separate registration.
+
+What that costs depends entirely on what the gate protects. Nothing here caps spend per person --
+`limits` bounds a single transaction and `per_person_max` is a request rate -- so the loss is
+audit-trail integrity (one human appearing as several unrelated people in `funding_requests`) and a
+multiplied request allowance, not a spend or laundering bound.
+
+**The sharper edge is the list's composition, not its length.** A caller declares which network
+answers their proof, and every proven person is equal downstream, so the gate is exactly as strong
+as the weakest network listed. Three testnets sharing a registration fee are equally weak and
+nothing is gained by picking between them. A testnet beside a mainnet People chain is a cheap side
+entrance to a mainnet-grade identity, and the verification is *correct* in that case -- the proof
+really is a valid testnet member -- which is what makes it hard to see. `trusted_equally` exists to
+make that composition an explicit operator assertion rather than a default nobody revisited; the
+service cannot check it, because registration difficulty is a social fact about a chain and not
+something reachable over `state_getStorage`.
 
 **R14: a captured `(challenge, proof)` pair replays until the challenge expires.** A challenge is
 deliberately not consumed on redemption, so anyone obtaining one redeem body can re-mint tokens as

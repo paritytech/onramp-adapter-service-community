@@ -26,10 +26,14 @@ meld:
 auth:
   mode: personhood
   personhood:
-    people_rpc_url: "wss://people-paseo.example.invalid"
-    collections:
-      - identifier: "0x1111111111111111111111111111111111111111111111111111111111111111"
-        ring_exponent: 9
+    # One network, so `trusted_equally` stays false: there is no weaker one to pick.
+    networks:
+      - id: paseo-next-v2
+        people_rpc_url: "wss://people-paseo.example.invalid"
+        collections:
+          - identifier: "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ring_exponent: 9
+    trusted_equally: false
     challenge_ttl_ms: 60000
     token_ttl_s: 300
 

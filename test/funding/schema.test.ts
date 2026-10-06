@@ -327,7 +327,12 @@ describe('the real migration chain', () => {
       const v1 = freshSchema()
         .filter((sql) => !sql.includes('supported_corridors'))
         .map((sql) =>
-          sql.replace(' country TEXT,', '').replace(' reason TEXT,', '').replace(' cancelled_at BIGINT,', ''),
+          sql
+            .replace(' country TEXT,', '')
+            .replace(' reason TEXT,', '')
+            .replace(' cancelled_at BIGINT,', '')
+            // v5 -> v6: which People network admitted the caller.
+            .replace(" network TEXT NOT NULL DEFAULT 'unrecorded',", ''),
         );
       for (const sql of v1) await raw(schema, sql);
       await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
@@ -376,7 +381,7 @@ describe('the real migration chain', () => {
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6]);
     } finally {
       await dropSchema(schema);
     }
@@ -395,7 +400,10 @@ describe('applying a migration', () => {
   const toCurrent: Migration = {
     from: 0,
     to: SCHEMA_VERSION,
-    sql: ['ALTER TABLE funding_requests ADD COLUMN status_history TEXT NOT NULL DEFAULT \'[]\''],
+    sql: [
+      'ALTER TABLE funding_requests ADD COLUMN status_history TEXT NOT NULL DEFAULT \'[]\'',
+      "ALTER TABLE funding_requests ADD COLUMN network TEXT NOT NULL DEFAULT 'unrecorded'",
+    ],
   };
 
   /**

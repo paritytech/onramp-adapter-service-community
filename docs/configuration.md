@@ -27,8 +27,10 @@ a service that runs in production with a development posture. See
 | `meld.boot_probe` | The quote requested at boot to prove the key and the endpoint. Operator-supplied, because it has to be a request Meld will actually accept; `destination_code` must be one this service delivers, since Meld resolves an unknown one to Bitcoin rather than refusing it. |
 | `auth.mode` | `personhood` \| `insecure_dev`. **Required, no default.** `personhood` verifies a ring-VRF proof on chain before spending the key; `insecure_dev` trusts a dev header and is refused anywhere but `development`. It gives every caller of a product the same alias, so funding rows and idempotency keys are shared between them. |
 | `auth.personhood.jwt_key` | Where the JWT signing key is read from: a second `Secret`, redacted like the Meld key. Required when `mode` is `personhood`, and **at least 32 bytes**: `openssl rand -base64 32`. |
-| `auth.personhood.people_rpc_url` | The People-chain RPC the register gate reads the ring commitment from. **Must be `wss` outside `development`**: this is the root of trust for personhood, and over plaintext an on-path attacker can serve a ring commitment they generated themselves. |
-| `auth.personhood.collections` | The People collections a proof may open against, tried in order. Each is `{ identifier, ring_exponent }`. A **list** because personhood is not one population: full persons (`pop:polkadot.network/people`) and lite persons (`pop:polkadot.network/people-lite`) live in different collections, and pinning one silently refuses everyone in the other. The exponent rides with the collection because it is the ring domain, a property of the collection rather than of the deployment. The real ids are ASCII names **space-padded to 32 bytes**; do not trim the trailing `0x20`. |
+| `auth.personhood.networks` | The People networks a proof may be verified against. Each is `{ id, people_rpc_url, collections }`, and **at least one is required**. `id` is what a caller declares at redeem, matched exactly; a name absent from this list is refused before any chain read, so the caller chooses among the operator's networks and cannot introduce one. Use the ids from `networks.json` (`previewnet`, `paseo-next-v2`, `polkadot-test`), not the front end's deploy-workflow env names, which differ. The network is on the wire because a proof cannot say which chain it was minted against: the collection identifiers are byte-identical across environments and only the roots differ. |
+| `auth.personhood.networks[].people_rpc_url` | The People-chain RPC the register gate reads the ring commitment from, for that network. **Must be `wss` outside `development`**: this is the root of trust for personhood, and over plaintext an on-path attacker can serve a ring commitment they generated themselves. Checked per entry, because one plaintext endpoint among several is enough -- the caller picks which network answers. |
+| `auth.personhood.networks[].collections` | The People collections a proof may open against on that network, tried in order. Each is `{ identifier, ring_exponent }`. A **list** because personhood is not one population: full persons (`pop:polkadot.network/people`) and lite persons (`pop:polkadot.network/people-lite`) live in different collections, and pinning one silently refuses everyone in the other. The exponent rides with the collection because it is the ring domain. The real ids are ASCII names **space-padded to 32 bytes**; do not trim the trailing `0x20`. The same identifier on two networks is normal and expected. |
+| `auth.personhood.trusted_equally` | **Required `true` once `networks` names more than one**, and refused as a default. The gate is only as strong as the weakest network listed, because the caller picks which one answers their proof and every proven person is equal downstream. Nothing here can measure a chain's registration difficulty, so this is the operator asserting the listed networks are equally hard to register on. **Never list a testnet People chain beside a mainnet one.** See threat model R13. |
 | `auth.personhood.challenge_ttl_ms` | How long a challenge stays acceptable; the freshness that stops replay. 1000 to 300000. |
 | `auth.personhood.token_ttl_s` | How long a redeemed session JWT is valid; the browser keeps it this long. 30 to 3600. |
 | `limits[]` | Per `(destination, currency)`: `code`, `min`, `max`, `currency`. **Optional, and no longer what decides whether a pair is buyable**: live discovery is. A row *tightens* Meld's live bound for the pair it names, so this is where a business ceiling stricter than Meld's goes; a pair with no row stays buyable at Meld's own bounds, and a row that does not overlap the live bound is refused rather than reconciled. It is also the fallback allow-list if the catalog is unreachable, where it does behave like the old hard gate; left empty, that window fails closed. A destination may appear more than once (a card buyer pays USD, a SEPA buyer EUR), but a repeated pair is refused rather than silently resolved. |
@@ -84,9 +86,17 @@ fixing one error per restart stops reading the errors:
 - an `auth.personhood.jwt_key` shorter than 32 bytes, an empty `collections` list, a collection
   `identifier` that is not 32 bytes of hex, a duplicate identifier, or a `ring_exponent` outside
   `9 | 10 | 14`;
-- `auth.personhood.people_rpc_url` that is not `wss` outside `development`: over plaintext an
-  on-path attacker serves a ring commitment they generated themselves, and the personhood gate
-  verifies against it;
+- `auth.personhood.networks[].people_rpc_url` that is not `wss` outside `development`: over
+  plaintext an on-path attacker serves a ring commitment they generated themselves, and the
+  personhood gate verifies against it;
+- two networks sharing an `id`, which would make the chain that verified a proof depend on list
+  order;
+- more than one network without `auth.personhood.trusted_equally: true`;
+- a configured network that is **reachable and answers for none of its own collections** at ring 0.
+  That is a wrong chain or a mispasted identifier rather than an outage, and every proof against it
+  would be refused; without this check the pod boots green, passes `/health`, and 401s every real
+  user. A network that is merely *unreachable* is logged and allowed through, because an outage is
+  not a verdict -- its redeems then fail as `503`;
 - a `meld.base_url` whose host is not this environment's pinned Meld host, or that is not https,
   or that carries userinfo (`https://api.meld.io@attacker.example`) or a path;
 - a `meld.boot_probe.destination_code` outside the catalog: Meld resolves an unrecognised

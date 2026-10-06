@@ -54,14 +54,14 @@ data:
         "mode": {{ .Values.auth.mode | quote }},
         "personhood": {
           "jwt_key": { "mode": "file", "path": {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.jwtKey.key | quote }} },
-          "people_rpc_url": {{ .Values.auth.personhood.people_rpc_url | quote }},
           {{- /*
             `toJson` rather than a hand-built array: Helm parses YAML numbers to float64 and
             text/template renders those with %v, so a hand-written `ring_exponent` comes out as
             `9` here but a larger value would print in exponent form. encoding/json writes the
             integer. Same trap the config.json ConfigMap avoids wholesale.
           */}}
-          "collections": {{ .Values.auth.personhood.collections | toJson }},
+          "networks": {{ .Values.auth.personhood.networks | toJson }},
+          "trusted_equally": {{ .Values.auth.personhood.trusted_equally | default false }},
           "challenge_ttl_ms": {{ int (.Values.auth.personhood.challenge_ttl_ms | default 60000) }},
           "token_ttl_s": {{ int (.Values.auth.personhood.token_ttl_s | default 300) }}
         }

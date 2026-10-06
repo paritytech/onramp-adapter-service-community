@@ -300,33 +300,58 @@ const configSchema = z
           .object({
             /** Where the JWT signing key is read from. A second `Secret`, redacted like the Meld key. */
             jwt_key: secretSource,
-            /** The People-chain RPC the register gate reads the ring commitment from. */
-            people_rpc_url: z.url(),
             /**
-             * The People-chain collections a proof may open against, tried in order.
+             * The People networks a proof may be verified against. The caller names one per
+             * redeem; a name absent from this list is refused before any chain read.
              *
-             * A list because pinning one silently refuses every person in the other: the commitment
-             * read succeeds for a collection they are not in, so the proof does not open and the
-             * service looks healthy while turning real people away. Multiplies the alias bound;
-             * see threat model R13.
-             *
-             * The exponent rides with the collection because it is the ring domain; two collections
-             * need not share one.
+             * A list because the collection identifiers are byte-identical across environments and
+             * only the roots differ, so a proof cannot say which chain minted it. Operator config,
+             * never a free-form caller field. A person registered separately on two networks holds
+             * two unlinkable aliases, so this list's length caps how many allowances one human can
+             * hold -- see `trusted_equally` and threat model R13.
              */
-            collections: z
+            networks: z
               .array(
                 z
                   .object({
-                    /** The collection id, as `0x...` hex (32 bytes). */
-                    identifier: z.string(),
-                    /** The ring exponent (proof domain) for this collection: 9 | 10 | 14. */
-                    ring_exponent: z.number().int().refine((n) => n === 9 || n === 10 || n === 14, {
-                      message: 'ring_exponent must be 9, 10 or 14.',
-                    }),
+                    /** The name a caller declares at redeem. Matched exactly, case-sensitively. */
+                    id: z.string().min(1).max(64),
+                    /** The People-chain RPC the register gate reads the ring commitment from. */
+                    people_rpc_url: z.url(),
+                    /**
+                     * The collections a proof may open against, tried in order. A list because
+                     * pinning one silently refuses everyone in the other. The exponent rides with
+                     * the collection because it is the ring domain. See threat model R13.
+                     */
+                    collections: z
+                      .array(
+                        z
+                          .object({
+                            /** The collection id, as `0x...` hex (32 bytes). */
+                            identifier: z.string(),
+                            /** The ring exponent (proof domain) for this collection: 9 | 10 | 14. */
+                            ring_exponent: z.number().int().refine((n) => n === 9 || n === 10 || n === 14, {
+                              message: 'ring_exponent must be 9, 10 or 14.',
+                            }),
+                          })
+                          .strict(),
+                      )
+                      .min(1),
                   })
                   .strict(),
               )
               .min(1),
+            /**
+             * The operator's assertion that every network above is equally hard to register on.
+             * Required once the list names more than one, so a mixed-tier list cannot be reached by
+             * leaving a default alone.
+             *
+             * The gate is only as strong as the weakest network listed: the caller picks which one
+             * answers and every proven person is equal downstream. Nothing here can measure a
+             * chain's registration difficulty, so it has to be asserted. Never list a testnet
+             * People chain beside a mainnet one.
+             */
+            trusted_equally: z.boolean().default(false),
             /** How long a challenge stays acceptable; the freshness that stops replay. */
             challenge_ttl_ms: z.number().int().min(1_000).max(300_000),
             /** How long a redeemed session JWT is valid; the browser keeps it this long. */
@@ -648,17 +673,21 @@ const configSchema = z
      * pinned because it carries a key; this one decides who is a person.
      */
     if (cfg.auth.personhood !== undefined) {
-      const rpc = parsedUrl(cfg.auth.personhood.people_rpc_url);
-      // `undefined` means the field's own `z.url()` already refused it.
-      if (rpc !== undefined && cfg.environment !== 'development' && rpc.protocol !== 'wss:') {
-        ctx.addIssue({
-          code: 'custom',
-          path: ['auth', 'personhood', 'people_rpc_url'],
-          message:
-            `auth.personhood.people_rpc_url must use wss in "${cfg.environment}", not ` +
-            `"${rpc.protocol}": an unauthenticated RPC can forge the ring commitment the ` +
-            'personhood gate is verified against.',
-        });
+      // Per network, by index. One plaintext RPC among several wss ones is the whole hole: the
+      // caller picks which network answers, so they pick the one nobody pinned.
+      for (const [index, network] of cfg.auth.personhood.networks.entries()) {
+        const rpc = parsedUrl(network.people_rpc_url);
+        // `undefined` means the field's own `z.url()` already refused it.
+        if (rpc !== undefined && cfg.environment !== 'development' && rpc.protocol !== 'wss:') {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['auth', 'personhood', 'networks', index, 'people_rpc_url'],
+            message:
+              `auth.personhood.networks[${String(index)}].people_rpc_url must use wss in ` +
+              `"${cfg.environment}", not "${rpc.protocol}": an unauthenticated RPC can forge the ` +
+              'ring commitment the personhood gate is verified against.',
+          });
+        }
       }
     }
 
@@ -821,34 +850,69 @@ const configSchema = z
           message: 'auth.personhood is required when auth.mode is "personhood".',
         });
       } else {
-        // Each identifier, by index, so a bad third entry names the third entry. The collection ids
-        // are ASCII names space-padded to 32 bytes (`pop:polkadot.network/people` carries four
-        // trailing `0x20`), so a trimmed value is a plausible mistake that must not be waived.
-        const seen = new Map<string, number>();
-        for (const [index, entry] of cfg.auth.personhood.collections.entries()) {
-          if (!/^0x[0-9a-fA-F]{64}$/.test(entry.identifier)) {
-            ctx.addIssue({
-              code: 'custom',
-              path: ['auth', 'personhood', 'collections', index, 'identifier'],
-              message:
-                'identifier must be a 32-byte hex value, e.g. "0x" followed by 64 hex digits. The ' +
-                'People collection ids are ASCII names padded to 32 bytes, so do not trim trailing spaces.',
-            });
-            continue;
-          }
-          // Duplicates are refused because the entry is what carries the exponent: two rows for
-          // one collection disagreeing on it makes verification depend on list order.
-          const canonical = entry.identifier.toLowerCase();
-          const first = seen.get(canonical);
+        const personhood = cfg.auth.personhood;
+        // `redeem` takes the first match, so two rows sharing an id would make the chain that
+        // verified a proof depend on list order -- the one thing the `net` claim exists to state.
+        const networkIds = new Map<string, number>();
+        for (const [index, network] of personhood.networks.entries()) {
+          const first = networkIds.get(network.id);
           if (first !== undefined) {
             ctx.addIssue({
               code: 'custom',
-              path: ['auth', 'personhood', 'collections', index, 'identifier'],
-              message: `duplicate collection identifier: already declared at index ${String(first)}.`,
+              path: ['auth', 'personhood', 'networks', index, 'id'],
+              message: `duplicate network id "${network.id}": already declared at index ${String(first)}.`,
             });
           } else {
-            seen.set(canonical, index);
+            networkIds.set(network.id, index);
           }
+
+          // By index, so a bad third entry names the third. The ids are ASCII names space-padded
+          // to 32 bytes, so a trimmed value is a plausible mistake that must not be waived. Scoped
+          // per network: the same identifier on two chains is the normal case (verified live), so
+          // only a repeat within one network is a fault.
+          const seen = new Map<string, number>();
+          for (const [entryIndex, entry] of network.collections.entries()) {
+            const path = ['auth', 'personhood', 'networks', index, 'collections', entryIndex, 'identifier'];
+            if (!/^0x[0-9a-fA-F]{64}$/.test(entry.identifier)) {
+              ctx.addIssue({
+                code: 'custom',
+                path,
+                message:
+                  'identifier must be a 32-byte hex value, e.g. "0x" followed by 64 hex digits. The ' +
+                  'People collection ids are ASCII names padded to 32 bytes, so do not trim trailing spaces.',
+              });
+              continue;
+            }
+            // Duplicates are refused because the entry is what carries the exponent: two rows for
+            // one collection disagreeing on it makes verification depend on list order.
+            const canonical = entry.identifier.toLowerCase();
+            const firstEntry = seen.get(canonical);
+            if (firstEntry !== undefined) {
+              ctx.addIssue({
+                code: 'custom',
+                path,
+                message: `duplicate collection identifier: already declared at index ${String(firstEntry)}.`,
+              });
+            } else {
+              seen.set(canonical, entryIndex);
+            }
+          }
+        }
+
+        // An operator assertion rather than a checkable rule: registration difficulty is a social
+        // fact about a chain, not something reachable over `state_getStorage`. One network needs no
+        // assertion -- there is no weaker one to pick.
+        if (personhood.networks.length > 1 && !personhood.trusted_equally) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['auth', 'personhood', 'trusted_equally'],
+            message:
+              `auth.personhood.networks names ${String(personhood.networks.length)} networks, so ` +
+              'auth.personhood.trusted_equally must be set true to confirm they are equally hard ' +
+              'to register on. A caller picks which network answers their proof and every proven ' +
+              'person is equal downstream, so the gate is only as strong as the weakest network ' +
+              'listed. Do not list a testnet People chain beside a mainnet one.',
+          });
         }
       }
     }

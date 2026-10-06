@@ -22,12 +22,17 @@ function liveService(): { service: PersonhoodService; tokenKey: Uint8Array } {
   const tokenKey = new Uint8Array(32).fill(6);
   const deps: PersonhoodDeps = {
     validate: () => new Uint8Array(32),
-    commitments: { commitment: async () => null },
     challengeKey: new Uint8Array(32).fill(6),
     tokenKey: { secret: tokenKey },
     challengeTtlMs: 60_000,
     tokenTtlSeconds: 300,
-    rings: [{ identifier: '0x' + '22'.repeat(32), exponent: 9 }],
+    networks: [
+      {
+        id: 'previewnet',
+        commitments: { commitment: async () => null },
+        rings: [{ identifier: '0x' + '22'.repeat(32), exponent: 9 }],
+      },
+    ],
     allowedProducts: ['app.dot'],
   };
   return { service: new PersonhoodService(deps), tokenKey };
@@ -52,6 +57,8 @@ describe('callerAuth', () => {
       expect(await authenticate(request({ 'x-dev-product-id': 'app.dot' }))).toEqual({
         productId: 'app.dot',
         alias: 'dev:app.dot',
+        // No chain was asked, so no chain is named.
+        network: 'dev',
         // Not a person: one alias for every caller of the product, which is why the rate limit
         // refuses to key on it. See src/caller.ts.
         proven: false,
@@ -84,11 +91,12 @@ describe('callerAuth', () => {
 
     it('returns the subject a real token carries', async () => {
       const { tokenKey } = liveService();
-      const token = await mintToken({ secret: tokenKey }, '0xalias', PRODUCT, 300);
+      const token = await mintToken({ secret: tokenKey }, '0xalias', PRODUCT, 'previewnet', 300);
 
       await expect(authenticate()(request({ authorization: `Bearer ${token}` }))).resolves.toEqual({
         productId: PRODUCT,
         alias: '0xalias',
+        network: 'previewnet',
         proven: true,
       });
     });
@@ -136,10 +144,11 @@ it('refuses trailing junk after the token as a bad token, not a malformed header
       // HTTP intermediaries may pad; a header that parses once trimmed is a good header. Without
       // the trim, the leading space would push the `^Bearer` anchor off the line.
       const { tokenKey } = liveService();
-      const token = await mintToken({ secret: tokenKey }, '0xalias', PRODUCT, 300);
+      const token = await mintToken({ secret: tokenKey }, '0xalias', PRODUCT, 'previewnet', 300);
       await expect(authenticate()(request({ authorization: `   Bearer ${token}   ` }))).resolves.toEqual({
         productId: PRODUCT,
         alias: '0xalias',
+        network: 'previewnet',
         proven: true,
       });
     });
@@ -147,7 +156,7 @@ it('refuses trailing junk after the token as a bad token, not a malformed header
     it('refuses a header whose scheme is preceded by other text', async () => {
       // The scheme must anchor the line; a scheme that floats mid-header must not open the gate.
       const { tokenKey } = liveService();
-      const token = await mintToken({ secret: tokenKey }, '0xalias', PRODUCT, 300);
+      const token = await mintToken({ secret: tokenKey }, '0xalias', PRODUCT, 'previewnet', 300);
       await expect(authenticate()(request({ authorization: `xBearer ${token}` }))).rejects.toThrow(
         'Malformed Authorization header.',
       );
@@ -155,7 +164,7 @@ it('refuses trailing junk after the token as a bad token, not a malformed header
 
     it('refuses a token the service did not mint, with the stable 401 shape', async () => {
       const other = new Uint8Array(32).fill(9); // not this service's signing key
-      const token = await mintToken({ secret: other }, '0xalias', PRODUCT, 300);
+      const token = await mintToken({ secret: other }, '0xalias', PRODUCT, 'previewnet', 300);
 
       await expectRefusal(authenticate()(request({ authorization: `Bearer ${token}` })));
     });

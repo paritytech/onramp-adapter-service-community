@@ -259,8 +259,14 @@ async function writeConfig(
           mode: 'personhood',
           personhood: {
             jwt_key: { mode: 'file', path: jwtKeyPath },
-            people_rpc_url: 'wss://people.example.invalid',
-            collections: [{ identifier: `0x${'11'.repeat(32)}`, ring_exponent: 9 }],
+            // `previewnet` because the tokens below are minted for it.
+            networks: [
+              {
+                id: 'previewnet',
+                people_rpc_url: 'wss://people.example.invalid',
+                collections: [{ identifier: `0x${'11'.repeat(32)}`, ring_exponent: 9 }],
+              },
+            ],
             challenge_ttl_ms: 60000,
             token_ttl_s: 300,
           },
@@ -613,6 +619,7 @@ describe('the service as a process', () => {
         challenge: Buffer.from(token).toString('base64url'),
         proof: Buffer.from(new Uint8Array([1, 2, 3])).toString('base64url'),
         ring: 0,
+        network: 'previewnet',
         productId: PRODUCT,
       }),
     });
@@ -666,8 +673,8 @@ describe('the service as a process', () => {
         }),
       });
 
-    const accepted = await quoteAs(await mintToken(keyFor('onramp:jwt'), '0xada', PRODUCT, 300));
-    const refused = await quoteAs(await mintToken(keyFor('onramp:challenge'), '0xmallory', PRODUCT, 300));
+    const accepted = await quoteAs(await mintToken(keyFor('onramp:jwt'), '0xada', PRODUCT, 'previewnet', 300));
+    const refused = await quoteAs(await mintToken(keyFor('onramp:challenge'), '0xmallory', PRODUCT, 'previewnet', 300));
     await stopService(child);
 
     expect(accepted.status).toBe(200);

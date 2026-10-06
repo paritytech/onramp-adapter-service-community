@@ -20,7 +20,7 @@ import {
   fundingRecord,
 } from './fixtures.js';
 
-const SUBJECT = { productId: 'app.dot', alias: 'alias-abc', proven: true };
+const SUBJECT = { productId: 'app.dot', alias: 'alias-abc', network: 'previewnet', proven: true };
 /** Narrow an optional the test has already asserted on. Throws rather than casting: a missing row
  *  then fails at the line that assumed it, naming what was missing. */
 function must<T>(value: T | undefined, what: string): T {
@@ -29,7 +29,7 @@ function must<T>(value: T | undefined, what: string): T {
 }
 
 /** A second caller, for the scoping assertions: same product, different personhood alias. */
-const OTHER_SUBJECT = { productId: 'app.dot', alias: 'alias-xyz', proven: true };
+const OTHER_SUBJECT = { productId: 'app.dot', alias: 'alias-xyz', network: 'previewnet', proven: true };
 const REQUEST_ID = 'req-1';
 /** Pinned so a test can assert the exact timeline without mocking time. */
 const NOW = 1_700_000_000_000;
@@ -489,7 +489,7 @@ describe('Onramp.create', () => {
 
     await service.createSession(SUBJECT, createRequest(), REQUEST_ID);
     const other = await service.createSession(
-      { productId: 'app.dot', alias: 'alias-other', proven: true },
+      { productId: 'app.dot', alias: 'alias-other', network: 'previewnet', proven: true },
       createRequest(),
       REQUEST_ID,
     );
@@ -1415,8 +1415,8 @@ describe('Onramp.create', () => {
       await service.createSession(SUBJECT, createRequest(), REQUEST_ID);
 
       expect((await service.get(SUBJECT, 'funding-1'))?.status).toBe('session_opened');
-      expect(await service.get({ productId: 'app.dot', alias: 'alias-other', proven: true }, 'funding-1')).toBeUndefined();
-      expect(await service.get({ productId: 'app.other', alias: 'alias-abc', proven: true }, 'funding-1')).toBeUndefined();
+      expect(await service.get({ productId: 'app.dot', alias: 'alias-other', network: 'previewnet', proven: true }, 'funding-1')).toBeUndefined();
+      expect(await service.get({ productId: 'app.other', alias: 'alias-abc', network: 'previewnet', proven: true }, 'funding-1')).toBeUndefined();
     });
 
     it('defaults the clock and id to real sources when not injected (production path)', async () => {

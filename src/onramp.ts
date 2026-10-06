@@ -992,6 +992,9 @@ export class Onramp {
       id: terms.id,
       subject_alias: terms.subject.alias,
       product_id: terms.subject.productId,
+      // Recorded because the alias cannot say it: one person proving on two chains is one alias
+      // here, by design. Audit only -- see `NETWORK_COLUMN` in `funding/schema.ts`.
+      network: terms.subject.network,
       destination_currency_code: terms.destinationCurrencyCode,
       wallet_address: terms.walletAddress,
       source_amount: terms.sourceAmount,

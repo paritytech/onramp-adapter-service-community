@@ -24,15 +24,15 @@ const TEMPLATE_MARKER = 'TODO(operator)';
 /**
  * The only fields a template overlay is allowed to be missing, in EVERY overlay.
  *
- * `people_rpc_url` is deliberately NOT here, and putting it back is a mistake worth naming because
- * it has been made twice. While it sat on this list any fault in it was swallowed: matching is by
- * substring across all overlays, so a `ws://attacker.example` in one of them passed this gate
- * green. That URL is the root of trust for personhood: every proof is verified against the
- * commitment read from it, and plaintext means whoever is on the path decides who is a person. An
- * overlay that leaves it empty fails this gate, which is the point: a substring waiver here would
- * also cover the overlay that has it filled.
+ * A network's `people_rpc_url` is deliberately NOT here, and putting it back is a mistake worth
+ * naming because it has been made twice. While it sat on this list any fault in it was swallowed:
+ * matching is by substring across all overlays, so a `ws://attacker.example` in one of them passed
+ * this gate green. That URL is the root of trust for personhood: every proof is verified against
+ * the commitment read from it, and plaintext means whoever is on the path decides who is a person.
+ * An overlay that leaves it empty fails this gate, which is the point: a substring waiver here
+ * would also cover the overlay that has it filled.
  */
-const EXPECTED_TEMPLATE_HOLES = ['collections', 'trusted_proxy_cidrs'];
+const EXPECTED_TEMPLATE_HOLES = ['networks', 'trusted_proxy_cidrs'];
 
 /**
  * Schema paths the defaults are expected to fail on for a reason that is not an unfilled hole.
@@ -64,19 +64,15 @@ const DEFAULTS_FAIL_CLOSED = ['meld.base_url'];
  */
 const REQUIRED_OPERATOR_INPUTS = [
   {
-    // The live Polkadot People chain carries no `Members` pallet, so there is no ring to verify
-    // against and no endpoint to name; a testnet like paseo-people-next has both. Empty rather
-    // than a plausible hostname, because the value that stood here did not resolve at all and
-    // read as configured.
-    what: 'auth.personhood.people_rpc_url',
-    owedBy: 'the People chain you target',
-    unfilled: (_output, config) => (config?.auth?.personhood?.people_rpc_url ?? '') === '',
-  },
-  {
-    what: 'auth.personhood.collections',
-    owedBy: 'the consumer application',
-    // Empty rather than all-zeroes: a zero id is valid 32-byte hex and would boot.
-    unfilled: (_output, config) => (config?.auth?.personhood?.collections ?? []).length === 0,
+    // Each entry is `{ id, people_rpc_url, collections }`: the RPC is the People chain's, the
+    // collections are the consumer application's. Shipped as an empty list rather than a plausible
+    // entry, because a zero collection id is valid 32-byte hex and would boot, and an endpoint
+    // that did not resolve once stood here and read as configured. A filled entry is validated in
+    // full: a `ws://` URL in one is a fault at `auth.personhood.networks.<i>.people_rpc_url`, not
+    // this hole.
+    what: 'auth.personhood.networks',
+    owedBy: 'the People chain you target and the consumer application',
+    unfilled: (_output, config) => (config?.auth?.personhood?.networks ?? []).length === 0,
   },
   {
     what: 'cors.allowed_origins',

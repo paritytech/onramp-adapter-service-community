@@ -102,14 +102,13 @@ on a metered upstream quota. Raising it is a change to the limiter, not to the d
 are not an outage: `RollingUpdate` with `maxUnavailable: 0` overlaps two pods for the length of a
 rollout, which doubles the allowance for that window only.
 
-Six values are not the service's to invent, and are left empty so a chart missing one fails at
+Five values are not the service's to invent, and are left empty so a chart missing one fails at
 render or at boot rather than behaving as though somebody had decided. `npm run check:chart`
 parses `values.yaml` and prints each one still owed.
 
 | Value | Supplied by | What it does, and what happens without it |
 | --- | --- | --- |
-| `auth.personhood.people_rpc_url` | the People chain you target | The People-chain RPC the ring commitment is read from. Empty fails config parse at boot, and anything but `wss` outside `development` is refused, because over plaintext whoever is on the path decides who is a person. |
-| `auth.personhood.collections` | the consumer application | The People-chain collection the ring-VRF proof is verified against. Empty fails config parse at boot, so the pod crash-loops rather than accepting unverifiable proofs. |
+| `auth.personhood.networks` | the People chain you target and the consumer application | The People networks a proof may be verified against, each `{ id, people_rpc_url, collections }`: the RPC the ring commitment is read from, and the collections the ring-VRF proof is verified against. Empty fails config parse at boot, so the pod crash-loops rather than accepting unverifiable proofs. Any `people_rpc_url` but `wss` outside `development` is refused, because over plaintext whoever is on the path decides who is a person. See [configuration](docs/configuration.md). |
 | `cors.allowed_origins` | the consumer application | The SPA origins allowed to call this service, and the only origins a `redirectUrl` may land on. Empty is fail-closed: every browser preflight and every redirect is refused. |
 | `server.trusted_proxy_cidrs` | your cluster operator | The peer CIDRs allowed to set `X-Forwarded-For` (the ingress controller's pod CIDR). Empty reads no forwarded header, so **every** caller behind the ingress shares one rate-limit bucket; that is safe and visible, but it is not what production wants. Filling it restores per-caller buckets behind the ingress. |
 | `store.authProxy.instance` | your cluster operator | `PROJECT:REGION:INSTANCE` for the Cloud SQL Auth Proxy. Empty and the proxy exits at startup, so the startup probe fails and the pod never serves. |
@@ -119,8 +118,12 @@ parses `values.yaml` and prints each one still owed.
 
 Boot is deliberately fatal on anything it cannot verify, and the message names the cause:
 
-- `identifier must be a 32-byte hex value`: `auth.personhood.collections` is empty. Expected on a
-  first deploy.
+- `auth.personhood.networks: Too small`: no People network is configured. Expected on a first
+  deploy.
+- `auth.personhood.networks '<id>' answered for none of their configured collections`: that
+  network's RPC answered, but serves no root for any collection listed under it, so it is the
+  wrong chain or a wrong identifier. A network that could not be read only logs, and its redeems
+  fail as `503` until it answers.
 - `Secret is missing or empty`: the Meld key, the JWT signing key or the store password is not
   mounted. All three are mandatory.
 - `Meld answered HTTP <status>`: the credential probe reached Meld and was rejected, so the key or

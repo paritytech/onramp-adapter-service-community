@@ -145,6 +145,9 @@ export const COLUMN_LIST = [
   'status',
   'reason',
   'cancelled_at',
+  // Audit only (v5 -> v6): not in `funding_by_reference` and not in any scoping predicate. See
+  // `NETWORK_COLUMN` in `schema.ts` for why adding it to either would be a bug.
+  'network',
   'status_history',
   'created_at',
   'updated_at',
@@ -739,6 +742,7 @@ interface Row {
   status: FundingState;
   reason: FundingFailure['tag'] | null;
   cancelled_at: number | null;
+  network: string;
   status_history: string;
   created_at: number;
   updated_at: number;
@@ -792,6 +796,7 @@ function recordToRow(r: FundingRecord): unknown[] {
     status: r.status,
     reason: r.reason ?? null,
     cancelled_at: r.cancelled_at ?? null,
+    network: r.network,
     status_history: JSON.stringify(r.status_history),
     created_at: r.created_at,
     updated_at: r.updated_at,
