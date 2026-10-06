@@ -978,7 +978,7 @@ describe('FundingStore', () => {
       });
     });
 
-    it('takes an amount the provider restates for the same address, without disturbing the address', async () => {
+    it('records an amount the provider restates for the same address as a conflict, keeping the deposit', async () => {
       await withStore(async (store) => {
         await store.create(sell({ status: 'transaction_seen' }));
         await store.update('funding-1', 'transaction_seen', 1_700_000_000_100, {
@@ -990,7 +990,10 @@ describe('FundingStore', () => {
 
         const persisted = await store.byId('funding-1');
         expect(persisted?.deposit_address).toBe(ALICE);
-        expect(persisted?.deposit_amount).toBe('12.3');
+        expect(persisted?.deposit_amount).toBe('12.3456789012');
+        // The database takes the reason: the constraint knows `terms_changed`.
+        expect(persisted?.deposit_conflict_reason).toBe('terms_changed');
+        expect(persisted?.deposit_conflict_at).toBe(1_700_000_000_200);
         // `deposit_observed_at` marks the first sighting of the fact, not the last: it must not
         // jump to the second update's timestamp.
         expect(persisted?.deposit_observed_at).toBe(1_700_000_000_100);

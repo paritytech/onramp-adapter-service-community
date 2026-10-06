@@ -19,14 +19,15 @@ export interface TimelineEntry {
 }
 
 /**
- * Why a disclosed deposit address was not accepted as an update to the one already stored.
+ * Why a disclosed deposit was not accepted as an update to the one already stored.
  *
  * A closed vocabulary, enforced by `funding_deposit_conflict_reason_known` in `schema.ts`, so a
  * support query can group on it. `address_changed` is a well-formed address that disagrees with
  * the one already stored; `address_malformed` is a value that does not decode as an account at
- * all. See `mergeDeposit` in `funding/merge.ts`, the one place either is produced.
+ * all; `terms_changed` is the stored address with another amount, asset or memo. See
+ * `mergeDeposit` in `funding/merge.ts`, the one place any is produced.
  */
-export type DepositConflictReason = 'address_changed' | 'address_malformed';
+export type DepositConflictReason = 'address_changed' | 'address_malformed' | 'terms_changed';
 
 /**
  * The durable record of one funding request.
@@ -114,11 +115,10 @@ export interface FundingRecord {
    * The sell deposit leg: where the seller sends the crypto, how much, in what, with what memo,
    * and when this service first read it off the rail.
    *
-   * The address is written once, by `mergeDeposit` (`funding/merge.ts`), from the first disclosure
-   * the worker observes, and never revised after that. The amount and the asset follow the
-   * provider: a later poll that restates them for the same address replaces them, and the worker
-   * logs the old and new values. `observedAt` dates the address, not the terms. `undefined` on
-   * every buy, always, and on a sell until the provider discloses one.
+   * Written once, by `mergeDeposit` (`funding/merge.ts`), from the first disclosure the worker
+   * observes, and never revised after that: a client may already have sent that amount of that
+   * asset to that address. A later poll that restates any of them is a conflict (below).
+   * `undefined` on every buy, always, and on a sell until the provider discloses one.
    */
   deposit_address?: string | undefined;
   deposit_amount?: string | undefined;
@@ -126,17 +126,17 @@ export interface FundingRecord {
   deposit_memo?: string | undefined;
   deposit_observed_at?: number | undefined;
   /**
-   * A deposit-address disclosure this service refused to accept, recorded rather than only
-   * thrown: a rail reporting a different address than the one already stored (or one that does
-   * not decode as an account at all) is an integrity problem `mergeDeposit` never lets overwrite
-   * `deposit_address`, so the rejected value lives here instead, queryable by an operator without
-   * anyone needing to grep logs. One recorded since the address landed stops the deposit being
-   * shown, and `FundingRequestDto.depositConflictAt` says so; the rejected value itself is not
-   * surfaced.
+   * A deposit disclosure this service refused to accept, recorded rather than thrown: a different
+   * address than the one already stored, one that does not decode as an account at all, or the
+   * stored address with other terms. `mergeDeposit` never lets it overwrite the deposit, so the
+   * reported address lives here instead, with the reason, queryable by an operator. One recorded
+   * since the address landed stops the deposit being shown, and
+   * `FundingRequestDto.depositConflictAt` says so; the rejected value itself is not surfaced.
    */
   deposit_conflict_address?: string | undefined;
   deposit_conflict_reason?: DepositConflictReason | undefined;
-  /** When the conflict was last observed. Re-stamped on every recurrence, not only the first. */
+  /** When the conflict was recorded. The worker skips a report naming the conflicting address
+   *  already on file (`depositIsNew`), so it is stamped once per conflicting address. */
   deposit_conflict_at?: number | undefined;
   status_history: TimelineEntry[];
   created_at: number;
@@ -252,9 +252,10 @@ export interface FundingRequestDto {
    */
   deposit?: FundingRequestDeposit;
   /**
-   * When the provider named another address, or one that is not an account, after the one it had
-   * disclosed. The deposit is no longer shown from then on: a client that has not sent yet should
-   * end the sale rather than wait for it. Present only while the request is live.
+   * When the provider named another address, or one that is not an account, or restated the
+   * amount or asset, after the deposit it had disclosed. The deposit is no longer shown from then
+   * on: a client that has not sent yet should end the sale rather than wait for it, and one that
+   * has should treat the sale as changed after it paid. Present only while the request is live.
    */
   depositConflictAt?: number;
   createdAt: number;
@@ -269,9 +270,7 @@ export interface FundingRequestDeposit {
   currency: string;
   /** Present only for an asset that needs one. Absent is the normal, permanent case for most. */
   memo?: string;
-  /** When this service first read the address off the rail, not when Meld itself issued it. It
-   *  dates the address only: an amount or asset the provider restates later replaces the one shown
-   *  here without moving it. */
+  /** When this service first read the deposit off the rail, not when Meld itself issued it. */
   observedAt: number;
 }
 

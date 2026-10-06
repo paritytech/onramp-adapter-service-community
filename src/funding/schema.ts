@@ -222,7 +222,7 @@ const DEPOSIT_CONFLICT_COLUMNS = [
  */
 const DEPOSIT_CONFLICT_CONSTRAINT =
   'CONSTRAINT funding_deposit_conflict_reason_known CHECK (' +
-  "deposit_conflict_reason IS NULL OR deposit_conflict_reason IN ('address_changed', 'address_malformed'))";
+  "deposit_conflict_reason IS NULL OR deposit_conflict_reason IN ('address_changed', 'address_malformed', 'terms_changed'))";
 
 /**
  * The ordered migration list.

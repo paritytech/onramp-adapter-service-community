@@ -214,8 +214,10 @@ const sourceAmount = z
  * verbatim, with no truncation, rounding or exponent. So the amount stays this exact string from
  * the wire to the row to the rail, and is never parsed into a `number` anywhere; a `double`
  * round-trip is not identity past 2^53 and turns `0.0000001` into `1e-7`.
+ *
+ * Also the shape `sameAmount` (`funding/amount.ts`) compares by value.
  */
-const CRYPTO_DECIMAL = /^\d{1,30}(\.\d{1,30})?$/;
+export const CRYPTO_DECIMAL = /^\d{1,30}(\.\d{1,30})?$/;
 
 /**
  * At least one non-zero digit, so `0`, `0.00000000` and any other spelling of nothing are

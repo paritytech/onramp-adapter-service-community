@@ -28,6 +28,7 @@ import { canonicalizeDisclosedAddress } from "../address.js";
 import type { Clock } from "../onramp.js";
 import type { RailDeposit, RailName } from "../rail.js";
 import { TERMINAL_STATES, type FundingState } from "./state.js";
+import { sameAmount } from "./amount.js";
 import type { FundingStore } from "./store.js";
 import type { FundingRecord } from "./types.js";
 
@@ -190,34 +191,16 @@ export async function tick(
         // it and lets an unrelated, legitimate transition through beside it, see `merge.ts`), so
         // it needs its own alarm here or it would be invisible: no error, no failed write, just a
         // row that quietly stopped accepting new disclosures. `deposit_conflict_at` changing is
-        // the signal -- re-stamped by `mergeDeposit` on every recurrence, not only the first, so
-        // this fires again each time the same disagreement is seen, which is what "loud" means
-        // for a fact an operator has not yet acted on. Its own line, and its own level: an
-        // aggregator must be able to tell this apart from the generic per-record failure below,
-        // which a rail hiccup produces just as easily and clears on its own.
+        // the signal: it changes once per conflicting address, since `depositIsNew` skips a report
+        // naming the one already on file. Its own line, and its own level: an aggregator must be
+        // able to tell this apart from the generic per-record failure below, which a rail hiccup
+        // produces just as easily and clears on its own.
         if (refreshed !== undefined && refreshed.deposit_conflict_at !== record.deposit_conflict_at) {
           log(
             `funding worker: request ${record.id} received a conflicting deposit disclosure ` +
               `(${refreshed.deposit_conflict_reason ?? 'unknown reason'}: "${refreshed.deposit_conflict_address ?? 'unknown value'}"); ` +
-              `the previously disclosed address is unchanged and is no longer shown. This needs a person, not a retry.`,
+              `the deposit first disclosed is unchanged and is no longer shown. This needs a person, not a retry.`,
             'error',
-          );
-        }
-        // The terms follow the provider for the address already landed (see `mergeDeposit`), so a
-        // restated amount or asset rewrites them. Logged with both values: the figure a seller may
-        // already have acted on is otherwise gone from the row.
-        if (
-          refreshed !== undefined &&
-          record.deposit_address !== undefined &&
-          refreshed.deposit_address === record.deposit_address &&
-          (refreshed.deposit_amount !== record.deposit_amount ||
-            refreshed.deposit_currency !== record.deposit_currency)
-        ) {
-          log(
-            `funding worker: request ${record.id} had its deposit terms restated by the provider, ` +
-              `from ${record.deposit_amount ?? 'no amount'} ${record.deposit_currency ?? 'no asset'} ` +
-              `to ${refreshed.deposit_amount ?? 'no amount'} ${refreshed.deposit_currency ?? 'no asset'}.`,
-            'warn',
           );
         }
         consecutiveFailures = 0;
@@ -646,42 +629,6 @@ function depositIsNew(record: FundingRecord, deposit: RailDeposit): boolean {
     (record.deposit_observed_at === undefined ||
       (record.deposit_conflict_at ?? 0) >= record.deposit_observed_at);
   return !matchesAccepted && !matchesKnownConflict;
-}
-
-/**
- * A plain non-negative decimal: digits, optionally a point and more digits. The only shape
- * `sameAmount` reads as a number.
- */
-const PLAIN_DECIMAL = /^\d+(\.\d+)?$/;
-
-/**
- * Whether a reported amount names the one already on file, compared exactly and never as a float.
- *
- * Two plain decimals are compared by value, so `23.4521`, `23.45210000` and `023.4521` are one
- * amount. Meld's figure for one amount need not be spelled the same way from one poll to the next;
- * compared as text, the two would read as new on every poll, which is the perpetual write
- * `depositIsNew` exists to stop.
- *
- * Anything else, an exponent or a sign say, is compared as exact text: reading it as a number would
- * be a guess, and text costs at most one write. A different value is new, and `mergeDeposit` takes
- * it, since the terms follow the provider.
- *
- * Local rather than in `money.ts`, which is the fiat minor-units module; a crypto amount never
- * becomes minor units (see `CRYPTO_DECIMAL` in `contract.ts`).
- */
-function sameAmount(stored: string | undefined, reported: string): boolean {
-  // An address on file with no amount is a row no rail writes (the column is nullable, the
-  // disclosure is not): it reads as new, and `mergeDeposit` writes the amount reported.
-  if (stored === undefined) return false;
-  if (!PLAIN_DECIMAL.test(stored) || !PLAIN_DECIMAL.test(reported)) return stored === reported;
-  return plainSpelling(stored) === plainSpelling(reported);
-}
-
-/** A plain decimal without the zeros that do not change its value: `023.45210000` is `23.4521`. */
-function plainSpelling(decimal: string): string {
-  const [whole = '0', fraction = ''] = decimal.split('.');
-  const significant = fraction.replace(/0+$/, '');
-  return whole.replace(/^0+(?=\d)/, '') + (significant === '' ? '' : `.${significant}`);
 }
 
 /**

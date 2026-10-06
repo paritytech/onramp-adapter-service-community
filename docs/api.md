@@ -189,17 +189,15 @@ How it is read, as Meld advises for a sell:
   `GET /meld/return?flow=sell` is the frameable landing for that, and says the seller is verified
   rather than that a payment arrived.
 
-**The address is written once, never rewritten; the terms follow the provider.** If a rail ever
-reports a *different* address for a row that already has one, or one that does not decode as an
-account at all, the stored address is never overwritten, and from then on the deposit is **no
-longer disclosed**: the provider has moved away from the address it named, nothing here can tell
-which one it stands behind, and a caller that has not sent yet must not be sent to the old one. The
-disagreement is recorded (not thrown away), an operator can find it on the row rather than grepping
-logs for it, and a real, unrelated state move riding alongside it still applies. Each new
-disagreement is still logged loudly, at its own level. A malformed report *before* any address
-landed does not withhold one the provider names later. An amount or an asset the provider restates
-for the same address replaces the one on file, once, so the disclosure always carries what the
-provider expects now.
+**The deposit is written once, never rewritten.** If a rail ever reports a *different* address for
+a row that already has one, one that does not decode as an account at all, or the same address with
+another amount (compared by value), asset or memo, the stored deposit is never overwritten, and
+from then on it is **no longer disclosed**: the provider has moved away from what it named, a
+caller may already have sent exactly that, and nothing here can tell which version the provider
+stands behind. The disagreement is recorded (not thrown away), an operator can find it on the row
+rather than grepping logs for it, and a real, unrelated state move riding alongside it still
+applies. Each new disagreement is still logged loudly, at its own level. A malformed report
+*before* any address landed does not withhold one the provider names later.
 
 **Cancelling is refused once an address has been disclosed.** See `POST /funding/:id/cancel` below.
 
@@ -547,19 +545,19 @@ On a sell whose provider has disclosed a deposit address, the object also carrie
 been observed to. **All four of `address`, `amount`, `currency` and `observedAt` are sent together
 or not at all** -- a half-disclosure (an address with no amount, say) is worse than none, because it
 looks complete. `amount` and `currency` are the provider's own, read off its transaction; compare
-them with the terms you agreed to before sending. They follow the provider: a restated amount or
-asset for the same address replaces the one shown. `observedAt` is when this service first read the
-address and does not move with them, so compare the terms themselves, not the timestamp. And
-`deposit` is gated exactly as the settlement
+them with the terms you agreed to before sending. They are frozen with the address once shown.
+`observedAt` is when this service first read the deposit. And `deposit` is gated exactly as the
+settlement
 surface below it is: only while the request is non-terminal, the rail's expiry has not passed, and
-the caller has not cancelled, and additionally never once the provider has named a different
-address (see "The deposit address" above). Handing a seller a deposit address for a concluded or
+the caller has not cancelled, and additionally never once the provider has changed it (see "The
+deposit is written once" above). Handing a seller a deposit address for a concluded or
 cancelled request is an invitation to an unrecoverable on-chain send to a place nobody is watching
 for it any more.
 
-When the deposit is withheld because the provider named a different address after the one it
-disclosed, the object carries `depositConflictAt` (epoch ms) instead: the sale cannot be paid as
-disclosed, and a caller that has not sent should end it rather than wait.
+When the deposit is withheld because the provider named a different address, or restated the
+amount or asset, after the deposit it disclosed, the object carries `depositConflictAt` (epoch ms)
+instead: the sale cannot be paid as disclosed. A caller that has not sent should end it rather than
+wait; one that has sent should treat the sale as changed after it paid.
 
 `status` is this service's lifecycle, not Meld's: `created` -> `session_opened` ->
 `transaction_seen` -> `settled` / `failed`, plus `expired` (the rail answered and no payment

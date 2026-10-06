@@ -2025,10 +2025,10 @@ describe('a sell whose provider discloses a deposit address', () => {
     }
   });
 
-  it('takes a different amount, or one that is not a plain decimal, as new, once', async () => {
+  it('records a different amount, or one not spelled the same, as a conflict, once', async () => {
     // By value only for plain decimals: another value, and any other shape spelled differently,
-    // reach the store, where the terms follow the provider. The next poll with the same figure is
-    // nothing new, so a provider that restated its amount causes one write, not one per tick.
+    // reach the store, which keeps the amount first shown and records the change. The next poll
+    // with the same figure is nothing new, so a restated amount causes one write, not one per tick.
     for (const [stored, amount] of [
       ['23.4521', '23.4522'],
       ['1e1', '10'],
@@ -2044,7 +2044,11 @@ describe('a sell whose provider discloses a deposit address', () => {
 
       await tick(store, NOW, restated, MAX_AGE, () => undefined, lease());
       expect(updated).toHaveBeenCalledTimes(1);
-      expect((await store.byId('funding-1'))?.deposit_amount).toBe(amount);
+      expect(await store.byId('funding-1')).toMatchObject({
+        deposit_amount: stored,
+        deposit_conflict_reason: 'terms_changed',
+        deposit_conflict_at: NOW,
+      });
 
       await tick(store, NOW + 1_000, restated, MAX_AGE, () => undefined, lease());
       expect(updated).toHaveBeenCalledTimes(1);
@@ -2052,7 +2056,7 @@ describe('a sell whose provider discloses a deposit address', () => {
     }
   });
 
-  it('takes an asset the provider restates for the same address, once', async () => {
+  it('records an asset the provider restates for the same address as a conflict, once', async () => {
     const { store, updated } = tracking([
       inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
     ]);
@@ -2066,11 +2070,14 @@ describe('a sell whose provider discloses a deposit address', () => {
     await tick(store, NOW + 1_000, restated, MAX_AGE, () => undefined, lease());
 
     expect(updated).toHaveBeenCalledTimes(1);
-    expect((await store.byId('funding-1'))?.deposit_currency).toBe('USDT_ASSETHUB');
+    expect(await store.byId('funding-1')).toMatchObject({
+      deposit_currency: 'DOT_ASSETHUB',
+      deposit_conflict_reason: 'terms_changed',
+    });
     await store.close();
   });
 
-  it('ages a row out from when it reached transaction_seen, however often its terms were written since', async () => {
+  it('ages a row out from when it reached transaction_seen, however often its deposit was written since', async () => {
     // Each deposit write moves `updated_at`; measured from there, a provider restating its terms
     // would keep the row asked for ever.
     const { store } = tracking([
@@ -2088,7 +2095,9 @@ describe('a sell whose provider discloses a deposit address', () => {
     await store.close();
   });
 
-  it('writes an amount that arrives after the address, once', async () => {
+  it('takes an amount on a row whose address landed without one as a change, once', async () => {
+    // No rail writes such a row (a disclosure always names its amount), but the column allows it,
+    // and a figure appearing after the address is not one a client was shown.
     const { store, updated } = tracking([
       inFlight({ deposit_address: ALICE, deposit_amount: undefined, deposit_currency: 'DOT_ASSETHUB' }),
     ]);
@@ -2100,7 +2109,10 @@ describe('a sell whose provider discloses a deposit address', () => {
 
     await tick(store, NOW, disclosed, MAX_AGE, () => undefined, lease());
     expect(updated).toHaveBeenCalledTimes(1);
-    expect((await store.byId('funding-1'))?.deposit_amount).toBe('23.4521');
+    expect(await store.byId('funding-1')).toMatchObject({
+      deposit_amount: undefined,
+      deposit_conflict_reason: 'terms_changed',
+    });
 
     await tick(store, NOW + 1_000, disclosed, MAX_AGE, () => undefined, lease());
     expect(updated).toHaveBeenCalledTimes(1);
@@ -2129,7 +2141,7 @@ describe('a sell whose provider discloses a deposit address', () => {
     await store.close();
   });
 
-  it('logs a restated term with the figure it replaces', async () => {
+  it('logs a restated term as a conflict that needs a person', async () => {
     const { store } = tracking([
       inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
     ]);
@@ -2148,9 +2160,8 @@ describe('a sell whose provider discloses a deposit address', () => {
       lease(),
     );
 
-    const line = lines.find((entry) => entry.includes('funding-1') && entry.includes('restated'));
-    expect(line).toContain('23.4521 DOT_ASSETHUB');
-    expect(line).toContain('20 DOT_ASSETHUB');
+    const line = lines.find((entry) => entry.includes('funding-1') && entry.includes('terms_changed'));
+    expect(line).toContain('is no longer shown');
     await store.close();
   });
 

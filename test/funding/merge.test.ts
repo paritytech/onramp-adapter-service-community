@@ -89,37 +89,48 @@ describe('mergeAdvance: the deposit disclosure', () => {
     expect(next.deposit_address).toBe(ALICE);
   });
 
-  it('fills in a memo that arrives later, and keeps one a later poll leaves out', () => {
-    // The memo is the one optional part of a disclosure: a later poll can complete it, and one that
-    // names none takes nothing away.
-    const without = mergeAdvance(inFlight(), 'transaction_seen', NOW, { deposit: deposit() });
-    expect(without.deposit_memo).toBeUndefined();
-
-    const tagged = mergeAdvance(without, 'transaction_seen', NOW + 100, {
+  it('keeps a memo a later poll leaves out, and records one that appears later as a change', () => {
+    // The memo is the one optional part of a disclosure. A poll that names none takes nothing
+    // away; one that names a memo the first did not is a new instruction to whoever sends.
+    const tagged = mergeAdvance(inFlight(), 'transaction_seen', NOW, {
       deposit: { ...deposit(), memo: 'tag-1' },
     });
-    expect(tagged.deposit_address).toBe(ALICE);
-    expect(tagged.deposit_memo).toBe('tag-1');
-    // The first sighting, not the second: observed_at does not move once set.
-    expect(tagged.deposit_observed_at).toBe(NOW);
-
-    const silent = mergeAdvance(tagged, 'transaction_seen', NOW + 200, { deposit: deposit() });
+    const silent = mergeAdvance(tagged, 'transaction_seen', NOW + 100, { deposit: deposit() });
     expect(silent.deposit_memo).toBe('tag-1');
+    expect(silent.deposit_conflict_at).toBeUndefined();
+
+    const without = mergeAdvance(inFlight(), 'transaction_seen', NOW, { deposit: deposit() });
+    const late = mergeAdvance(without, 'transaction_seen', NOW + 200, {
+      deposit: { ...deposit(), memo: 'tag-1' },
+    });
+    expect(late.deposit_memo).toBeUndefined();
+    expect(late).toMatchObject({ deposit_conflict_reason: 'terms_changed', deposit_conflict_at: NOW + 200 });
   });
 
-  it('pins the address and lets the terms follow the provider for the same address', () => {
-    // The address is what a seller may already have sent to; the amount and the asset are what the
-    // provider expects now, and a client can only refuse a difference it is shown.
+  it('freezes the terms with the address: a restated amount or asset is a conflict', () => {
+    // A client may already have sent what it was first shown, so the deposit is not rewritten.
+    // The change is recorded, and from then on the deposit is no longer disclosed.
     const first = mergeAdvance(inFlight(), 'transaction_seen', NOW, { deposit: deposit() });
-    const restated = mergeAdvance(first, 'transaction_seen', NOW + 1000, {
-      deposit: { address: ALICE_PREFIX_42, amount: '11', currency: 'USDT_ASSETHUB' },
+    for (const [incoming, at] of [
+      [{ address: ALICE_PREFIX_42, amount: '11', currency: 'DOT_ASSETHUB' }, NOW + 1000],
+      [{ address: ALICE, amount: '12.3456789012', currency: 'USDT_ASSETHUB' }, NOW + 2000],
+    ] as const) {
+      const restated = mergeAdvance(first, 'transaction_seen', at, { deposit: incoming });
+      expect(restated).toMatchObject({
+        deposit_address: first.deposit_address,
+        deposit_amount: first.deposit_amount,
+        deposit_currency: first.deposit_currency,
+        deposit_observed_at: NOW,
+        deposit_conflict_address: incoming.address,
+        deposit_conflict_reason: 'terms_changed',
+        deposit_conflict_at: at,
+      });
+    }
+    // The same amount spelled another way is the same deposit.
+    const respelled = mergeAdvance(first, 'transaction_seen', NOW + 3000, {
+      deposit: { ...deposit(), amount: '12.34567890120' },
     });
-
-    expect(restated.deposit_address).toBe(first.deposit_address);
-    expect(restated.deposit_amount).toBe('11');
-    expect(restated.deposit_currency).toBe('USDT_ASSETHUB');
-    expect(restated.deposit_observed_at).toBe(NOW);
-    expect(restated.deposit_conflict_at).toBeUndefined();
+    expect(respelled.deposit_conflict_at).toBeUndefined();
   });
 
   it('ignores a repeat of the same address rather than treating it as new information', () => {
@@ -175,7 +186,7 @@ describe('mergeAdvance: the deposit disclosure', () => {
       expect(settled.deposit_conflict_address).toBe(BOB);
     });
 
-    it('re-stamps `deposit_conflict_at` on every recurrence, not only the first', () => {
+    it('stamps `deposit_conflict_at` on each conflicting report it is given (the worker skips repeats)', () => {
       const first = mergeAdvance(inFlight(), 'transaction_seen', NOW, { deposit: deposit({ address: ALICE }) });
       const second = mergeAdvance(first, 'transaction_seen', NOW + 1000, { deposit: deposit({ address: BOB }) });
       const third = mergeAdvance(second, 'transaction_seen', NOW + 2000, { deposit: deposit({ address: BOB }) });
