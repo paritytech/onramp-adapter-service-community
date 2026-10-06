@@ -674,6 +674,16 @@ describe('CORS', () => {
     expect(response.headers['access-control-allow-origin']).toBeUndefined();
   });
 
+  it('exposes retry-after, so the app can read how long a 429 lasts', async () => {
+    const response = await (await serve()).inject({
+      method: 'GET',
+      url: '/transaction/tx_A1-b2C3',
+      headers: { ...DEV_HEADERS, origin: 'https://app.example' },
+    });
+
+    expect(response.headers['access-control-expose-headers']).toBe('retry-after');
+  });
+
   it('does not allow credentials, which would open a CSRF surface', async () => {
     const response = await (await serve()).inject({
       method: 'OPTIONS',

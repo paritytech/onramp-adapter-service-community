@@ -232,6 +232,9 @@ export async function buildServer(
     // "CORS unconfigured" rather than "origin rejected".
     origin: cfg.cors.allowed_origins.length > 0 ? cfg.cors.allowed_origins.map(toOriginMatcher) : false,
     methods: ['GET', 'POST'],
+    // The browser hides `retry-after` from a cross-origin page unless it is exposed; without it
+    // the app cannot tell how long a 429 lasts.
+    exposedHeaders: ['retry-after'],
     // No `credentials`: this service uses no cookies, and allowing them alongside an origin
     // allowlist is how a CSRF surface gets introduced by accident.
     maxAge: 600,
