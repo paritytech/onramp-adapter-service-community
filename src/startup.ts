@@ -390,49 +390,49 @@ export async function buildPersonhood(cfg: Config): Promise<PersonhoodService> {
  * Any one collection answering is enough: `people-lite` carrying a root while `people` does not is
  * the live shape on previewnet and polkadot-test.
  *
- * Only a network whose reads all *answered*, and all answered `None`, is refused. Treating an
- * unreachable RPC as a wrong answer would be a restart loop; it is logged instead, and its redeems
- * then fail as `503` rather than `401`.
+ * Only a network whose reads all *answered*, and all answered `None`, is refused. A read that
+ * failed leaves the network unverified rather than dead, even when another collection answered
+ * `None`: on previewnet and polkadot-test `people` is empty by design, so a `people-lite` timeout at
+ * boot would otherwise refuse the whole service, healthy networks included. Treating an unreachable
+ * RPC as a wrong answer would be a restart loop; it is logged instead, and its redeems then fail
+ * as `503` rather than `401`.
+ *
+ * Networks are probed in parallel, so one slow chain costs its own read timeout rather than adding
+ * to every other network's inside the startup probe's budget.
  */
 export async function probePersonhoodNetworks(
   networks: readonly PersonhoodNetwork[],
   log: (message: string) => void,
 ): Promise<void> {
-  const dead: string[] = [];
+  const verdicts = await Promise.all(
+    networks.map(async (network): Promise<'answered' | 'dead' | 'unverified'> => {
+      let failed = false;
 
-  for (const network of networks) {
-    let answered = false;
-    let reachable = false;
-
-    for (const ring of network.rings) {
-      try {
-        const root = await network.commitments.commitment(ring.identifier, 0);
-        reachable = true;
-        if (root !== null) {
-          answered = true;
-          break;
+      for (const ring of network.rings) {
+        try {
+          const root = await network.commitments.commitment(ring.identifier, 0);
+          if (root !== null) return 'answered';
+          log(
+            `personhood probe: network '${network.id}' collection ${ring.identifier} has no root at ring 0.`,
+          );
+        } catch (cause) {
+          failed = true;
+          log(
+            `personhood probe: network '${network.id}' collection ${ring.identifier} could not be read: ` +
+              (cause instanceof Error ? cause.message : 'unknown'),
+          );
         }
-        log(
-          `personhood probe: network '${network.id}' collection ${ring.identifier} has no root at ring 0.`,
-        );
-      } catch (cause) {
-        log(
-          `personhood probe: network '${network.id}' collection ${ring.identifier} could not be read: ` +
-            (cause instanceof Error ? cause.message : 'unknown'),
-        );
       }
-    }
 
-    if (answered) continue;
-    if (reachable) {
-      dead.push(network.id);
-    } else {
+      if (!failed) return 'dead';
       log(
-        `personhood probe: network '${network.id}' was unreachable, so its collections are unverified. ` +
+        `personhood probe: network '${network.id}' could not be fully read, so its collections are unverified. ` +
           'Redeems against it will fail as 503 until it answers.',
       );
-    }
-  }
+      return 'unverified';
+    }),
+  );
+  const dead = networks.filter((_, i) => verdicts[i] === 'dead').map((network) => network.id);
 
   if (dead.length > 0) {
     throw new Error(

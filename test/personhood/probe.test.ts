@@ -79,18 +79,67 @@ describe('probePersonhoodNetworks', () => {
         (m) => logged.push(m),
       ),
     ).resolves.toBeUndefined();
-    expect(logged.join('\n')).toMatch(/'previewnet' was unreachable/);
+    expect(logged.join('\n')).toMatch(/'previewnet' could not be fully read/);
   });
 
-  it('still refuses a network that answered on one collection and errored on another', async () => {
-    // A read that came back is evidence: one `None` plus one failure is still a network that
-    // serves nothing this deployment declared.
+  it('lets through a network that answered None on one collection and errored on another', async () => {
+    // The live shape on previewnet and polkadot-test: `people` has no root, `people-lite` does. A
+    // `people-lite` timeout at boot must not read as a wrong chain, or one slow read refuses the
+    // whole service, healthy networks included.
+    const logged: string[] = [];
     await expect(
       probePersonhoodNetworks(
-        [network('previewnet', { [LITE]: null, [IDENTIFIER]: new Error('timeout') })],
+        [
+          network('previewnet', { [LITE]: new Error('timeout'), [IDENTIFIER]: null }),
+          network('paseo-next-v2', { [LITE]: COMMITMENT }),
+        ],
+        (m) => logged.push(m),
+      ),
+    ).resolves.toBeUndefined();
+    expect(logged.join('\n')).toMatch(/'previewnet' could not be fully read/);
+  });
+
+  it('still refuses a dead network beside an unverified one', async () => {
+    await expect(
+      probePersonhoodNetworks(
+        [
+          network('previewnet', { [LITE]: new Error('timeout'), [IDENTIFIER]: null }),
+          network('polkadot-test', { [LITE]: null, [IDENTIFIER]: null }),
+        ],
         silent,
       ),
-    ).rejects.toThrow(/'previewnet'/);
+    ).rejects.toThrow(/^auth\.personhood\.networks 'polkadot-test' answered/);
+  });
+
+  it('probes networks in parallel, so one slow chain does not delay the others', async () => {
+    // The first network's read settles only once the second network has been asked. Probed in
+    // sequence, this never resolves.
+    let release: () => void = () => undefined;
+    const secondAsked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow: PersonhoodNetwork = {
+      id: 'previewnet',
+      commitments: {
+        commitment: async () => {
+          await secondAsked;
+          return COMMITMENT;
+        },
+      },
+      rings: [{ identifier: LITE, exponent: 9 }],
+    };
+    const fast: PersonhoodNetwork = {
+      id: 'paseo-next-v2',
+      commitments: {
+        commitment: async () => {
+          release();
+          return COMMITMENT;
+        },
+      },
+      rings: [{ identifier: LITE, exponent: 9 }],
+    };
+
+    await expect(probePersonhoodNetworks([slow, fast], silent)).resolves.toBeUndefined();
   });
 
   it('stops reading a network as soon as one collection answers', async () => {
