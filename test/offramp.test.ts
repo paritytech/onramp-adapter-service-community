@@ -4,7 +4,7 @@ import { mergeMethods, mergeOfframpCorridors, type LaneCorridor, type OfframpLan
 import { refreshJobs } from '../src/startup.js';
 
 const DOT: OfframpLane = { code: 'DOT_ASSETHUB', chain: 'assethub' };
-const SOL: OfframpLane = { code: 'USDT_SOL', chain: 'solana' };
+const SOL: OfframpLane = { code: 'USDT_SOLANA', chain: 'solana' };
 
 const m = (paymentMethodType: string, over: Record<string, unknown> = {}) => ({
   paymentMethodType,
@@ -62,7 +62,7 @@ describe('mergeOfframpCorridors', () => {
     expect(fr?.fiat).toBe('EUR');
     expect(fr?.methods.map((x) => [x.paymentMethodType, x.lane.code])).toEqual([
       ['SEPA', 'DOT_ASSETHUB'],
-      ['CARD', 'USDT_SOL'],
+      ['CARD', 'USDT_SOLANA'],
     ]);
   });
 
@@ -79,19 +79,19 @@ describe('mergeOfframpCorridors', () => {
 
 describe('refreshJobs', () => {
   it('keeps DOT buy and sell, and adds a sell job per lane without duplicating', () => {
-    const jobs = refreshJobs([{ code: 'DOT_ASSETHUB' }, { code: 'USDT_SOL' }, { code: 'USDT_SOL' }]);
+    const jobs = refreshJobs([{ code: 'DOT_ASSETHUB' }, { code: 'USDT_SOLANA' }, { code: 'USDT_SOLANA' }]);
     expect(jobs).toEqual([
       { crypto: 'DOT_ASSETHUB', direction: 'buy' },
       { crypto: 'DOT_ASSETHUB', direction: 'sell' },
-      { crypto: 'USDT_SOL', direction: 'sell' },
+      { crypto: 'USDT_SOLANA', direction: 'sell' },
     ]);
   });
 
   it('still refreshes DOT when it is not a configured lane', () => {
-    expect(refreshJobs([{ code: 'USDT_SOL' }]).map((j) => `${j.crypto}|${j.direction}`)).toEqual([
+    expect(refreshJobs([{ code: 'USDT_SOLANA' }]).map((j) => `${j.crypto}|${j.direction}`)).toEqual([
       'DOT_ASSETHUB|buy',
       'DOT_ASSETHUB|sell',
-      'USDT_SOL|sell',
+      'USDT_SOLANA|sell',
     ]);
   });
 });

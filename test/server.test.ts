@@ -2083,7 +2083,7 @@ describe('the discovery routes', () => {
             min: '10',
             max: '5000',
             currency: 'BRL',
-            lane: { code: 'USDT_SOL', chain: 'solana' },
+            lane: { code: 'USDT_SOLANA', chain: 'solana' },
           },
         ],
       },

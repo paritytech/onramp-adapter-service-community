@@ -29,8 +29,8 @@ export const DESTINATIONS: readonly Destination[] = Object.freeze([
  * same reason `DESTINATIONS` is: Meld resolves an unknown code to Bitcoin (threat model T4).
  */
 export const OFFRAMP_ONLY: readonly Destination[] = Object.freeze([
-  Object.freeze({ code: 'USDT_SOL' }),
-  Object.freeze({ code: 'USDC_SOL' }),
+  Object.freeze({ code: 'USDT_SOLANA' }),
+  Object.freeze({ code: 'USDC_SOLANA' }),
 ]);
 
 /** Is this a code that is sellable but never deliverable? */

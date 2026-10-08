@@ -268,7 +268,7 @@ come from the first lane that has the country. Methods keep first-lane order, th
 rule as `GET /supported/corridors`; `GET /supported/offramp` asks Meld live, one `corridorForCountry`
 per lane in sell direction.
 
-The sell-only codes `USDT_SOL` and `USDC_SOL` are accepted wherever `direction=sell` is, and refused with
+The sell-only codes `USDT_SOLANA` and `USDC_SOLANA` are accepted wherever `direction=sell` is, and refused with
 `WrongAssetOrChain` on every buy path. A sell on one of them discloses a base58 Solana deposit address,
 which is stored and compared exactly as given (case-sensitive), not SS58-normalised.
 

@@ -866,7 +866,7 @@ describe('parseConfig', () => {
     it('accepts an ordered list of delivered and sell-only codes', () => {
       const value = [
         { code: 'DOT_ASSETHUB', chain: 'assethub' },
-        { code: 'USDT_SOL', chain: 'solana' },
+        { code: 'USDT_SOLANA', chain: 'solana' },
       ];
       expect(lanes(value)()['supported'].offramp_lanes).toEqual(value);
     });
@@ -876,12 +876,12 @@ describe('parseConfig', () => {
       expect(lanes([{ code: 'BTC', chain: 'bitcoin' }])).toThrow(/Unknown offramp lane code/);
       expect(
         lanes([
-          { code: 'USDT_SOL', chain: 'solana' },
-          { code: 'USDT_SOL', chain: 'solana' },
+          { code: 'USDT_SOLANA', chain: 'solana' },
+          { code: 'USDT_SOLANA', chain: 'solana' },
         ]),
       ).toThrow(/Duplicate/);
-      expect(lanes([{ code: 'USDT_SOL', chain: 'solana', extra: 1 }])).toThrow();
-      expect(lanes([{ code: 'USDT_SOL' }])).toThrow();
+      expect(lanes([{ code: 'USDT_SOLANA', chain: 'solana', extra: 1 }])).toThrow();
+      expect(lanes([{ code: 'USDT_SOLANA' }])).toThrow();
     });
   });
 

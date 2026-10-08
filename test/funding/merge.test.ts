@@ -255,8 +255,8 @@ describe('mergeAdvance: the deposit disclosure', () => {
 describe('mergeAdvance: a Solana deposit on a sell-only code', () => {
   const SOLANA = 'So11111111111111111111111111111111111111112';
   const OTHER = 'Vote111111111111111111111111111111111111111';
-  const solSell = () => ({ ...inFlight(), destination_currency_code: 'USDT_SOL' });
-  const sol = (address: string) => deposit({ address, currency: 'USDT_SOL' });
+  const solSell = () => ({ ...inFlight(), destination_currency_code: 'USDT_SOLANA' });
+  const sol = (address: string) => deposit({ address, currency: 'USDT_SOLANA' });
 
   it('stores the base58 address exactly as disclosed', () => {
     const next = mergeAdvance(solSell(), 'transaction_seen', NOW, { deposit: sol(SOLANA) });

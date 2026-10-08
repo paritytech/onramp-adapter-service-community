@@ -479,8 +479,8 @@ describe('MeldRail.observation', () => {
 
     it('passes a Solana deposit address through unchanged for a sell-only code, comparing it exactly', async () => {
       const SOLANA = 'So11111111111111111111111111111111111111112';
-      const terms = { sourceAmount: '10', sourceCurrencyCode: 'USDT_SOL' };
-      const record = sellRecord({ destination_currency_code: 'USDT_SOL' });
+      const terms = { sourceAmount: '10', sourceCurrencyCode: 'USDT_SOLANA' };
+      const record = sellRecord({ destination_currency_code: 'USDT_SOLANA' });
       const same = sellClient(undefined, {
         id: 'tx-1',
         status: 'PENDING',

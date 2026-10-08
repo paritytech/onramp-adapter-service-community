@@ -55,12 +55,12 @@ describe('catalog', () => {
 
 describe('sell-only codes', () => {
   it('lists exactly the Solana codes, frozen', () => {
-    expect(OFFRAMP_ONLY.map((d) => d.code)).toEqual(['USDT_SOL', 'USDC_SOL']);
+    expect(OFFRAMP_ONLY.map((d) => d.code)).toEqual(['USDT_SOLANA', 'USDC_SOLANA']);
     expect(Object.isFrozen(OFFRAMP_ONLY)).toBe(true);
   });
 
   it('are never valid for a buy, and are valid for a sell', () => {
-    for (const code of ['USDT_SOL', 'USDC_SOL']) {
+    for (const code of ['USDT_SOLANA', 'USDC_SOLANA']) {
       expect(() => resolveDestination(code)).toThrow(Refusal);
       expect(() => resolveForDirection(code, 'buy')).toThrow(Refusal);
       expect(resolveForDirection(code, 'sell')).toEqual({ code });

@@ -394,7 +394,7 @@ describe('a refusal from discovery is not an outage', () => {
 });
 
 describe('sell-only codes across the sell paths', () => {
-  const SOL_CODE = 'USDT_SOL';
+  const SOL_CODE = 'USDT_SOLANA';
 
   it('accepts them on sell for supported, countries and corridors, and refuses them on buy', async () => {
     const svc = build(fakeDiscovery());
@@ -432,7 +432,7 @@ describe('Onramp offramp discovery', () => {
   const payout = { paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' as const, min: '5', max: '1000', currency: 'BRL' };
   const lanes = [
     { code: 'DOT_ASSETHUB', chain: 'assethub' },
-    { code: 'USDT_SOL', chain: 'solana' },
+    { code: 'USDT_SOLANA', chain: 'solana' },
   ];
   const cfg = () => {
     const c = config();
@@ -445,8 +445,8 @@ describe('Onramp offramp discovery', () => {
       store.upsertCorridor({ destination_currency_code: code, direction, country, name, fiat: 'BRL', methods } as never);
     await put('DOT_ASSETHUB', 'sell', 'BR', 'Brazil', [payout]);
     await put('DOT_ASSETHUB', 'buy', 'AR', 'Argentina', [pix]);
-    await put('USDT_SOL', 'sell', 'BR', 'Brazil', [{ ...payout, min: '1' }, pix]);
-    await put('USDT_SOL', 'sell', 'AR', 'Argentina', [pix]);
+    await put('USDT_SOLANA', 'sell', 'BR', 'Brazil', [{ ...payout, min: '1' }, pix]);
+    await put('USDT_SOLANA', 'sell', 'AR', 'Argentina', [pix]);
     const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'f', undefined);
 
     expect(await svc.offrampCorridors()).toEqual([
@@ -465,7 +465,7 @@ describe('Onramp offramp discovery', () => {
 
   it('serves nothing for stale rows', async () => {
     const store = fakeStore();
-    await store.upsertCorridor({ destination_currency_code: 'USDT_SOL', direction: 'sell', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+    await store.upsertCorridor({ destination_currency_code: 'USDT_SOLANA', direction: 'sell', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
     const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => 3_000_000_000_000, () => 'f', undefined);
     expect(await svc.offrampCorridors()).toEqual([]);
   });
@@ -478,12 +478,12 @@ describe('Onramp offramp discovery', () => {
       corridorForCountry: async (country, code, direction) => {
         directions.push(direction);
         crypto.push(code);
-        return { country, fiat: code === 'USDT_SOL' ? 'USD' : '', crypto: code, methods: code === 'USDT_SOL' ? [method({ providers: ['X'] })] : [] };
+        return { country, fiat: code === 'USDT_SOLANA' ? 'USD' : '', crypto: code, methods: code === 'USDT_SOLANA' ? [method({ providers: ['X'] })] : [] };
       },
     };
     const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', discovery);
     const out = await svc.offramp('US');
-    expect(crypto).toEqual(['DOT_ASSETHUB', 'USDT_SOL']);
+    expect(crypto).toEqual(['DOT_ASSETHUB', 'USDT_SOLANA']);
     expect(directions).toEqual(['sell', 'sell']);
     expect(out).toEqual({
       country: 'US',

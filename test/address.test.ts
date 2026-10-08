@@ -61,14 +61,14 @@ describe('canonicalizeDisclosedAddress for a sell-only code', () => {
   const SOLANA = 'So11111111111111111111111111111111111111112';
 
   it('passes a base58 Solana key through unchanged', () => {
-    expect(canonicalizeDisclosedAddress(SOLANA, 'USDT_SOL')).toBe(SOLANA);
-    expect(canonicalizeDisclosedAddress(SOLANA, 'USDC_SOL')).toBe(SOLANA);
+    expect(canonicalizeDisclosedAddress(SOLANA, 'USDT_SOLANA')).toBe(SOLANA);
+    expect(canonicalizeDisclosedAddress(SOLANA, 'USDC_SOLANA')).toBe(SOLANA);
   });
 
   it('refuses empty, non-base58 and wrong-length values', () => {
-    expect(canonicalizeDisclosedAddress('', 'USDT_SOL')).toBeUndefined();
-    expect(canonicalizeDisclosedAddress('0OIl', 'USDT_SOL')).toBeUndefined();
-    expect(canonicalizeDisclosedAddress('abc', 'USDT_SOL')).toBeUndefined();
+    expect(canonicalizeDisclosedAddress('', 'USDT_SOLANA')).toBeUndefined();
+    expect(canonicalizeDisclosedAddress('0OIl', 'USDT_SOLANA')).toBeUndefined();
+    expect(canonicalizeDisclosedAddress('abc', 'USDT_SOLANA')).toBeUndefined();
   });
 
   it('leaves SS58 handling for Asset Hub codes as it was', () => {
