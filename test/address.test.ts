@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { encodeAddress } from '@polkadot/util-crypto';
 
-import { normalizeAddress } from '../src/address.js';
+import { canonicalizeDisclosedAddress, normalizeAddress } from '../src/address.js';
 import { Refusal } from '../src/contract.js';
 
 // Alice, the canonical well-known account.
@@ -54,5 +54,26 @@ describe('normalizeAddress', () => {
     // plausible address that nobody controls, in a locked checkout field.
     const short = encodeAddress(ALICE_PUBKEY.slice(0, 8), 0);
     expect(() => normalizeAddress(short)).toThrow(/8 bytes, expected 32/);
+  });
+});
+
+describe('canonicalizeDisclosedAddress for a sell-only code', () => {
+  const SOLANA = 'So11111111111111111111111111111111111111112';
+
+  it('passes a base58 Solana key through unchanged', () => {
+    expect(canonicalizeDisclosedAddress(SOLANA, 'USDT_SOL')).toBe(SOLANA);
+    expect(canonicalizeDisclosedAddress(SOLANA, 'USDC_SOL')).toBe(SOLANA);
+  });
+
+  it('refuses empty, non-base58 and wrong-length values', () => {
+    expect(canonicalizeDisclosedAddress('', 'USDT_SOL')).toBeUndefined();
+    expect(canonicalizeDisclosedAddress('0OIl', 'USDT_SOL')).toBeUndefined();
+    expect(canonicalizeDisclosedAddress('abc', 'USDT_SOL')).toBeUndefined();
+  });
+
+  it('leaves SS58 handling for Asset Hub codes as it was', () => {
+    expect(canonicalizeDisclosedAddress(ALICE_PREFIX_42, 'DOT_ASSETHUB')).toBe(ALICE_PREFIX_0);
+    expect(canonicalizeDisclosedAddress(ALICE_PREFIX_42)).toBe(ALICE_PREFIX_0);
+    expect(canonicalizeDisclosedAddress(SOLANA, 'DOT_ASSETHUB')).toBeUndefined();
   });
 });

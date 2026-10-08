@@ -32,6 +32,8 @@ import {
   supportedQuery,
   supportedCountriesQuery,
   supportedCorridorsQuery,
+  supportedOfframpCorridorsQuery,
+  supportedOfframpQuery,
   redeemRequest,
   malformedRequest,
   notFound,
@@ -54,6 +56,8 @@ type OnrampPort = Pick<
   | 'supported'
   | 'supportedCountries'
   | 'supportedCorridors'
+  | 'offrampCorridors'
+  | 'offramp'
   | 'transaction'
   | 'cancel'
   | 'get'
@@ -315,6 +319,16 @@ export async function buildServer(
   app.get<{ Querystring: Record<string, string> }>('/supported/corridors', asCaller, async (request, reply) => {
     const q = parse(supportedCorridorsQuery, request.query);
     return reply.send({ corridors: await onramp.supportedCorridors(q.destinationCurrencyCode, q.direction) });
+  });
+
+  // Sell corridors merged across the configured offramp lanes: cached (all countries) and live (one).
+  app.get<{ Querystring: Record<string, string> }>('/supported/offramp/corridors', asCaller, async (request, reply) => {
+    parse(supportedOfframpCorridorsQuery, request.query);
+    return reply.send({ corridors: await onramp.offrampCorridors() });
+  });
+  app.get<{ Querystring: Record<string, string> }>('/supported/offramp', asCaller, async (request, reply) => {
+    const q = parse(supportedOfframpQuery, request.query);
+    return reply.send(await onramp.offramp(q.country));
   });
 
   /** The one operation that leads to a card charge. */

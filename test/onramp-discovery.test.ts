@@ -392,3 +392,121 @@ describe('a refusal from discovery is not an outage', () => {
       .toBe('RegionUnavailable');
   });
 });
+
+describe('sell-only codes across the sell paths', () => {
+  const SOL_CODE = 'USDT_SOL';
+
+  it('accepts them on sell for supported, countries and corridors, and refuses them on buy', async () => {
+    const svc = build(fakeDiscovery());
+    expect((await svc.supported('US', SOL_CODE, 'sell')).crypto).toBe(SOL_CODE);
+    expect(await svc.supportedCountries(SOL_CODE, 'sell')).toHaveLength(1);
+    expect(await svc.supportedCorridors(SOL_CODE, 'sell')).toEqual([]);
+
+    expect((await refusalOf(() => svc.supported('US', SOL_CODE))).tag).toBe('WrongAssetOrChain');
+    expect((await refusalOf(() => svc.supportedCountries(SOL_CODE, 'buy'))).tag).toBe('WrongAssetOrChain');
+    expect((await refusalOf(() => svc.supportedCorridors(SOL_CODE))).tag).toBe('WrongAssetOrChain');
+  });
+
+  it('quotes and opens a sell session, and refuses both on a buy', async () => {
+    const svc = build(fakeDiscovery({ methods: [method({ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' })] }));
+    expect((await svc.quote(asQuote(sellQuoteBody({ destinationCurrencyCode: SOL_CODE })))).quotes).toHaveLength(1);
+    const opened = await svc.createSession(SUBJECT, asSession(sellRequest({ destinationCurrencyCode: SOL_CODE })), 'req-sol');
+    expect(opened.pinned.cryptoAmount).toBe('12.3456789012');
+
+    expect((await refusalOf(() => svc.quote(asQuote(quoteBody({ destinationCurrencyCode: SOL_CODE }))))).tag).toBe('WrongAssetOrChain');
+    expect(
+      (await refusalOf(() => svc.createSession(SUBJECT, asSession(sessionBody({ destinationCurrencyCode: SOL_CODE })), 'req-sol-buy'))).tag,
+    ).toBe('WrongAssetOrChain');
+  });
+
+  it('still refuses a walletAddress on a sell session', async () => {
+    const svc = build(fakeDiscovery());
+    await expect(
+      svc.createSession(SUBJECT, asSession(sellRequest({ destinationCurrencyCode: SOL_CODE, walletAddress: 'x' })), 'req-sol-w'),
+    ).rejects.toThrow();
+  });
+});
+
+describe('Onramp offramp discovery', () => {
+  const pix = { paymentMethodType: 'PIX', category: 'bank' as const, min: '10', max: '5000', currency: 'BRL' };
+  const payout = { paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' as const, min: '5', max: '1000', currency: 'BRL' };
+  const lanes = [
+    { code: 'DOT_ASSETHUB', chain: 'assethub' },
+    { code: 'USDT_SOL', chain: 'solana' },
+  ];
+  const cfg = () => {
+    const c = config();
+    return { ...c, supported: { ...c.supported, offramp_lanes: lanes } };
+  };
+
+  it('merges cached sell corridors across lanes, first lane winning, and ignores buy rows', async () => {
+    const store = fakeStore();
+    const put = (code: string, direction: 'buy' | 'sell', country: string, name: string, methods: unknown[]) =>
+      store.upsertCorridor({ destination_currency_code: code, direction, country, name, fiat: 'BRL', methods } as never);
+    await put('DOT_ASSETHUB', 'sell', 'BR', 'Brazil', [payout]);
+    await put('DOT_ASSETHUB', 'buy', 'AR', 'Argentina', [pix]);
+    await put('USDT_SOL', 'sell', 'BR', 'Brazil', [{ ...payout, min: '1' }, pix]);
+    await put('USDT_SOL', 'sell', 'AR', 'Argentina', [pix]);
+    const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'f', undefined);
+
+    expect(await svc.offrampCorridors()).toEqual([
+      { country: 'AR', name: 'Argentina', fiat: 'BRL', methods: [{ ...pix, lane: lanes[1] }] },
+      {
+        country: 'BR',
+        name: 'Brazil',
+        fiat: 'BRL',
+        methods: [
+          { ...payout, lane: lanes[0] },
+          { ...pix, lane: lanes[1] },
+        ],
+      },
+    ]);
+  });
+
+  it('serves nothing for stale rows', async () => {
+    const store = fakeStore();
+    await store.upsertCorridor({ destination_currency_code: 'USDT_SOL', direction: 'sell', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+    const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => 3_000_000_000_000, () => 'f', undefined);
+    expect(await svc.offrampCorridors()).toEqual([]);
+  });
+
+  it('answers one country live, per lane in order, sell direction', async () => {
+    const directions: string[] = [];
+    const crypto: string[] = [];
+    const discovery: Discovery = {
+      ...fakeDiscovery({ directions }),
+      corridorForCountry: async (country, code, direction) => {
+        directions.push(direction);
+        crypto.push(code);
+        return { country, fiat: code === 'USDT_SOL' ? 'USD' : '', crypto: code, methods: code === 'USDT_SOL' ? [method({ providers: ['X'] })] : [] };
+      },
+    };
+    const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', discovery);
+    const out = await svc.offramp('US');
+    expect(crypto).toEqual(['DOT_ASSETHUB', 'USDT_SOL']);
+    expect(directions).toEqual(['sell', 'sell']);
+    expect(out).toEqual({
+      country: 'US',
+      fiat: 'USD',
+      methods: [
+        { paymentMethodType: 'CREDIT_DEBIT_CARD', category: 'card', min: '5', max: '3000', currency: 'USD', lane: lanes[1] },
+      ],
+    });
+  });
+
+  it('reports a fiat with empty methods when nothing routes, and empty fiat when none is known', async () => {
+    const mk = (fiat: string): Discovery => ({
+      ...fakeDiscovery(),
+      corridorForCountry: async (country, code) => ({ country, fiat, crypto: code, methods: [] }),
+    });
+    const a = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', mk('GBP'));
+    expect(await a.offramp('GB')).toEqual({ country: 'GB', fiat: 'GBP', methods: [] });
+    const b = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', mk(''));
+    expect(await b.offramp('GB')).toEqual({ country: 'GB', fiat: '', methods: [] });
+  });
+
+  it('is a 503 without discovery', async () => {
+    const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', undefined);
+    await expect(svc.offramp('US')).rejects.toBeInstanceOf(Refusal);
+  });
+});

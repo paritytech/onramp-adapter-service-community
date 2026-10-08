@@ -5,6 +5,7 @@ import { reject, transactionId, type CreateSessionResponse, type QuoteResponse }
 import type { FundingRecord } from '../src/funding/types.js';
 import { MeldHttpError } from '../src/meld/client.js';
 import type { SupportedCorridorDto } from '../src/onramp.js';
+import type { OfframpCorridor } from '../src/offramp.js';
 import { Secret } from '../src/secret.js';
 import { buildServer } from '../src/server.js';
 import {
@@ -57,6 +58,7 @@ const serve = async (
     list: () => Promise<FundingRecord[]>;
     cancel: () => Promise<FundingRecord | undefined>;
     supportedCorridors: () => Promise<SupportedCorridorDto[]>;
+    offrampCorridors: () => Promise<OfframpCorridor[]>;
   }> = {},
   sink?: { write: (line: string) => void },
 ) => {
@@ -68,6 +70,8 @@ const serve = async (
     supported: async () => ({ country: 'US', fiat: 'USD', crypto: 'DOT_ASSETHUB', methods: [] }),
     supportedCountries: async () => [],
     supportedCorridors: async () => [],
+    offrampCorridors: async () => [],
+    offramp: async (country: string) => ({ country, fiat: 'USD', methods: [] }),
     quote: async () => ({
       // A complete breakdown, because the test below is named for it. An incomplete fixture
       // under that name is the fake and the code agreeing with each other. Amounts are decimal
@@ -153,6 +157,8 @@ describe('logging', () => {
           supported: async () => ({ country: 'US', fiat: 'USD', crypto: 'DOT_ASSETHUB', methods: [] }),
           supportedCountries: async () => [],
           supportedCorridors: async () => [],
+    offrampCorridors: async () => [],
+    offramp: async (country: string) => ({ country, fiat: 'USD', methods: [] }),
           quote: async () => ({
             quotes: [],
             requested: { destinationCurrencyCode: 'USDC_ASSETHUB', sourceAmount: '20', fiat: 'USD' },
@@ -2062,6 +2068,49 @@ describe('the discovery routes', () => {
     });
 
     expect(response.statusCode).toBe(400);
+  });
+
+  it('GET /supported/offramp/corridors returns merged corridors and takes no query', async () => {
+    const corridors = [
+      {
+        country: 'BR',
+        name: 'Brazil',
+        fiat: 'BRL',
+        methods: [
+          {
+            paymentMethodType: 'PIX',
+            category: 'bank' as const,
+            min: '10',
+            max: '5000',
+            currency: 'BRL',
+            lane: { code: 'USDT_SOL', chain: 'solana' },
+          },
+        ],
+      },
+    ];
+    const built = await serve(undefined, config(), { offrampCorridors: async () => corridors });
+    const ok = await built.inject({ method: 'GET', url: '/supported/offramp/corridors', headers: DEV_HEADERS });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json()).toEqual({ corridors });
+
+    const extra = await built.inject({ method: 'GET', url: '/supported/offramp/corridors?country=BR', headers: DEV_HEADERS });
+    expect(extra.statusCode).toBe(400);
+  });
+
+  it('GET /supported/offramp returns the merged country, and is strict about its query', async () => {
+    const built = await serve();
+    const ok = await built.inject({ method: 'GET', url: '/supported/offramp?country=US', headers: DEV_HEADERS });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json()).toEqual({ country: 'US', fiat: 'USD', methods: [] });
+
+    for (const url of ['/supported/offramp', '/supported/offramp?country=US&direction=sell']) {
+      expect((await built.inject({ method: 'GET', url, headers: DEV_HEADERS })).statusCode).toBe(400);
+    }
+  });
+
+  it('the offramp routes need a caller like the other discovery routes', async () => {
+    const built = await serve();
+    expect((await built.inject({ method: 'GET', url: '/supported/offramp?country=US' })).statusCode).toBeGreaterThanOrEqual(400);
   });
 
   it('GET /supported/corridors refuses a missing crypto', async () => {

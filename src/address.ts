@@ -14,9 +14,10 @@
  * sell's deposit address) and never throws, because that value was never a caller's to get wrong.
  */
 
-import { decodeAddress, encodeAddress } from '@polkadot/util-crypto';
+import { base58Decode, decodeAddress, encodeAddress } from '@polkadot/util-crypto';
 
 import { reject } from './contract.js';
+import { isOfframpOnly } from './meld/catalog.js';
 
 /** Polkadot Asset Hub. Passed explicitly at every call site; never defaulted. */
 const POLKADOT_SS58_PREFIX = 0;
@@ -74,7 +75,10 @@ export function normalizeAddress(input: string): string {
  * Polkadot-prefix form so two disclosures of the same account under different prefixes compare
  * equal rather than looking like a changed address.
  */
-export function canonicalizeDisclosedAddress(input: string): string | undefined {
+export function canonicalizeDisclosedAddress(input: string, code?: string): string | undefined {
+  // A sell-only code is sold on Solana: a base58 32-byte key with no checksum and no prefix, so
+  // there is nothing to normalise. It is returned exactly as given and compared case-sensitively.
+  if (code !== undefined && isOfframpOnly(code)) return solanaAddress(input);
   // `decodeAddress('')` throws, but spelling the empty case out here rather than relying on that
   // is what stops a future, more permissive base58 decoder from ever making an empty string look
   // like a valid, if peculiar, account.
@@ -87,4 +91,14 @@ export function canonicalizeDisclosedAddress(input: string): string | undefined 
   }
   if (publicKey.length !== PUBLIC_KEY_BYTES) return undefined;
   return encodeAddress(publicKey, POLKADOT_SS58_PREFIX);
+}
+
+/** A Solana account: base58, decoding to 32 bytes. Returned unchanged, or `undefined`. */
+function solanaAddress(input: string): string | undefined {
+  if (input.length === 0) return undefined;
+  try {
+    return base58Decode(input).length === PUBLIC_KEY_BYTES ? input : undefined;
+  } catch {
+    return undefined;
+  }
 }

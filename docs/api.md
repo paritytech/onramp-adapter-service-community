@@ -15,6 +15,8 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
+| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lane: {code, chain}}]}]}`. No query parameters (strict). See "Offramp lanes" below. |
+| `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
 | `GET /transaction/:id` | `GET /payments/transactions/{id}` | Status, projected onto the five fields this service declares. |
@@ -249,6 +251,26 @@ account-level truth, surfaced honestly, not a defect in this service: `GET /supp
 `GET /supported/corridors` answering "not offered" for a corridor genuinely not offered is the
 whole point of asking live rather than hand-maintaining a list. The day a provider that off-ramps
 these assets is onboarded, the same code starts returning it, without a deploy.
+
+### Offramp lanes
+
+A sell can settle through more than one crypto lane (an Asset Hub asset, or a Solana stablecoin
+sold after a Chainflip swap). `supported.offramp_lanes` lists the lanes in preference order, and the two
+`/supported/offramp*` routes answer "what can a seller in this country use" without the caller
+picking a lane first.
+
+Merge rule, per country: the set of countries is the union across lanes. For each
+`paymentMethodType`, the method comes from the first lane, in configuration order, whose corridor
+offers it, with that corridor's own `min`, `max` and `currency`, and carries that lane as
+`lane: {code, chain}`. A later lane contributes only the methods earlier lanes lack. `name` and `fiat`
+come from the first lane that has the country. Methods keep first-lane order, then later lanes' extras.
+`GET /supported/offramp/corridors` is ordered by name then country, from the same cache and staleness
+rule as `GET /supported/corridors`; `GET /supported/offramp` asks Meld live, one `corridorForCountry`
+per lane in sell direction.
+
+The sell-only codes `USDT_SOL` and `USDC_SOL` are accepted wherever `direction=sell` is, and refused with
+`WrongAssetOrChain` on every buy path. A sell on one of them discloses a base58 Solana deposit address,
+which is stored and compared exactly as given (case-sensitive), not SS58-normalised.
 
 ## `POST /quote`
 

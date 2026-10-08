@@ -43,9 +43,18 @@ const SUPPORTED_REFRESH_CRYPTOS = ['DOT_ASSETHUB'];
  * as an ordinary outcome, not a failure, and the day a provider does off-ramp the asset this job
  * starts producing rows with no code change.
  */
-const SUPPORTED_REFRESH_JOBS: readonly RefreshJob[] = SUPPORTED_REFRESH_CRYPTOS.flatMap((crypto) =>
-  DIRECTIONS.map((direction) => ({ crypto, direction })),
-);
+export function refreshJobs(lanes: readonly { code: string }[]): RefreshJob[] {
+  const jobs: RefreshJob[] = SUPPORTED_REFRESH_CRYPTOS.flatMap((crypto) =>
+    DIRECTIONS.map((direction) => ({ crypto, direction })),
+  );
+  // Every offramp lane is sold, so each needs a sell corridor cache; deduped against the above.
+  for (const { code } of lanes) {
+    if (!jobs.some((j) => j.crypto === code && j.direction === 'sell')) {
+      jobs.push({ crypto: code, direction: 'sell' });
+    }
+  }
+  return jobs;
+}
 
 /** A listening service, and the one call that takes it down. */
 interface ServerHandle {
@@ -252,7 +261,7 @@ export async function start(
       ? startSupportedRefresh(
           discovery,
           funding,
-          SUPPORTED_REFRESH_JOBS,
+          refreshJobs(cfg.supported.offramp_lanes),
           { catalogMs: cfg.supported.catalog_interval_ms, routesMs: cfg.supported.routes_interval_ms },
           // warn, not info: a silently staling cache must reach an operator filtering to warn.
           (message) => {

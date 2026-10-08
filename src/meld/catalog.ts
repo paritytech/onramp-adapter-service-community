@@ -22,6 +22,28 @@ export const DESTINATIONS: readonly Destination[] = Object.freeze([
 ]);
 
 /**
+ * Codes a seller may sell, and a buyer may never receive.
+ *
+ * These are sold on Solana after a Chainflip swap; this service never delivers them, so they are
+ * not in `DESTINATIONS` and every buy path keeps refusing them. Code, not configuration, for the
+ * same reason `DESTINATIONS` is: Meld resolves an unknown code to Bitcoin (threat model T4).
+ */
+export const OFFRAMP_ONLY: readonly Destination[] = Object.freeze([
+  Object.freeze({ code: 'USDT_SOL' }),
+  Object.freeze({ code: 'USDC_SOL' }),
+]);
+
+/** Is this a code that is sellable but never deliverable? */
+export function isOfframpOnly(code: string): boolean {
+  return OFFRAMP_ONLY.some((d) => d.code === code);
+}
+
+/** Every code a sell may name: what is delivered plus what is sell-only. */
+export function isSellable(code: string): boolean {
+  return DESTINATIONS.some((d) => d.code === code) || isOfframpOnly(code);
+}
+
+/**
  * Is this one of the crypto codes this service delivers?
  *
  * The predicate behind `resolveDestination`, exposed separately because one caller needs the
@@ -32,12 +54,12 @@ export const DESTINATIONS: readonly Destination[] = Object.freeze([
  *
  * "Crypto" here means "crypto this deployment delivers", which is narrower than Meld's notion of
  * one. That is the right test for that purpose and the wrong one for any other: a code outside
- * this list is refused by `resolveDestination` long before a rail is called, so by the time the
+ * this list (sell-only codes included, which are crypto on a sell leg) is refused by `resolveDestination` long before a rail is called, so by the time the
  * client asks, the only codes in play are these three and fiat. It is not a general crypto/fiat
  * classifier and must not be used as one — `BTC` is a crypto and is not in it.
  */
 export function isDeliveredCrypto(code: string): boolean {
-  return DESTINATIONS.some((d) => d.code === code);
+  return DESTINATIONS.some((d) => d.code === code) || isOfframpOnly(code);
 }
 
 /** Resolve a code, or refuse it as `WrongAssetOrChain`: it settles somewhere unserved. */
@@ -47,4 +69,21 @@ export function resolveDestination(code: string): Destination {
     throw reject({ tag: 'WrongAssetOrChain' }, `Unknown destination code "${code}".`);
   }
   return found;
+}
+
+/**
+ * Resolve a code for a sell: delivered codes plus the sell-only ones. A buy must keep using
+ * `resolveDestination`, which refuses the sell-only codes.
+ */
+export function resolveSellCode(code: string): Destination {
+  const found = [...DESTINATIONS, ...OFFRAMP_ONLY].find((d) => d.code === code);
+  if (!found) {
+    throw reject({ tag: 'WrongAssetOrChain' }, `Unknown destination code "${code}".`);
+  }
+  return found;
+}
+
+/** Resolve a code for the given direction. */
+export function resolveForDirection(code: string, direction: 'buy' | 'sell'): Destination {
+  return direction === 'sell' ? resolveSellCode(code) : resolveDestination(code);
 }

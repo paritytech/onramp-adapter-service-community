@@ -477,6 +477,28 @@ describe('MeldRail.observation', () => {
       expect((await old.rail.observation().finder(sellRecord()))?.deposit?.address).toBe('1OldName');
     });
 
+    it('passes a Solana deposit address through unchanged for a sell-only code, comparing it exactly', async () => {
+      const SOLANA = 'So11111111111111111111111111111111111111112';
+      const terms = { sourceAmount: '10', sourceCurrencyCode: 'USDT_SOL' };
+      const record = sellRecord({ destination_currency_code: 'USDT_SOL' });
+      const same = sellClient(undefined, {
+        id: 'tx-1',
+        status: 'PENDING',
+        ...terms,
+        cryptoDetails: { destinationWalletAddress: SOLANA, offrampDestinationWalletAddress: SOLANA },
+      });
+      expect((await same.rail.observation().finder(record))?.deposit?.address).toBe(SOLANA);
+
+      // Same letters in another case is a different key, so two names that differ that way disclose nothing.
+      const cased = sellClient(undefined, {
+        id: 'tx-1',
+        status: 'PENDING',
+        ...terms,
+        cryptoDetails: { destinationWalletAddress: SOLANA, offrampDestinationWalletAddress: SOLANA.toLowerCase() },
+      });
+      expect((await cased.rail.observation().finder(record))?.deposit).toBeUndefined();
+    });
+
     it('omits the deposit for a sell until the provider discloses an address', async () => {
       const { rail } = sellClient({
         id: 'tx-1',
