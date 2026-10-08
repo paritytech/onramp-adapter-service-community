@@ -109,7 +109,7 @@
     "routes_interval_ms": 7200000,
     "offramp_lanes": [
       { "code": "DOT_ASSETHUB", "chain": "assethub" },
-      { "code": "USDT_SOLANA", "chain": "solana" }
+      { "code": "USDC_SOLANA", "chain": "solana" }
     ]
   }
 }
