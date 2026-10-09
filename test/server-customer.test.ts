@@ -11,8 +11,10 @@ import { CustomerAuth, customerGate, customerKeyHash, type CustomerKeys } from '
 import { PersonhoodService } from '../src/personhood.js';
 import { mintChallenge } from '../src/personhood/challenge.js';
 import { mintToken } from '../src/personhood/token.js';
+import { MeldHttpError } from '../src/meld/client.js';
 import { buildServer } from '../src/server.js';
-import { config, headlessConfig, personhoodConfig } from './fixtures.js';
+import { CustomerService } from '../src/customer.js';
+import { config, fakeCustomerMeld, fakeStore, headlessConfig, personhoodConfig } from './fixtures.js';
 
 const KEYS: CustomerKeys = {
   customerChallengeKey: new Uint8Array(32).fill(3),
@@ -55,9 +57,18 @@ const headless = (overrides: Record<string, unknown> = {}) => config({ ...headle
 
 const serve = async (
   cfg: Config = headless(),
-  options: { personhood?: PersonhoodService; sink?: { write: (line: string) => void } } = {},
+  options: {
+    personhood?: PersonhoodService;
+    sink?: { write: (line: string) => void };
+    meld?: ReturnType<typeof fakeCustomerMeld>;
+    store?: ReturnType<typeof fakeStore>;
+  } = {},
 ) => {
-  const instance = await buildServer(cfg, stubOnramp, options.personhood, options.sink, KEYS);
+  const meld = options.meld ?? fakeCustomerMeld();
+  const store = options.store ?? fakeStore();
+  const instance = await buildServer(cfg, stubOnramp, options.personhood, options.sink, KEYS, (audit, log) =>
+    new CustomerService(cfg, meld, store, audit, log),
+  );
   app = instance;
   return instance;
 };
@@ -76,7 +87,7 @@ const tokenOf = async (instance: FastifyInstance, headers: Record<string, string
 
 /**
  * A route behind `asCustomer`, registered by the test on the real server so its error handler and
- * limiter apply. No production route consumes the helper yet.
+ * limiter apply, and so the gate is tested apart from any one production route.
  */
 const withProbe = (instance: FastifyInstance, cfg: Config, personhood?: PersonhoodService) => {
   const gate = callerGate(callerAuth(cfg, { personhood }));
@@ -93,11 +104,26 @@ describe('customer key routes', () => {
     const instance = await buildServer(config(), stubOnramp, undefined, undefined, KEYS);
     app = instance;
 
-    for (const url of ['/customer/challenge', '/customer/token']) {
-      const response = await instance.inject({ method: 'POST', url, headers: DEV, payload: {} });
+    const routes = [
+      ['POST', '/customer/challenge'],
+      ['POST', '/customer/token'],
+      ['GET', '/customer'],
+      ['POST', '/customer'],
+      ['POST', '/customer/kyc'],
+      ['POST', '/customer/details'],
+      ['POST', '/customer/verifications'],
+      ['POST', '/customer/verifications/confirm'],
+      ['GET', '/requirements'],
+    ] as const;
+    for (const [method, url] of routes) {
+      const response = await instance.inject({ method, url, headers: DEV, ...(method === 'POST' ? { payload: {} } : {}) });
       expect(response.statusCode).toBe(404);
       expect(response.json().error.value.code).toBe('NOT_FOUND');
     }
+  });
+
+  it('refuse to build when headless is enabled without the customer service', async () => {
+    await expect(buildServer(headless(), stubOnramp, undefined, undefined, KEYS)).rejects.toThrow(/requires the customer service/);
   });
 
   it('refuse to build when headless is enabled without the keys', async () => {
@@ -306,5 +332,331 @@ describe('asCustomer', () => {
 
     expect(response.statusCode).toBe(401);
     expect(response.json().error.value.code).toBe('CUSTOMER_TOKEN_INVALID');
+  });
+});
+
+describe('customer routes', () => {
+  const REGISTRATION = {
+    firstName: 'Ada',
+    lastName: 'Lovelace',
+    email: 'ada@example.com',
+    dateOfBirth: '1990-03-15',
+    address: { lineOne: '1 Main St', lineTwo: 'Apt 2', city: 'Berlin', region: 'BE', postalCode: '10115', countryCode: 'DE' },
+  };
+  const REQUIREMENTS =
+    '/requirements?provider=BANXA&paymentMethodType=CREDIT_DEBIT_CARD&country=DE&fiat=EUR&sourceAmount=101.20&destinationCurrencyCode=DOT_ASSETHUB';
+
+  /** A server and a customer token for the test key, through the real A5 routes. */
+  const signedIn = async (options: Parameters<typeof serve>[1] = {}, cfg: Config = headless()) => {
+    const meld = options.meld ?? fakeCustomerMeld();
+    const store = options.store ?? fakeStore();
+    const instance = await serve(cfg, { ...options, meld, store });
+    const { token } = (await tokenOf(instance)).json<{ token: string }>();
+    const headers = { ...DEV, 'x-customer-token': token };
+    return { instance, meld, store, headers };
+  };
+
+  it('register a customer once, then read it', async () => {
+    const { instance, meld, store, headers } = await signedIn();
+    meld.createCustomer.mockResolvedValueOnce({
+      id: 'meld-customer-1',
+      serviceProviderCustomers: [{ serviceProvider: 'SUMSUB', kyc: { status: 'PENDING' } }],
+    });
+
+    const before = await instance.inject({ method: 'GET', url: '/customer', headers });
+    const created = await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+    const again = await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+    const after = await instance.inject({ method: 'GET', url: '/customer', headers });
+
+    expect(before.json()).toEqual({ customer: null });
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toEqual({ customer: { kyc: 'pending', providers: [] } });
+    expect(store.customers.get(`app.dot|${customerKeyHash(pair.publicKey)}`)?.meld_customer_id).toBe('meld-customer-1');
+    expect(again.statusCode).toBe(409);
+    expect(again.json().error.value.code).toBe('CUSTOMER_EXISTS');
+    expect(after.json()).toEqual({ customer: { kyc: 'none', providers: [] } });
+    expect(meld.createCustomer).toHaveBeenCalledTimes(1);
+  });
+
+  it('let a key register again once Meld no longer knows its customer', async () => {
+    const { instance, meld, headers } = await signedIn();
+    await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+    meld.getCustomer.mockResolvedValueOnce(undefined);
+    meld.createCustomer.mockResolvedValueOnce({ id: 'meld-customer-2', serviceProviderCustomers: [] });
+
+    const read = await instance.inject({ method: 'GET', url: '/customer', headers });
+    const registered = await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+
+    expect(read.json()).toEqual({ customer: null });
+    expect(registered.statusCode).toBe(201);
+  });
+
+  it.each([
+    ['an unexpected field', { ...REGISTRATION, phone: '+14155550123' }],
+    ['an unreadable email', { ...REGISTRATION, email: 'ada' }],
+    ['a birth date in the future', { ...REGISTRATION, dateOfBirth: '2999-01-01' }],
+    ['an impossible birth date', { ...REGISTRATION, dateOfBirth: '1990-02-30' }],
+    ['an address without a city', { ...REGISTRATION, address: { lineOne: '1 Main St', postalCode: '10115', countryCode: 'DE' } }],
+    ['a blank name', { ...REGISTRATION, firstName: '   ' }],
+  ])('refuse a registration with %s', async (_name, payload) => {
+    const { instance, meld, headers } = await signedIn();
+
+    const response = await instance.inject({ method: 'POST', url: '/customer', headers, payload });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.value.code).toBe('MALFORMED_REQUEST');
+    expect(meld.createCustomer).not.toHaveBeenCalled();
+  });
+
+  it('require a customer token', async () => {
+    const instance = await serve();
+
+    const response = await instance.inject({ method: 'GET', url: '/customer', headers: DEV });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().error.value.code).toBe('CUSTOMER_TOKEN_INVALID');
+  });
+
+  it('start KYC, re-issuing the URL when Meld already started it', async () => {
+    const { instance, meld, headers } = await signedIn();
+    await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+    meld.initiateKyc.mockResolvedValueOnce({ outcome: 'already_shared' });
+
+    const response = await instance.inject({ method: 'POST', url: '/customer/kyc', headers, payload: {} });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ url: 'https://kyc.example/verify/2' });
+    expect(meld.refreshKyc).toHaveBeenCalledWith('meld-customer-1', { serviceProvider: 'SUMSUB', mode: 'HOSTED_URL' });
+  });
+
+  it('refuse KYC for a key with no customer', async () => {
+    const { instance, headers } = await signedIn();
+
+    const response = await instance.inject({ method: 'POST', url: '/customer/kyc', headers });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error).toEqual({
+      tag: 'Other',
+      value: { code: 'CUSTOMER_NOT_FOUND', message: 'No customer is registered for this key.' },
+    });
+  });
+
+  it('answer requirements without a customer token, never ready', async () => {
+    const { instance, meld } = await signedIn();
+
+    const response = await instance.inject({ method: 'GET', url: REQUIREMENTS, headers: DEV });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      agreements: [{ type: 'TERMS_OF_SERVICE', url: 'https://provider.example/terms' }],
+      verifications: [],
+      missingFields: [],
+      pending: false,
+      blocked: false,
+      ready: false,
+    });
+    expect(meld.requirements.mock.calls[0]?.[1]).not.toHaveProperty('customerId');
+  });
+
+  it('answer requirements for the stored customer when a token is sent', async () => {
+    const { instance, meld, headers } = await signedIn();
+    await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+
+    const response = await instance.inject({ method: 'GET', url: REQUIREMENTS, headers });
+
+    expect(response.json().ready).toBe(true);
+    expect(meld.requirements).toHaveBeenCalledWith('BANXA', {
+      customerId: 'meld-customer-1',
+      paymentMethodType: 'CREDIT_DEBIT_CARD',
+      sourceCurrencyCode: 'EUR',
+      sourceAmount: '101.20',
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      countryCode: 'DE',
+      destinationNetworkCode: 'polkadot',
+    });
+  });
+
+  it('refuse requirements with a customer token that is not valid', async () => {
+    const { instance, meld } = await signedIn();
+
+    const response = await instance.inject({
+      method: 'GET',
+      url: REQUIREMENTS,
+      headers: { ...DEV, 'x-customer-token': 'not-a-token' },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().error.value.code).toBe('CUSTOMER_TOKEN_INVALID');
+    expect(meld.requirements).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an inexact amount', REQUIREMENTS.replace('101.20', '101.205')],
+    ['a lowercase provider', REQUIREMENTS.replace('BANXA', 'banxa')],
+    ['an unexpected parameter', `${REQUIREMENTS}&customerId=meld-customer-9`],
+  ])('refuse a requirements query with %s', async (_name, url) => {
+    const { instance } = await signedIn();
+
+    const response = await instance.inject({ method: 'GET', url, headers: DEV });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.value.code).toBe('MALFORMED_REQUEST');
+  });
+
+  it('send provider details and answer 204', async () => {
+    const { instance, meld, headers } = await signedIn();
+    await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+
+    const response = await instance.inject({
+      method: 'POST',
+      url: '/customer/details',
+      headers,
+      payload: { provider: 'BANXA', fields: { occupation: 'Engineer', sourceOfFunds: 'Salary' } },
+    });
+
+    expect(response.statusCode).toBe(204);
+    expect(response.body).toBe('');
+    expect(meld.refreshKyc.mock.calls[0]?.[1]).toMatchObject({
+      kycShareProviders: ['BANXA'],
+      serviceProviderDetails: { occupation: 'Engineer', sourceOfFunds: 'Salary' },
+    });
+  });
+
+  it.each([
+    ['no fields', { provider: 'BANXA', fields: {} }],
+    ['a field name that is not one', { provider: 'BANXA', fields: { 'source of funds': 'Salary' } }],
+    ['a value that is not text', { provider: 'BANXA', fields: { occupation: 3 } }],
+  ])('refuse provider details with %s', async (_name, payload) => {
+    const { instance, headers } = await signedIn();
+
+    const response = await instance.inject({ method: 'POST', url: '/customer/details', headers, payload });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.value.code).toBe('MALFORMED_REQUEST');
+  });
+
+  it('start a verification', async () => {
+    const { instance, headers } = await signedIn();
+    await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+
+    const response = await instance.inject({
+      method: 'POST',
+      url: '/customer/verifications',
+      headers,
+      payload: { channel: 'PHONE', target: '+14155550123' },
+    });
+
+    expect(response.json()).toEqual({
+      verificationId: 'verification-1',
+      expiresAt: '2026-08-25T02:57:26Z',
+      resendAvailableAt: '2026-08-25T02:47:56Z',
+    });
+  });
+
+  it('refuse a verification during a cooldown with the time it lifts', async () => {
+    const { instance, meld, headers } = await signedIn();
+    await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+    meld.startVerification.mockResolvedValueOnce({ outcome: 'cooldown', resendAvailableAt: '2026-08-25T02:47:56Z' });
+
+    const response = await instance.inject({
+      method: 'POST',
+      url: '/customer/verifications',
+      headers,
+      payload: { channel: 'EMAIL', target: 'ada@example.com' },
+    });
+
+    expect(response.statusCode).toBe(429);
+    expect(response.json()).toEqual({
+      error: {
+        tag: 'Other',
+        value: {
+          code: 'VERIFICATION_COOLDOWN',
+          message: 'A code was sent recently. Wait before asking for another.',
+          resendAvailableAt: '2026-08-25T02:47:56Z',
+        },
+      },
+      request_id: expect.any(String),
+    });
+  });
+
+  it.each([
+    ['a phone number with spacing', { channel: 'PHONE', target: '+1 415 555 0123' }],
+    ['an email on the phone channel', { channel: 'PHONE', target: 'ada@example.com' }],
+    ['an unknown channel', { channel: 'SMS', target: '+14155550123' }],
+  ])('refuse a verification request with %s', async (_name, payload) => {
+    const { instance, headers } = await signedIn();
+
+    const response = await instance.inject({ method: 'POST', url: '/customer/verifications', headers, payload });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('confirm a code, answering FAILED with the attempts left', async () => {
+    const { instance, meld, headers } = await signedIn();
+    await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+    meld.confirmVerification.mockResolvedValueOnce({ status: 'FAILED', attemptsRemaining: 2 });
+
+    const response = await instance.inject({
+      method: 'POST',
+      url: '/customer/verifications/confirm',
+      headers,
+      payload: { verificationId: 'verification-1', code: '316856' },
+    });
+
+    expect(response.json()).toEqual({ status: 'FAILED', attemptsRemaining: 2 });
+  });
+
+  it('refuse a code that is not digits', async () => {
+    const { instance, headers } = await signedIn();
+
+    const response = await instance.inject({
+      method: 'POST',
+      url: '/customer/verifications/confirm',
+      headers,
+      payload: { verificationId: 'verification-1', code: '31a856' },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('write no personal data to the log, on success or on a Meld failure', async () => {
+    const lines: string[] = [];
+    const cfg = headless({ server: { port: 8080, host: '127.0.0.1', log_level: 'debug' } });
+    const { instance, meld, headers } = await signedIn({ sink: { write: (line) => lines.push(line) } }, cfg);
+    const phone = '+14155550123';
+    const code = '316856';
+
+    await instance.inject({ method: 'POST', url: '/customer', headers, payload: REGISTRATION });
+    await instance.inject({ method: 'POST', url: '/customer/verifications', headers, payload: { channel: 'PHONE', target: phone } });
+    await instance.inject({ method: 'POST', url: '/customer/verifications/confirm', headers, payload: { verificationId: 'verification-1', code } });
+
+    meld.startVerification.mockRejectedValueOnce(new MeldHttpError(400, 'BAD_REQUEST', `target ${phone} is not mobile`));
+    meld.confirmVerification.mockRejectedValueOnce(new MeldHttpError(400, 'BAD_REQUEST', `code ${code} expired`));
+    meld.createCustomer.mockRejectedValueOnce(
+      new MeldHttpError(500, 'SERVICE_PROVIDER_ERROR', `Ada Lovelace ada@example.com 1990-03-15 1 Main St`, 'Berlin 10115'),
+    );
+    const failed = [
+      await instance.inject({ method: 'POST', url: '/customer/verifications', headers, payload: { channel: 'PHONE', target: phone } }),
+      await instance.inject({ method: 'POST', url: '/customer/verifications/confirm', headers, payload: { verificationId: 'verification-1', code } }),
+    ];
+    const other = await signedIn({ sink: { write: (line) => lines.push(line) }, meld }, cfg);
+    failed.push(await other.instance.inject({ method: 'POST', url: '/customer', headers: other.headers, payload: REGISTRATION }));
+    failed.push(
+      await instance.inject({ method: 'POST', url: '/customer', headers, payload: { ...REGISTRATION, email: 'not-an-email@' } }),
+    );
+
+    expect(failed.map((r) => r.statusCode)).toEqual([400, 400, 503, 400]);
+    // Without the fields every line carries, so a digit run in a timestamp or an id cannot match a postal code.
+    const logged = lines
+      .map((line) => {
+        const fields = JSON.parse(line) as Record<string, unknown>;
+        for (const key of ['time', 'pid', 'reqId', 'requestId']) Reflect.deleteProperty(fields, key);
+        return JSON.stringify(fields);
+      })
+      .join('\n');
+    expect(logged).toContain('request refused');
+    for (const pii of ['Ada', 'Lovelace', 'ada@example.com', 'not-an-email', '1990-03-15', '1 Main St', 'Apt 2', 'Berlin', '10115', phone, '4155550123', code]) {
+      expect(logged).not.toContain(pii);
+    }
   });
 });

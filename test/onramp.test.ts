@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { AuditEvent } from '../src/audit.js';
+import type { AuditEvent, SessionAuditEvent } from '../src/audit.js';
 import {
   directionUnsupported,
   Refusal,
@@ -2115,7 +2115,7 @@ describe('a sell request', () => {
 
     await service.createSession(SUBJECT, sell(), REQUEST_ID);
 
-    const created = audit.events.find((e) => e.event === 'session.created');
+    const created = audit.events.find((e): e is SessionAuditEvent => e.event === 'session.created');
     expect(created).toMatchObject({ direction: 'sell', cryptoAmount: '12.3456789012' });
     expect(created?.walletAddress).toBeUndefined();
     expect(created?.sourceAmount).toBeUndefined();

@@ -11,6 +11,7 @@
  */
 
 import { z } from 'zod';
+import type { KycState } from './funding/customer.js';
 import { MINOR_UNIT_DECIMAL } from './money.js';
 
 import { DEFAULT_DIRECTION, DIRECTIONS, RAIL_NAMES } from './rail.js';
@@ -52,6 +53,11 @@ export type FundingFailure =
          * client_reference)`, so the caller reaching this branch already owns it.
          */
         fundingRequestId?: string;
+        /**
+         * On `VERIFICATION_COOLDOWN`: when another code may be sent, as Meld states it (ISO 8601).
+         * `null` is Meld's daily cap, with no time at which it lifts.
+         */
+        resendAvailableAt?: string | null;
       };
     };
 
@@ -173,6 +179,45 @@ export const customerTokenInvalid = (detail: string) =>
   new Refusal(
     401,
     { tag: 'Other', value: { code: 'CUSTOMER_TOKEN_INVALID', message: 'The customer token was not accepted.' } },
+    detail,
+  );
+
+/** `409`: this customer key already has a Meld customer. Read it with `GET /customer`. */
+export const customerExists = (detail: string) =>
+  new Refusal(
+    409,
+    { tag: 'Other', value: { code: 'CUSTOMER_EXISTS', message: 'A customer is already registered for this key.' } },
+    detail,
+  );
+
+/** `404`: this customer key has no Meld customer yet. Register one with `POST /customer`. */
+export const customerNotFound = (detail: string) =>
+  new Refusal(
+    404,
+    { tag: 'Other', value: { code: 'CUSTOMER_NOT_FOUND', message: 'No customer is registered for this key.' } },
+    detail,
+  );
+
+/** `429`: Meld will not send another code yet. `null` is its daily cap. */
+export const verificationCooldown = (resendAvailableAt: string | null) =>
+  new Refusal(
+    429,
+    {
+      tag: 'Other',
+      value: {
+        code: 'VERIFICATION_COOLDOWN',
+        message: 'A code was sent recently. Wait before asking for another.',
+        resendAvailableAt,
+      },
+    },
+    'Meld verification cooldown',
+  );
+
+/** `400`: the verification expired or is no longer pending. The remedy is a new code. */
+export const verificationExpired = (detail: string) =>
+  new Refusal(
+    400,
+    { tag: 'Other', value: { code: 'VERIFICATION_EXPIRED', message: 'This code has expired. Ask for a new one.' } },
     detail,
   );
 
@@ -367,6 +412,97 @@ export const customerTokenRequest = z
   .strict();
 
 export type CustomerTokenRequest = z.infer<typeof customerTokenRequest>;
+
+/**
+ * Free text a customer types: bounded, not blank, no control characters. Never transformed, so
+ * Meld receives exactly what was sent.
+ */
+const customerText = (max: number) =>
+  z.string().max(max).regex(/^(?=.*\S)[^\p{Cc}]+$/u, 'Expected text without control characters.');
+
+/** At most 254 characters, the longest address SMTP can carry. */
+const email = z.email().max(254);
+
+/** A Meld service provider code, e.g. `BANXA`. It becomes a Meld URL path segment. */
+const serviceProviderCode = z.string().regex(/^[A-Z0-9_]{1,48}$/, 'Expected a Meld service provider code.');
+
+/** A body-less `POST`: nothing, or an empty object, and nothing else. */
+export const emptyRequest = z.object({}).strict().optional();
+
+/**
+ * `POST /customer`. Every field is personal data: it is forwarded to Meld and never logged, stored
+ * or echoed. `region` and `lineTwo` are optional because many addresses have neither.
+ */
+export const customerRegistration = z
+  .object({
+    firstName: customerText(100),
+    lastName: customerText(100),
+    email,
+    dateOfBirth: z.iso.date().refine((value) => Date.parse(value) < Date.now(), 'Expected a date in the past.'),
+    address: z
+      .object({
+        lineOne: customerText(200),
+        lineTwo: customerText(200).exactOptional(),
+        city: customerText(100),
+        region: customerText(100).exactOptional(),
+        postalCode: customerText(20),
+        countryCode: country,
+      })
+      .strict()
+      .exactOptional(),
+  })
+  .strict();
+
+export type CustomerRegistration = z.infer<typeof customerRegistration>;
+
+/** `GET /requirements`: the order a provider's requirements are asked for. */
+export const requirementsQuery = z
+  .object({
+    provider: serviceProviderCode,
+    paymentMethodType,
+    country,
+    fiat,
+    sourceAmount,
+    destinationCurrencyCode,
+  })
+  .strict();
+
+export type RequirementsRequest = z.infer<typeof requirementsQuery>;
+
+/** `POST /customer/details`: the extra fields a provider asked for, keyed as it named them. */
+export const providerDetailsRequest = z
+  .object({
+    provider: serviceProviderCode,
+    fields: z
+      .record(z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,63}$/, 'Expected a field name.'), customerText(500))
+      .refine((fields) => {
+        const count = Object.keys(fields).length;
+        return count >= 1 && count <= 32;
+      }, 'Expected between 1 and 32 fields.'),
+  })
+  .strict();
+
+export type ProviderDetailsRequest = z.infer<typeof providerDetailsRequest>;
+
+/** `POST /customer/verifications`: an email address, or an E.164 phone number with no spacing. */
+export const verificationRequest = z.discriminatedUnion('channel', [
+  z.object({ channel: z.literal('EMAIL'), target: email }).strict(),
+  z
+    .object({ channel: z.literal('PHONE'), target: z.string().regex(/^\+[1-9]\d{6,14}$/, 'Expected an E.164 phone number.') })
+    .strict(),
+]);
+
+export type VerificationRequestBody = z.infer<typeof verificationRequest>;
+
+/** `POST /customer/verifications/confirm`. The code is sent to Meld exactly as typed. */
+export const verificationConfirmation = z
+  .object({
+    verificationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/, 'Expected an opaque verification id.'),
+    code: z.string().regex(/^\d{4,10}$/, 'Expected the digits of the code.'),
+  })
+  .strict();
+
+export type VerificationConfirmation = z.infer<typeof verificationConfirmation>;
 
 /**
  * Which way the request moves value. Absent defaults to `DIRECTIONS[0]` (`buy`). See `src/rail.ts`.
@@ -618,6 +754,43 @@ export interface CreateSessionResponse {
 export interface TransactionResponse {
   transaction: unknown;
 }
+
+/** One provider's own KYC, as Meld reports it for this customer. */
+export interface ProviderKycView {
+  provider: string;
+  kyc: KycState;
+  /** The provider's hosted questionnaire, only while its KYC has not reached a final state. */
+  actionUrl?: string;
+}
+
+/** `GET /customer` and `POST /customer`: KYC states only, never the details registered. */
+export interface CustomerView {
+  /** Meld's Unified KYC (Sumsub). */
+  kyc: KycState;
+  providers: ProviderKycView[];
+}
+
+/** What a provider still needs before it takes an order from this customer. */
+export interface RequirementsView {
+  agreements: { type: string; url: string }[];
+  /** Contact channels the provider requires and the customer has not satisfied. */
+  verifications: { channel: 'EMAIL' | 'PHONE'; reason: 'MISSING' | 'STALE' | 'VOIP' }[];
+  /** The union of the fields every outstanding `PROVIDER_EXTRA_KYC` requirement names. */
+  missingFields: string[];
+  pending: boolean;
+  blocked: boolean;
+  /** Nothing outstanding for a known customer. Always false without a customer token. */
+  ready: boolean;
+}
+
+/** `POST /customer/verifications`. Times are Meld's ISO 8601 strings, passed through. */
+export interface VerificationStarted {
+  verificationId: string;
+  expiresAt: string;
+  resendAvailableAt: string;
+}
+
+export type VerificationResult = { status: 'VERIFIED' } | { status: 'FAILED'; attemptsRemaining?: number };
 
 /** The only error body a client ever sees. No rule text, no upstream payload, no detail. */
 export interface ErrorResponse {

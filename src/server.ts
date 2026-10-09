@@ -1,7 +1,8 @@
 /**
  * The HTTP surface: the authenticated routes (every one wrapped in `asCaller`, so a grep answers
  * which and how many), the two public handshake routes, the widget's return landing, and a
- * liveness probe. With Meld Headless enabled, the customer key routes join the authenticated set.
+ * liveness probe. With Meld Headless enabled, the customer key, customer and requirements routes
+ * join the authenticated set.
  *
  * Two invariants live here rather than in the docs, because both are easy to break locally:
  * every failure becomes a response in one of exactly three places (the error handler, the
@@ -25,11 +26,18 @@ import type { AuditLog } from './audit.js';
 import { callerAuth } from './auth.js';
 import { callerGate } from './caller.js';
 import { toOriginMatcher, type Config } from './config.js';
-import { customerAuth, type CustomerKeys } from './customer-auth.js';
+import { customerAuth, customerGate, type CustomerKeys } from './customer-auth.js';
+import type { CustomerLog, CustomerService } from './customer.js';
 import type { PersonhoodService } from './personhood.js';
 import {
   createSessionRequest,
+  customerRegistration,
   customerTokenRequest,
+  emptyRequest,
+  providerDetailsRequest,
+  requirementsQuery,
+  verificationConfirmation,
+  verificationRequest,
   quoteRequest,
   supportedQuery,
   supportedCountriesQuery,
@@ -71,6 +79,14 @@ type OnrampPort = Pick<
  */
 type OnrampFactory = (audit: AuditLog) => OnrampPort;
 
+type CustomerPort = Pick<
+  CustomerService,
+  'get' | 'register' | 'startKyc' | 'requirements' | 'submitDetails' | 'startVerification' | 'confirmVerification'
+>;
+
+/** Built like `Onramp`, from the app's loggers. Called only when Meld Headless is enabled. */
+type CustomerFactory = (audit: AuditLog, log: CustomerLog) => CustomerPort;
+
 /**
  * Where log lines go. Defaults to stdout; a test passes a stream it can read.
  *
@@ -87,6 +103,7 @@ export async function buildServer(
   personhood?: PersonhoodService,
   logDestination?: LogDestination,
   customerKeys?: CustomerKeys,
+  makeCustomers?: CustomerFactory,
 ): Promise<FastifyInstance> {
   const app = Fastify({
     // A request id on every log line and every error body, so a support conversation can
@@ -269,7 +286,8 @@ export async function buildServer(
   // A pino child shares the parent's destination, so this is still one sink and one stream, which
   // is the property the comment above `OnrampFactory` protects. What it does not share is the
   // threshold, and the audit trail is not the request log's to silence.
-  const onramp = makeOnramp(app.log.child({}, { level: 'info' }));
+  const audit = app.log.child({}, { level: 'info' });
+  const onramp = makeOnramp(audit);
 
   /** Parse or refuse. The zod message is operator-facing and never reaches the client. */
   const parse = <T>(schema: z.ZodType<T>, body: unknown): T => {
@@ -375,6 +393,61 @@ export async function buildServer(
       const subject = gate.subjectOf(request);
       const body = parse(customerTokenRequest, request.body);
       return reply.send(await customer.issueToken(subject, body));
+    });
+
+    if (makeCustomers === undefined) throw new Error('meld.headless.enabled requires the customer service.');
+    const customers = makeCustomers(audit, app.log);
+    const { asCustomer, customerKeyHashOf } = customerGate(customer, gate);
+
+    /**
+     * The customer behind the caller's customer key. Request bodies here are personal data: they
+     * are forwarded to Meld and reach no log line, and no Meld error text is echoed back.
+     */
+    app.get('/customer', asCustomer, async (request, reply) => {
+      const subject = gate.subjectOf(request);
+      return reply.send({ customer: await customers.get(subject, customerKeyHashOf(request), request.id) });
+    });
+    app.post('/customer', asCustomer, async (request, reply) => {
+      const subject = gate.subjectOf(request);
+      const body = parse(customerRegistration, request.body);
+      const view = await customers.register(subject, customerKeyHashOf(request), body, request.id);
+      return reply.code(201).send({ customer: view });
+    });
+    app.post('/customer/kyc', asCustomer, async (request, reply) => {
+      const subject = gate.subjectOf(request);
+      parse(emptyRequest, request.body);
+      return reply.send(await customers.startKyc(subject, customerKeyHashOf(request), request.id));
+    });
+    app.post('/customer/details', asCustomer, async (request, reply) => {
+      const subject = gate.subjectOf(request);
+      const body = parse(providerDetailsRequest, request.body);
+      await customers.submitDetails(subject, customerKeyHashOf(request), body);
+      return reply.code(204).send();
+    });
+    app.post('/customer/verifications', asCustomer, async (request, reply) => {
+      const subject = gate.subjectOf(request);
+      const body = parse(verificationRequest, request.body);
+      return reply.send(await customers.startVerification(subject, customerKeyHashOf(request), body));
+    });
+    app.post('/customer/verifications/confirm', asCustomer, async (request, reply) => {
+      const subject = gate.subjectOf(request);
+      const body = parse(verificationConfirmation, request.body);
+      return reply.send(await customers.confirmVerification(subject, customerKeyHashOf(request), body));
+    });
+
+    /**
+     * A provider's requirements for an order. The customer token is optional: without one only the
+     * agreements are meaningful, but a token that is sent must be valid.
+     */
+    app.get<{ Querystring: Record<string, string> }>('/requirements', asCaller, async (request, reply) => {
+      const subject = gate.subjectOf(request);
+      const header = request.headers['x-customer-token'];
+      const keyHash =
+        header === undefined
+          ? undefined
+          : await customer.verifyToken(subject, typeof header === 'string' ? header : undefined);
+      const query = parse(requirementsQuery, request.query);
+      return reply.send(await customers.requirements(subject, keyHash, query));
     });
   }
 

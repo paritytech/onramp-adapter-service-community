@@ -1,4 +1,5 @@
 import { encodeAddress } from '@polkadot/util-crypto';
+import { vi } from 'vitest';
 
 import { parseConfig, type Config } from '../src/config.js';
 import { TERMINAL_STATES, type FundingState } from '../src/funding/state.js';
@@ -7,6 +8,8 @@ import { mergeAdvance } from '../src/funding/merge.js';
 import type { FundingStore, SupportedCorridorRow } from '../src/funding/store.js';
 import { directionTermsViolation, type FundingRecord } from '../src/funding/types.js';
 import type { BankInstructions } from '../src/meld/bank-instructions.js';
+import type { MeldCustomer } from '../src/meld/client.js';
+import type { CustomerMeldPort } from '../src/customer.js';
 import type { Direction, RailBuySession, RailSellSession } from '../src/rail.js';
 
 const ALICE_PUBKEY = new Uint8Array([
@@ -332,6 +335,48 @@ export const customerRow = (overrides: Partial<MeldCustomerRow> = {}): MeldCusto
   ...overrides,
 });
 
+/** A Meld customer as `GET /accounts/customers/{id}` answers it. */
+export const meldCustomer = (overrides: Partial<MeldCustomer> = {}): MeldCustomer => ({
+  id: 'meld-customer-1',
+  status: 'ACTIVE',
+  serviceProviderCustomers: [],
+  ...overrides,
+});
+
+/**
+ * A stand-in for the Meld customer calls, each a `vi.fn` with a documented happy answer, so a test
+ * overrides only the call it is about and asserts on what was sent.
+ */
+export function fakeCustomerMeld() {
+  return {
+    createCustomer: vi.fn<CustomerMeldPort['createCustomer']>(async () => meldCustomer()),
+    getCustomer: vi.fn<CustomerMeldPort['getCustomer']>(async () => meldCustomer()),
+    addCustomerAddress: vi.fn<CustomerMeldPort['addCustomerAddress']>(async () => ({ id: 'address-1', status: 'ACTIVE' })),
+    initiateKyc: vi.fn<CustomerMeldPort['initiateKyc']>(async () => ({
+      outcome: 'started',
+      session: { status: 'PENDING', url: 'https://kyc.example/verify/1' },
+    })),
+    refreshKyc: vi.fn<CustomerMeldPort['refreshKyc']>(async () => ({ status: 'PENDING', url: 'https://kyc.example/verify/2' })),
+    requirements: vi.fn<CustomerMeldPort['requirements']>(async () => ({
+      legalAgreements: [{ type: 'TERMS_OF_SERVICE', url: 'https://provider.example/terms', region: 'EU' }],
+      kycRequirements: [],
+    })),
+    startVerification: vi.fn<CustomerMeldPort['startVerification']>(async () => ({
+      outcome: 'sent',
+      verification: {
+        verificationId: 'verification-1',
+        status: 'PENDING',
+        expiresAt: '2026-08-25T02:57:26Z',
+        resendAvailableAt: '2026-08-25T02:47:56Z',
+      },
+    })),
+    confirmVerification: vi.fn<CustomerMeldPort['confirmVerification']>(async () => ({
+      verificationId: 'verification-1',
+      status: 'VERIFIED',
+    })),
+  } satisfies CustomerMeldPort;
+}
+
 /**
  * An in-memory stand-in for `FundingStore`, honouring the parts of its contract the callers rely
  * on: the state machine refuses an illegal transition, `update` answers `undefined` for a row that
@@ -539,6 +584,11 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       customers.set(`${found.product_id}|${found.customer_key_hash}`, updated);
       return structuredClone(updated);
     }) satisfies FundingStore['updateKycCache'],
+    deleteCustomer: (async (productId: string, customerKeyHash: string, meldCustomerId: string) => {
+      const key = `${productId}|${customerKeyHash}`;
+      if (customers.get(key)?.meld_customer_id !== meldCustomerId) return false;
+      return customers.delete(key);
+    }) satisfies FundingStore['deleteCustomer'],
     webhookEvents,
     recordWebhookEvent: (async (eventId: string) => {
       if (webhookEvents.has(eventId)) return false;

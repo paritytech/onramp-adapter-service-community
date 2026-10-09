@@ -13,7 +13,7 @@
 
 import { normalizeAddress } from './address.js';
 import { railRefusal } from './meld/refusal.js';
-import type { AuditEvent, AuditLog } from './audit.js';
+import type { AuditLog, SessionAuditEvent } from './audit.js';
 import type { Subject } from './auth.js';
 import { originAllowed, type Config } from './config.js';
 import {
@@ -99,7 +99,7 @@ function committedTerm(value: string | undefined, field: string, direction: Dire
  * The direction, as an audit line carries it: nothing at all on a buy.
  *
  * Omitted rather than emitted as `'buy'`, so every audit line a buy produces is byte-identical
- * to the one it produced before sell existed. See `AuditEvent.direction` for why that matters to
+ * to the one it produced before sell existed. See `SessionAuditEvent.direction` for why that matters to
  * a consumer off-box, and `DEFAULT_DIRECTION` for why absence reads as `buy` consistently with
  * the wire.
  */
@@ -117,7 +117,7 @@ function auditDirection(direction: Direction): { direction?: Direction } {
  * truth about which ones they are.
  */
 function auditTerms(terms: CreateSessionResponse['pinned']): Pick<
-  AuditEvent,
+  SessionAuditEvent,
   'destinationCurrencyCode' | 'walletAddress' | 'sourceAmount' | 'cryptoAmount' | 'fiat'
 > {
   return {
@@ -890,7 +890,7 @@ export class Onramp {
     subject: Subject,
     requestId: string,
     record: FundingRecord,
-  ): AuditEvent {
+  ): SessionAuditEvent {
     return {
       event,
       alias: subject.alias,

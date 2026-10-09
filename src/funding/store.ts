@@ -825,6 +825,19 @@ export class FundingStore {
     );
   }
 
+  /**
+   * Remove a key's mapping, only while it still names `meldCustomerId`, so a mapping a newer
+   * registration wrote is never removed on the strength of a read of the old one. `true` when a
+   * row was removed.
+   */
+  async deleteCustomer(productId: string, customerKeyHash: string, meldCustomerId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      'DELETE FROM meld_customers WHERE product_id = $1 AND customer_key_hash = $2 AND meld_customer_id = $3',
+      [productId, customerKeyHash, meldCustomerId],
+    );
+    return result.rowCount === 1;
+  }
+
   /** `true` the first time an event id is seen, `false` on every redelivery. */
   async recordWebhookEvent(eventId: string, eventType: string, now: number): Promise<boolean> {
     const result = await this.pool.query(

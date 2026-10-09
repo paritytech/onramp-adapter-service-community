@@ -78,8 +78,10 @@ the rules on where each secret may come from.
 
 ## The API
 
-Twelve routes: the authenticated Meld calls and funding reads, the two public personhood handshake
-routes, the widget's return landing, and a liveness probe.
+Thirteen routes: the authenticated Meld calls and funding reads, the two public personhood handshake
+routes, the widget's return landing, and a liveness probe. With Meld Headless enabled, nine more
+serve the headless customer: its key proof, registration, KYC, contact verification and provider
+requirements.
 [docs/api.md](docs/api.md) is the reference.
 
 ## Testing

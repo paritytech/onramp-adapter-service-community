@@ -9,7 +9,7 @@
 import type { Direction, RailName } from './rail.js';
 
 /** One audit line: what happened, to which request, on which rail. */
-export interface AuditEvent {
+export interface SessionAuditEvent {
   /**
    * `session.orphaned` is the one that matters at 3am: the rail opened a settlement surface and
    * the record of it could not be written, so the only handle to that upstream session is this
@@ -91,6 +91,29 @@ export interface AuditEvent {
   /** Present on refusal. The enumerated tag only, never the operator detail. */
   reason?: string;
 }
+
+/**
+ * A headless customer was registered, started KYC, or was left without a mapping. No field names
+ * the person: their details reach Meld and nothing else, and the customer key is not even hashed
+ * into this line.
+ */
+export interface CustomerAuditEvent {
+  /**
+   * `customer.orphaned`: Meld created a customer and this service could not record it, so the
+   * Meld id on this line is the only handle to it. `customer.forgotten`: Meld no longer knows a
+   * stored customer, so its mapping was removed and the key may register again.
+   */
+  event: 'customer.created' | 'customer.kyc_started' | 'customer.orphaned' | 'customer.forgotten';
+  alias: string;
+  productId: string;
+  requestId: string;
+  /** On `customer.orphaned` and `customer.forgotten`. Meld's opaque id, no personal data itself. */
+  meldCustomerId?: string;
+  /** Present on `customer.orphaned`: the enumerated step that failed, never a driver message. */
+  reason?: 'address_failed' | 'insert_failed' | 'concurrent_registration';
+}
+
+export type AuditEvent = SessionAuditEvent | CustomerAuditEvent;
 
 /** Just enough of a logger to write one, so any pino-shaped log satisfies it. */
 export interface AuditLog {

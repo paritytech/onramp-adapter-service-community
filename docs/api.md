@@ -6,9 +6,11 @@ See [README.md](../README.md) for what the service is and how to run it.
 Nine routes are authenticated by the short-lived JWT the handshake mints: `POST /quote`,
 `POST /session`, `GET /supported`, `GET /supported/countries`, `GET /supported/corridors`,
 `GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel` and `GET /transaction/:id`. With
-Meld Headless enabled (`meld.headless.enabled`), `POST /customer/challenge` and
-`POST /customer/token` make eleven. The unauthenticated remainder is `GET /health`,
-`GET /meld/return` and the two handshake routes.
+Meld Headless enabled (`meld.headless.enabled`), nine more make eighteen: `POST /customer/challenge`,
+`POST /customer/token` and `GET /requirements` take caller auth, and `GET /customer`,
+`POST /customer`, `POST /customer/kyc`, `POST /customer/details`, `POST /customer/verifications`
+and `POST /customer/verifications/confirm` also take a customer token. The unauthenticated
+remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
 
 | Endpoint | Proxies | Purpose |
 | --- | --- | --- |
@@ -16,6 +18,13 @@ Meld Headless enabled (`meld.headless.enabled`), `POST /customer/challenge` and
 | `POST /api/v1/auth/redeem` | none | Exchanges a challenge + ring-VRF proof for a short-lived JWT. Verifies against the People-chain commitment. |
 | `POST /customer/challenge` | none | Headless only. Mints a fresh 56-byte challenge for a customer key proof. Caller auth. |
 | `POST /customer/token` | none | Headless only. Exchanges an sr25519 signature over that challenge for a short-lived customer token. Caller auth. |
+| `GET /customer` | `GET /accounts/customers/{id}` | Headless only. The KYC states of the caller's customer, or `null` before it registers. Customer token. |
+| `POST /customer` | `POST /accounts/customers`, `POST .../addresses` | Headless only. Registers the customer behind the caller's customer key. Customer token. |
+| `POST /customer/kyc` | `POST`, then `PATCH` on `409`, `.../kyc/initiate` | Headless only. A Sumsub hosted KYC URL. Customer token. |
+| `POST /customer/details` | `PATCH .../kyc/initiate` | Headless only. Sends the extra fields a provider asked for. Customer token. |
+| `POST /customer/verifications` | `POST .../verifications` | Headless only. Sends an email or SMS code. Customer token. |
+| `POST /customer/verifications/confirm` | `POST .../verifications/{id}/confirm` | Headless only. Checks a code. Customer token. |
+| `GET /requirements` | `GET /crypto/onramp/{provider}/requirements` | Headless only. What a provider needs before an order: agreements, verifications, fields. Caller auth, customer token optional. |
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
@@ -510,6 +519,113 @@ check and then discarded: it is not stored, logged or returned. Sent as `x-custo
 that is missing, expired, or bound to another product or alias is `401 CUSTOMER_TOKEN_INVALID`; the
 remedy is a new token, never new caller credentials.
 
+## Headless customer routes
+
+Present only when `meld.headless.enabled` is true. Every route below carries caller auth and
+`x-customer-token` (see above), except `GET /requirements`, where the token is optional. They act
+for the customer behind the token's key hash in the caller's product; the service holds Meld's id
+for it, a random `externalId` it gave Meld, and the last KYC states it read, nothing else.
+
+**What a customer submits is personal data.** It is forwarded to Meld and is never logged, stored
+or echoed back. Meld's own error text is not forwarded either, because it may quote a submitted
+value: a Meld failure on these routes is logged by HTTP status and Meld code only, and answers
+`400 Other{ PROVIDER_REJECTED }` for a Meld `400` and `503 ProviderTimeout` for anything else,
+except where a route names its own code below.
+
+Times Meld states (`expiresAt`, `resendAvailableAt`) pass through as ISO 8601 strings.
+
+### `GET /customer`
+
+```json
+{ "customer": { "kyc": "approved", "providers": [{ "provider": "NOAH", "kyc": "pending", "actionUrl": "https://..." }] } }
+```
+
+`customer` is `null` until the key has registered. `kyc` is Meld's Unified KYC (Sumsub); each
+`providers` entry is a provider Meld shared it with. A state is one of `none`, `pending`,
+`approved`, `rejected`, `expired`: Meld's `APPROVED`, `REJECTED` and `EXPIRED` map by name, no
+status is `none`, and every other status, including one Meld adds later, is `pending`. `actionUrl`
+is the provider's hosted questionnaire, present only while that provider is neither `approved`,
+`rejected` nor `expired`. Each read refreshes the stored KYC cache. A stored customer Meld answers
+`404` for is forgotten: the mapping is removed (audited as `customer.forgotten` with its Meld id),
+the read answers `null`, and the key may register again.
+
+### `POST /customer`
+
+```json
+{ "firstName": "Ada", "lastName": "Lovelace", "email": "ada@example.com", "dateOfBirth": "1990-03-15",
+  "address": { "lineOne": "1 Main St", "lineTwo": "Apt 2", "city": "Berlin", "region": "BE", "postalCode": "10115", "countryCode": "DE" } }
+```
+
+`address` is optional, and within it `lineTwo` and `region`. Text fields are bounded (names and city
+100, address lines 200, postal code 20), not blank, and free of control characters; `email` is at
+most 254 characters; `dateOfBirth` is a real calendar date in the past. Answers
+`201 { "customer": CustomerView }`. A key that already has a customer Meld still knows is
+`409 Other{ CUSTOMER_EXISTS }`, also when a concurrent registration of the same key won; one Meld
+answers `404` for is forgotten as above and the registration proceeds. The
+address, when given, is filed with Meld before the mapping is stored. A Meld customer created
+without a stored mapping (the address or the store write failed) is written to the audit log as
+`customer.orphaned` with its Meld id.
+
+### `POST /customer/kyc`
+
+No body, or `{}`. Starts Sumsub KYC in `HOSTED_URL` mode, sharing it with
+`meld.headless.kyc_share_providers` when that list is not empty, and answers
+`{ "url": "https://..." }`. Meld answers a second start with `409`; that is re-issued as the `PATCH`
+with the same body, which returns a fresh URL, so this route can be called again after a page
+lapses. `404 Other{ CUSTOMER_NOT_FOUND }` before `POST /customer`.
+
+### `GET /requirements`
+
+`?provider&paymentMethodType&country&fiat&sourceAmount&destinationCurrencyCode`, all required and
+nothing else accepted. `provider` is a Meld code such as `BANXA`; `sourceAmount` is fiat with at
+most two fraction digits; `destinationCurrencyCode` must be one this service delivers (else
+`400 WrongAssetOrChain`). The Meld network code comes from `meld.headless.network_codes`.
+
+```json
+{ "agreements": [{ "type": "TERMS_OF_SERVICE", "url": "https://..." }],
+  "verifications": [{ "channel": "PHONE", "reason": "STALE" }],
+  "missingFields": ["occupation"], "pending": false, "blocked": false, "ready": false }
+```
+
+Meld's customer id is sent only with a valid customer token whose key has registered; a token that
+is sent and not valid is `401 Other{ CUSTOMER_TOKEN_INVALID }`. `verifications` lists the channels
+the provider requires and the customer has not satisfied, with Meld's reason (`MISSING` when it
+gives none). `missingFields` is the union of the fields every `REQUIRED` `PROVIDER_EXTRA_KYC`
+requirement names. `pending` and `blocked` say whether any KYC requirement is in that state.
+`ready` is true only when a customer was sent, no verification is outstanding and every KYC
+requirement is `SATISFIED`. **Without a customer `ready` is always false**, which means "not known
+yet", never "requirements outstanding"; only `agreements` is meaningful then.
+
+### `POST /customer/details`
+
+```json
+{ "provider": "BANXA", "fields": { "occupation": "Engineer", "sourceOfFunds": "Salary" } }
+```
+
+One to 32 fields, names `^[A-Za-z][A-Za-z0-9_]{0,63}$`, values text of at most 500 characters.
+Sent to Meld as `serviceProviderDetails` on `PATCH .../kyc/initiate`, with
+`serviceProvider: "SUMSUB"`, `mode: "HOSTED_URL"` and `kycShareProviders: [provider]`. Meld does
+not document the shape it expects for these fields, so they go as named. Answers `204`.
+
+### `POST /customer/verifications`
+
+`{ "channel": "EMAIL", "target": "ada@example.com" }`, or `"PHONE"` with an E.164 number and no
+spacing (`+14155550123`). Answers
+`{ "verificationId": "...", "expiresAt": "...", "resendAvailableAt": "..." }`. While Meld's resend
+cooldown runs, the answer is `429 Other{ VERIFICATION_COOLDOWN }` with `resendAvailableAt` inside
+`Other`'s value; `null` there is Meld's daily cap.
+
+```json
+{ "error": { "tag": "Other", "value": { "code": "VERIFICATION_COOLDOWN", "message": "...", "resendAvailableAt": "2026-08-25T02:47:56Z" } }, "request_id": "..." }
+```
+
+### `POST /customer/verifications/confirm`
+
+`{ "verificationId": "...", "code": "316856" }`, the code as 4 to 10 digits. Answers
+`{ "status": "VERIFIED" }` or `{ "status": "FAILED", "attemptsRemaining": 2 }`; `FAILED` is an
+answer, not an error, and `attemptsRemaining` is absent when Meld does not state it. A verification
+that expired or is no longer pending is `400 Other{ VERIFICATION_EXPIRED }`: ask for a new code.
+
 ## `POST /funding/:id/cancel`
 
 **Cancelling withdraws the payment surface without concluding the request.** `cancelled_at` is a
@@ -680,6 +796,10 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 401 | `Other{ UNAUTHORIZED }` | Caller not verified. |
 | 401 | `Other{ CUSTOMER_PROOF_INVALID }` | `POST /customer/token`: the challenge is stale, inauthentic or malformed, or the signature does not verify over its raw bytes. Fetch a new challenge. |
 | 401 | `Other{ CUSTOMER_TOKEN_INVALID }` | `x-customer-token` is missing, expired, or bound to another product or alias. Get a new token from `POST /customer/token`. |
+| 409 | `Other{ CUSTOMER_EXISTS }` | `POST /customer` for a key that already has a customer. Read it with `GET /customer`. |
+| 404 | `Other{ CUSTOMER_NOT_FOUND }` | A customer route other than `GET /customer` and `POST /customer`, for a key that has not registered. Register with `POST /customer`. |
+| 429 | `Other{ VERIFICATION_COOLDOWN }` | `POST /customer/verifications` during Meld's resend cooldown. `resendAvailableAt` in the value says when another code may be sent; `null` is the daily cap. |
+| 400 | `Other{ VERIFICATION_EXPIRED }` | `POST /customer/verifications/confirm` for a verification that expired or is no longer pending. Ask for a new code. |
 | 400 | `RouteWithdrawn` | The operator has disabled session creation. |
 | 400 | `Other{ UNKNOWN_RAIL }` | A rail this build knows but this deployment has not wired. |
 | 400 | `Other{ PROVIDER_REJECTED }` | Meld understood the request and declined it, for a reason not enumerated above. Not retryable. |
@@ -692,9 +812,9 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 500 | `Other{ INTERNAL }` | An unhandled failure. The detail is in the log against this `request_id`; the body never carries it. |
 | 503 | `ProviderTimeout` | Meld did not answer, or the People chain did not answer a `/redeem`, or answered with a non-400 error status. |
 
-Every `409` refuses because a request already exists, and each carries that request's id as
-`fundingRequestId` inside `Other`'s value. It turns "do not start another" into something the
-caller can follow. Minting a fresh key instead is the one response that opens a second settlement
+Every `409` on the funding routes refuses because a request already exists, and each carries that
+request's id as `fundingRequestId` inside `Other`'s value. It turns "do not start another" into
+something the caller can follow. Minting a fresh key instead is the one response that opens a second settlement
 surface.
 
 ### Unknown `Other` codes must halt, never retry

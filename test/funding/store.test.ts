@@ -1259,7 +1259,7 @@ describe('headless funding rows', () => {
  */
 type CustomerSurface = Pick<
   FundingStore,
-  'customerByKey' | 'customerByMeldId' | 'insertCustomer' | 'updateKycCache' | 'recordWebhookEvent'
+  'customerByKey' | 'customerByMeldId' | 'insertCustomer' | 'updateKycCache' | 'deleteCustomer' | 'recordWebhookEvent'
 >;
 
 const onBoth = (body: (store: CustomerSurface) => Promise<void>) => async () => {
@@ -1340,6 +1340,22 @@ describe('meld customers', () => {
     'reports a KYC update for an unknown customer as nothing updated',
     onBoth(async (store) => {
       expect(await store.updateKycCache('meld-customer-404', { kyc: 'approved' }, 1)).toBeUndefined();
+    }),
+  );
+
+  it(
+    'removes a mapping only while it still names the Meld customer read',
+    onBoth(async (store) => {
+      await store.insertCustomer(customerRow());
+      expect(await store.deleteCustomer('app.dot', KEY_HASH, 'meld-customer-2')).toBe(false);
+      expect(await store.customerByKey('app.dot', KEY_HASH)).toEqual(customerRow());
+
+      expect(await store.deleteCustomer('app.dot', KEY_HASH, 'meld-customer-1')).toBe(true);
+      expect(await store.customerByKey('app.dot', KEY_HASH)).toBeUndefined();
+      expect(await store.deleteCustomer('app.dot', KEY_HASH, 'meld-customer-1')).toBe(false);
+
+      const again = customerRow({ meld_customer_id: 'meld-customer-2', external_id: 'external-2' });
+      expect(await store.insertCustomer(again)).toEqual(again);
     }),
   );
 

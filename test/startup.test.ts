@@ -722,6 +722,24 @@ afterEach(async () => {
     expect(meldRequests).toBe(0);
   });
 
+  it('boots with Meld Headless and serves the customer routes', async () => {
+    const baseUrl = await fakeMeld({ quotes: [] });
+    const path = await writeConfig('headless-ok', baseUrl);
+    const raw = JSON.parse(await readFile(path, 'utf8')) as { meld: Record<string, unknown>; customer?: unknown };
+    const secret = { mode: 'file', path: join(dir, 'headless-ok.key') } as const;
+    const headless = headlessConfig({ webhook: secret, customer: secret });
+    const { headless: block, webhook } = headless.meld as Record<string, unknown>;
+    Object.assign(raw.meld, { headless: block, webhook });
+    raw.customer = headless.customer;
+    await writeFile(path, JSON.stringify(raw));
+
+    handle = await start(path);
+
+    const response = await handle.app.inject({ method: 'GET', url: '/customer', headers: { 'x-dev-product-id': 'app.dot' } });
+    expect(response.statusCode).toBe(401);
+    expect(response.json().error.value.code).toBe('CUSTOMER_TOKEN_INVALID');
+  });
+
   it('boots in personhood mode and serves the handshake', async () => {
     // The personhood RPC is read lazily on `/redeem`, so boot never opens a socket. The probe
     // still runs, proving the Meld leg; then the handshake routes exist because personhood was

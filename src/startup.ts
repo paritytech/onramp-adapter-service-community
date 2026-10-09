@@ -14,6 +14,7 @@ import { hkdfSync } from 'node:crypto';
 
 import { loadConfig, type Config } from './config.js';
 import type { CustomerKeys } from './customer-auth.js';
+import { CustomerService } from './customer.js';
 import { ChainflipRail } from './chainflip/rail.js';
 import { FundingStore } from './funding/store.js';
 import { startWorker, type RailObservation } from './funding/worker.js';
@@ -169,6 +170,7 @@ export async function start(
       personhood,
       logDestination,
       headless,
+      (audit, log) => new CustomerService(cfg, meld, funding, audit, log),
     );
     // A non-optional handle for the callbacks below: `app` has to be declared outside this block
     // so the `catch` can close it, and TypeScript cannot narrow a mutable binding inside a closure.
