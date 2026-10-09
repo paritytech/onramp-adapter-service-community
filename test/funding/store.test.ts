@@ -1255,7 +1255,7 @@ describe('headless funding rows', () => {
 });
 
 describe('advancing a row to a reported state', () => {
-  type AdvanceSurface = Pick<FundingStore, 'create' | 'byId' | 'update' | 'advanceTo'>;
+  type AdvanceSurface = Pick<FundingStore, 'create' | 'byId' | 'update' | 'advanceTo' | 'claim'>;
   const onBothStores = (body: (store: AdvanceSurface) => Promise<void>) => async () => {
     await withStore(body);
     await body(fakeStore());
@@ -1313,6 +1313,25 @@ describe('advancing a row to a reported state', () => {
       expect(concluded?.record.status).toBe('settled');
 
       expect(await store.advanceTo('missing', 'settled', 2, {})).toBeUndefined();
+    }),
+  );
+
+  it(
+    'writes under a named lease only while that worker still holds the row',
+    onBothStores(async (store) => {
+      await store.create(headlessRecord());
+      await store.claim('worker-a', 1_700_000_000_000, 60_000, 10);
+
+      const taken = await store.advanceTo('funding-1', 'transaction_seen', 1_700_000_000_100, { claimedBy: 'worker-b' });
+      expect(taken).toBeUndefined();
+      expect((await store.byId('funding-1'))?.status).toBe('session_opened');
+
+      const held = await store.advanceTo('funding-1', 'transaction_seen', 1_700_000_000_100, {
+        providerTransactionId: 'tx-1',
+        claimedBy: 'worker-a',
+      });
+      expect(held?.record.status).toBe('transaction_seen');
+      expect(await store.byId('funding-1')).toEqual(held?.record);
     }),
   );
 });

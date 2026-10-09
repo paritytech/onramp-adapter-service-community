@@ -220,14 +220,17 @@ export async function start(
   // rail. Stopped on shutdown so a restart tears down cleanly.
   //
   // Meld is observable: a session is filed under its funding row's id, so the transaction that
-  // row produces can be found again. Chainflip is absent rather than stubbed; it opens no
-  // session, so there is nothing of its to observe.
+  // row produces can be found again, and a headless order by its stored customer and order id.
+  // Chainflip is absent rather than stubbed; it opens no session, so there is nothing of its to
+  // observe.
   //
   // Not started when no rail can observe. A worker with no finder does not sit idle: every
   // in-flight row ages out to `unobserved` (terminal, and unactionable) over purchases it had no
   // way of seeing. Leaving a request at `session_opened` is the truthful answer in that case, so
   // the loop stays down and says so.
-  const wired = observations ?? { meld: meldRail.observation() };
+  const wired = observations ?? {
+    meld: meldRail.observation(cfg.meld.headless?.enabled === true ? funding : undefined),
+  };
   const observable = Object.keys(wired).length > 0;
   if (cfg.worker.enabled && !observable) {
     app.log.warn(

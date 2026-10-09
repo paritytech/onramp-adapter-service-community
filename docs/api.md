@@ -914,6 +914,14 @@ is reserved **before** the rail is called, so the unique index arbitrates the id
 rather than a check-then-act race. An in-process worker advances the lifecycle, and so, for an
 order, does Meld's webhook.
 
+The worker finds a session's transaction by the reference the session was filed under, and an
+order's among its Meld customer's transactions (read under `meld.headless.api_version`, one page of
+100) by `orderId`. An order's row moves only forwards to where Meld's status puts it, so a row the
+webhook already moved is left as it is. An unpaid order is not expired while it can still be paid:
+a bank order is watched until its transfer details lapse, if that is later than
+`worker.session_max_age_ms` after the request, and Meld is asked once more before `expired`. An
+order whose stored customer is gone cannot be asked, and concludes `unobserved` at its deadline.
+
 Two bounds keep that loop from becoming a standing cost:
 
 - A reservation the rail never answered ages out as `unobserved` **and keeps the caller's key**.

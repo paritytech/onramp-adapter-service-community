@@ -27,8 +27,14 @@
 
 import type { MeldClient, MeldTransaction } from './client.js';
 import { canonicalizeDisclosedAddress } from '../address.js';
+import type { FundingStore } from '../funding/store.js';
 import type { FundingRecord } from '../funding/types.js';
-import type { RailObservation, TransactionMapper } from '../funding/worker.js';
+import {
+  UnobservableRecord,
+  type RailObservation,
+  type TransactionMapper,
+  type TransactionObservation,
+} from '../funding/worker.js';
 import type {
   FundingRail,
   MeldTransactionReader,
@@ -73,6 +79,15 @@ export const MELD_STATUS_TO_STATE: TransactionMapper = (status) => {
     return 'failed';
   return 'transaction_seen';
 };
+
+/**
+ * One page of a customer's transactions. Meld's default page is ten, which a returning buyer
+ * outgrows; a full page is read as unanswered rather than as "no transaction for this order".
+ */
+export const CUSTOMER_TRANSACTIONS_PAGE = 100;
+
+/** Where a headless row's Meld customer is found. */
+export type CustomerLookup = Pick<FundingStore, 'customerByKey'>;
 
 export class MeldRail implements FundingRail, MeldTransactionReader {
   readonly provider = 'meld' as const;
@@ -163,9 +178,12 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
    * sell in the tick. Only the reference's own failure propagates, so the finder throws only when
    * neither lookup could answer. The swallowed failure is not logged: neither this rail nor its
    * client holds a logger.
+   *
+   * With `customers`, headless rows are observable too, through `headlessTransaction`.
    */
-  observation(): RailObservation {
+  observation(customers?: CustomerLookup): RailObservation {
     return {
+      ...(customers === undefined ? {} : { headlessFinder: (record) => this.headlessTransaction(record, customers) }),
       finder: async (record) => {
         const bySession =
           record.direction === 'sell' && record.provider_session_id !== undefined
@@ -180,6 +198,38 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
       },
       mapper: MELD_STATUS_TO_STATE,
     };
+  }
+
+  /**
+   * A headless order's transaction: the stored customer's transactions, matched on `orderId`.
+   * Meld files no reference of ours on a headless transaction, so the order is the join. Two
+   * transactions for one order are ambiguous and throw rather than picking one.
+   */
+  private async headlessTransaction(
+    record: FundingRecord,
+    customers: CustomerLookup,
+  ): Promise<TransactionObservation | undefined> {
+    const orderId = record.meld_order_id;
+    const keyHash = record.customer_key_hash;
+    if (orderId === undefined || keyHash === undefined) {
+      throw new UnobservableRecord(`headless request ${record.id} names no Meld order or customer`);
+    }
+    const customer = await customers.customerByKey(record.product_id, keyHash);
+    if (customer === undefined) {
+      throw new UnobservableRecord(`no Meld customer is stored for headless request ${record.id} (order ${orderId})`);
+    }
+    const rows = await this.client.transactionsByCustomer(customer.meld_customer_id, {
+      limit: CUSTOMER_TRANSACTIONS_PAGE,
+    });
+    const mine = rows.filter((row) => row.orderId === orderId);
+    if (mine.length > 1) {
+      throw new Error(`Meld returned ${String(mine.length)} transactions for order ${orderId}.`);
+    }
+    const txn = mine[0];
+    if (txn === undefined && rows.length >= CUSTOMER_TRANSACTIONS_PAGE) {
+      throw new Error(`Meld returned a full page of transactions for customer ${customer.meld_customer_id} without order ${orderId}.`);
+    }
+    return txn === undefined ? undefined : { id: txn.id, status: txn.status ?? null };
   }
 }
 

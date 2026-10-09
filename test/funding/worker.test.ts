@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { ALICE, ALICE_PREFIX_42, BOB, fakeStore, fundingRecord } from '../fixtures.js';
+import {
+  ALICE,
+  ALICE_PREFIX_42,
+  BOB,
+  KEY_HASH,
+  bankInstructions,
+  customerRow,
+  fakeStore,
+  fundingRecord,
+  headlessRecord,
+} from '../fixtures.js';
 
 import type { FundingRecord } from '../../src/funding/types.js';
 import {
@@ -14,6 +24,8 @@ import {
   type TransactionObservation,
 } from '../../src/funding/worker.js';
 import type { FundingState } from '../../src/funding/state.js';
+import type { MeldClient, MeldTransaction } from '../../src/meld/client.js';
+import { MeldRail } from '../../src/meld/rail.js';
 import type { RailName } from '../../src/rail.js';
 
 const NOW = 1_700_000_000_000;
@@ -414,6 +426,7 @@ describe('pruning refused requests', () => {
     const store = {
       claim: async () => [],
       release: async () => undefined,
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async (cutoff: number) => {
         cutoffs.push(cutoff);
@@ -441,6 +454,7 @@ describe('pruning refused requests', () => {
     const store = {
       claim: async () => [],
       release: async () => undefined,
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async (cutoff: number) => {
         cutoffs.push(cutoff);
@@ -466,6 +480,7 @@ describe('pruning refused requests', () => {
     const store = {
       claim: async () => [],
       release: async () => undefined,
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async () => 7,
     };
@@ -493,6 +508,7 @@ describe('pruning refused requests', () => {
     const store = {
       claim: async () => [record({ status: 'session_opened', created_at: NOW - MAX_AGE - 1 })],
       release: async () => undefined,
+      advanceTo: async () => undefined,
       update: async () => record({ status: 'unobserved' }),
       pruneRefusals: () => Promise.reject(new Error('permission denied for table funding_requests')),
     };
@@ -508,6 +524,7 @@ describe('pruning refused requests', () => {
     const store = {
       claim: async () => [],
       release: async () => undefined,
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async (cutoff: number) => {
         calls.push(cutoff);
@@ -535,6 +552,7 @@ describe('naming the lease on every advance', () => {
       claim: async () => [record({ status: 'session_opened', created_at: NOW - MAX_AGE - 1 })],
       release: async () => undefined,
       pruneRefusals: async () => 0,
+      advanceTo: async () => undefined,
       update: async (_id: string, _to: FundingState, _now: number, extra?: { claimedBy?: string }) => {
         seen.push(extra?.claimedBy);
         return record({ status: 'unobserved' });
@@ -553,6 +571,7 @@ describe('naming the lease on every advance', () => {
       claim: async () => [record({ status: 'session_opened', created_at: NOW - MAX_AGE - 1 })],
       release: async () => undefined,
       pruneRefusals: async () => 0,
+      advanceTo: async () => undefined,
       update: async () => undefined,
     };
 
@@ -579,6 +598,7 @@ describe('releasing claims', () => {
     const store = {
       claim: async () => [record({ status: 'session_opened', created_at: NOW - MAX_AGE - 1 })],
       release: () => Promise.reject(new Error('Cannot use a pool after calling end on the pool')),
+      advanceTo: async () => undefined,
       update: async () => record({ status: 'unobserved' }),
       pruneRefusals: async () => 0,
     };
@@ -682,6 +702,7 @@ describe('worker identity', () => {
         released.push([...ids]);
         for (const id of ids) leased.delete(id);
       },
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async () => 0,
     };
@@ -709,6 +730,7 @@ describe('worker identity', () => {
     const store = {
       claim: async () => rows,
       release: async () => undefined,
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async () => 0,
     };
@@ -740,6 +762,7 @@ describe('worker identity', () => {
     const store = {
       claim: async () => [record({ id: 'r1', status: 'session_opened' })],
       release: async () => undefined,
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async () => 0,
     };
@@ -772,6 +795,7 @@ describe('worker identity', () => {
       release: async (_w: string, ids: readonly string[]) => {
         released.push([...ids]);
       },
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async () => 0,
     };
@@ -799,6 +823,7 @@ describe('worker identity', () => {
     const store = {
       claim: async () => [record({ id: 'held-1', status: 'session_opened' })],
       release: () => Promise.reject(new Error('pool is closing')),
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async () => 0,
     };
@@ -840,6 +865,7 @@ describe('worker identity', () => {
         released.push([...ids]);
         for (const id of ids) leased.set(id, false);
       },
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async () => 0,
     };
@@ -864,6 +890,7 @@ describe('worker identity', () => {
       release: async (_w: string, ids: readonly string[]) => {
         released.push([...ids]);
       },
+      advanceTo: async () => undefined,
       update: async () => undefined,
       pruneRefusals: async () => 0,
     };
@@ -1008,6 +1035,7 @@ describe('the tick, hardened', () => {
       claim: async () => [record()],
       release: async () => undefined,
       pruneRefusals: async () => 0,
+      advanceTo: async () => undefined,
       update: async () => undefined,
     };
 
@@ -1154,6 +1182,7 @@ describe('the tick, hardened', () => {
         Array.from({ length: 8 }, (_unused, i) => record({ id: `funding-${String(i)}`, created_at: NOW - 10_000 + i })),
       release: async () => undefined,
       pruneRefusals: async () => 0,
+      advanceTo: async () => undefined,
       update: async () => {
         throw new Error('attempt to write a readonly database');
       },
@@ -1483,6 +1512,7 @@ describe('the loop, when the tick itself fails', () => {
       claim: () => Promise.reject(new Error('database is not open')),
       release: async () => undefined,
       pruneRefusals: async () => 0,
+      advanceTo: async () => undefined,
       update: async () => undefined,
     };
     const log = vi.fn();
@@ -2249,6 +2279,181 @@ describe('a sell whose provider discloses a deposit address', () => {
     const line = lines.find((entry) => entry.includes('funding-1'));
     expect(line).toContain('PENDING');
     expect(line).not.toContain('deposit address was disclosed');
+    await store.close();
+  });
+});
+
+describe('headless rows', () => {
+  /** A fake Meld answering the customer's transactions, observed through the real rail finder. */
+  const meld = (answer: () => Promise<MeldTransaction[]>) => {
+    const transactionsByCustomer = vi.fn<MeldClient['transactionsByCustomer']>(answer);
+    const rail = new MeldRail({ transactionsByCustomer } as unknown as MeldClient);
+    return { transactionsByCustomer, rail };
+  };
+  const seen = (orderId: string, status: string, id = `tx-${orderId}`): MeldTransaction => ({
+    id,
+    status,
+    orderId,
+    customer: { id: 'meld-customer-1' },
+  });
+  const withCustomer = (records: readonly FundingRecord[]) => {
+    const store = fakeStore(records);
+    store.customers.set(`app.dot|${KEY_HASH}`, customerRow());
+    return store;
+  };
+  const card = (overrides: Partial<FundingRecord> = {}) =>
+    headlessRecord({ payment_method_type: 'CREDIT_DEBIT_CARD', payment_instructions: undefined, ...overrides });
+
+  it('polls an order from pending to settled through the customer and order', async () => {
+    const store = withCustomer([card()]);
+    let status = 'PENDING';
+    const { transactionsByCustomer, rail } = meld(async () => [seen('order-0', 'SETTLED'), seen('order-1', status)]);
+    const wired = { meld: rail.observation(store) };
+
+    expect(await tick(store, NOW, wired, MAX_AGE, () => undefined, lease())).toBe(1);
+    expect(await store.byId('funding-1')).toMatchObject({
+      status: 'transaction_seen',
+      provider_transaction_id: 'tx-order-1',
+      provider_status: 'PENDING',
+    });
+
+    status = 'SETTLED';
+    expect(await tick(store, NOW + 1, wired, MAX_AGE, () => undefined, lease())).toBe(1);
+    const row = await store.byId('funding-1');
+    expect(row?.status).toBe('settled');
+    expect(row?.provider_status).toBe('SETTLED');
+    expect(row?.status_history.map((entry) => entry.status)).toEqual(['session_opened', 'transaction_seen', 'settled']);
+    expect(transactionsByCustomer).toHaveBeenCalledWith('meld-customer-1', { limit: 100 });
+    await store.close();
+  });
+
+  it('leaves rows a webhook already moved, without counting them as failures', async () => {
+    const raced = ['r1', 'r2', 'r3'];
+    const store = withCustomer([
+      ...raced.map((id, at) => card({ id, meld_order_id: `order-${id}`, created_at: NOW - 10 + at })),
+      card({ id: 'r4', meld_order_id: 'order-r4' }),
+    ]);
+    // The webhook lands between the claim and the worker's write.
+    const racing = {
+      ...store,
+      claim: async (workerId: string, now: number, ttlMs: number, limit: number) => {
+        const claimed = await store.claim(workerId, now, ttlMs, limit);
+        for (const id of raced) await store.advanceTo(id, 'settled', NOW, { providerStatus: 'SETTLED' });
+        return claimed;
+      },
+    };
+    const { transactionsByCustomer, rail } = meld(async () =>
+      ['r1', 'r2', 'r3', 'r4'].map((id) => seen(`order-${id}`, 'PENDING')),
+    );
+    const { lines, log } = notes();
+
+    const advanced = await tick(racing, NOW, { meld: rail.observation(store) }, MAX_AGE, log, lease());
+
+    expect(advanced).toBe(1);
+    expect(lines).toEqual([]);
+    expect(transactionsByCustomer).toHaveBeenCalledTimes(4);
+    expect((await store.byId('r1'))?.status_history.map((entry) => entry.status)).toEqual([
+      'session_opened',
+      'transaction_seen',
+      'settled',
+    ]);
+    expect((await store.byId('r4'))?.status).toBe('transaction_seen');
+    await store.close();
+  });
+
+  it('keeps a bank order alive past the local window until its transfer details lapse', async () => {
+    const created_at = NOW - MAX_AGE - 1;
+    const store = withCustomer([
+      headlessRecord({ created_at, payment_instructions: bankInstructions({ expiresAt: NOW + 10_000 }) }),
+      card({ id: 'card', meld_order_id: 'order-card', created_at }),
+    ]);
+    const { rail } = meld(async () => []);
+    const wired = { meld: rail.observation(store) };
+
+    await tick(store, NOW, wired, MAX_AGE, () => undefined, lease());
+    expect((await store.byId('funding-1'))?.status).toBe('session_opened');
+    expect((await store.byId('card'))?.status).toBe('expired');
+
+    await tick(store, NOW + 10_001, wired, MAX_AGE, () => undefined, lease());
+    expect((await store.byId('funding-1'))?.status).toBe('expired');
+    await store.close();
+  });
+
+  it('records a transaction found at the deadline instead of expiring the order', async () => {
+    const store = withCustomer([card({ created_at: NOW - MAX_AGE - 1 })]);
+    const { rail } = meld(async () => [seen('order-1', 'PENDING')]);
+
+    await tick(store, NOW, { meld: rail.observation(store) }, MAX_AGE, () => undefined, lease());
+
+    expect((await store.byId('funding-1'))?.status).toBe('transaction_seen');
+    await store.close();
+  });
+
+  it('concludes unobserved, never expired, when Meld cannot be read at the deadline', async () => {
+    const store = withCustomer([card()]);
+    const { rail } = meld(() => Promise.reject(new Error('Meld answered 503')));
+    const wired = { meld: rail.observation(store) };
+    const { lines, log } = notes();
+
+    await tick(store, NOW, wired, MAX_AGE, log, lease());
+    expect((await store.byId('funding-1'))?.status).toBe('session_opened');
+
+    await tick(store, NOW + MAX_AGE + 1, wired, MAX_AGE, log, lease());
+    expect((await store.byId('funding-1'))?.status).toBe('unobserved');
+    expect(lines.some((line) => line.includes('concluded funding-1 as unobserved'))).toBe(true);
+    await store.close();
+  });
+
+  it('leaves a row with no stored customer to its deadline, logging ids only', async () => {
+    const orphans = ['o1', 'o2', 'o3'].map((id, at) =>
+      card({ id, meld_order_id: `order-${id}`, customer_key_hash: 'ff'.repeat(32), created_at: NOW - 10 + at }),
+    );
+    const store = withCustomer([...orphans, card()]);
+    const { transactionsByCustomer, rail } = meld(async () => [seen('order-1', 'PENDING')]);
+    const wired = { meld: rail.observation(store) };
+    const { lines, log } = notes();
+
+    await tick(store, NOW, wired, MAX_AGE, log, lease());
+
+    expect((await store.byId('o1'))?.status).toBe('session_opened');
+    expect((await store.byId('funding-1'))?.status).toBe('transaction_seen');
+    expect(transactionsByCustomer).toHaveBeenCalledTimes(1);
+    expect(lines).toEqual(
+      ['o1', 'o2', 'o3'].map(
+        (id) => `funding worker cannot observe ${id}: no Meld customer is stored for headless request ${id} (order order-${id})`,
+      ),
+    );
+
+    await tick(store, NOW + MAX_AGE + 1, wired, MAX_AGE, log, lease());
+    expect((await store.byId('o1'))?.status).toBe('unobserved');
+    expect(lines.join('\n')).not.toContain('ff'.repeat(32));
+    await store.close();
+  });
+
+  it('keeps re-observing a seen order whose customer is gone, until the window closes', async () => {
+    const store = fakeStore([card({ status: 'transaction_seen', provider_status: 'PENDING' })]);
+    const { rail } = meld(async () => []);
+    const { lines, log } = notes();
+
+    expect(await tick(store, NOW, { meld: rail.observation(store) }, MAX_AGE, log, lease())).toBe(0);
+
+    expect((await store.byId('funding-1'))?.status).toBe('transaction_seen');
+    expect(lines).toEqual([
+      'funding worker cannot observe funding-1: no Meld customer is stored for headless request funding-1 (order order-1)',
+    ]);
+    await store.close();
+  });
+
+  it('never reads a headless row through the widget finder', async () => {
+    const store = withCustomer([card()]);
+    const widgetFinder = vi.fn(async () => txn());
+    const { lines, log } = notes();
+
+    await tick(store, NOW, observations(widgetFinder), MAX_AGE, log, lease());
+
+    expect(widgetFinder).not.toHaveBeenCalled();
+    expect((await store.byId('funding-1'))?.status).toBe('session_opened');
+    expect(lines.some((line) => line.includes('has no observation wired'))).toBe(true);
     await store.close();
   });
 });

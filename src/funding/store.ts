@@ -704,20 +704,21 @@ export class FundingStore {
    *
    * Nothing is written when the row is already there or cannot get there (a concluded row, or a
    * report behind the row). `from` is the state the row was found in; `record` is the row after
-   * the write, or as found when nothing was written. `undefined` when no row has this id.
+   * the write, or as found when nothing was written. `undefined` when no row has this id, or when
+   * the lease named in `claimedBy` moved on, as `update` reports it.
    */
   async advanceTo(
     id: string,
     to: FundingState,
     now: number,
-    extra: Pick<UpdateExtra, 'providerTransactionId' | 'providerStatus'>,
+    extra: Pick<UpdateExtra, 'providerTransactionId' | 'providerStatus' | 'claimedBy'>,
   ): Promise<{ from: FundingState; record: FundingRecord } | undefined> {
     return this.locked(id, async (previous, client) => {
       if (previous === undefined) return undefined;
       const steps = pathTo(previous.status, to) ?? [];
       if (steps.length === 0) return { from: previous.status, record: previous };
       const updated = steps.reduce((record, step) => mergeAdvance(record, step, now, extra), previous);
-      await this.write(client, id, updated, undefined);
+      if (!(await this.write(client, id, updated, extra.claimedBy))) return undefined;
       return { from: previous.status, record: updated };
     });
   }

@@ -154,9 +154,9 @@ an operator can tie a running pod to a commit in this repository.
 ## Before this can serve real traffic
 
 - **The settlement join is unverified against a live Meld.** The worker finds a transaction by the
-  reference the session was filed under. That contract is reported from a live sandbox but never
-  re-verified here, so a request whose transaction cannot be found concludes `unobserved` rather
-  than claiming the buyer did not pay.
+  reference the session was filed under, and a headless order's by its Meld customer and order id.
+  Neither contract is re-verified here against a live sandbox, so a request whose transaction
+  cannot be found concludes `unobserved` rather than claiming the buyer did not pay.
 - **`meld.api_version` has no known-good value yet.** It is required precisely so it is not guessed.
 - **The jurisdiction is pinned but not locked.** Meld exposes no `lockFields` entry for the country,
   so a buyer can change it inside Meld's flow after this service pinned one. See the threat model.

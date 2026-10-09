@@ -118,8 +118,10 @@ const transactionPath = (id: string) => `/payments/transactions/${encodeURICompo
  */
 const transactionSearchPath = (reference: string) =>
   `/payments/transactions?externalSessionIds=${encodeURIComponent(reference)}`;
-const transactionsByCustomerPath = (customerId: string) =>
-  `/payments/transactions?customerIds=${encodeURIComponent(customerId)}`;
+/** `limit` is the page size; Meld's default is ten and `?limit=100` was observed to be honoured. */
+const transactionsByCustomerPath = (customerId: string, limit: number | undefined) =>
+  `/payments/transactions?customerIds=${encodeURIComponent(customerId)}` +
+  (limit === undefined ? '' : `&limit=${String(limit)}`);
 
 /**
  * Meld answered, and said no.
@@ -943,8 +945,8 @@ export class MeldClient {
    *
    * Under the headless version, which is where Meld documents this search and the order it joins.
    */
-  async transactionsByCustomer(customerId: string): Promise<MeldTransaction[]> {
-    const body = await this.send('GET', transactionsByCustomerPath(customerId), undefined, this.headless());
+  async transactionsByCustomer(customerId: string, options: { limit?: number } = {}): Promise<MeldTransaction[]> {
+    const body = await this.send('GET', transactionsByCustomerPath(customerId, options.limit), undefined, this.headless());
     const parsed = this.read(transactionSearchResponse, body, 'transaction search');
     const rows = Array.isArray(parsed) ? parsed : parsed.transactions;
     const mine = rows.filter((row) => row.customer?.id === customerId || row.customerId === customerId);

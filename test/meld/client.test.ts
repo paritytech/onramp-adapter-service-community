@@ -1933,6 +1933,14 @@ describe('transactionsByCustomer', () => {
     expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
   });
 
+  it('asks for a page of the given size under the headless version', async () => {
+    const fetchMock = stub(200, { transactions: [own] });
+    await headless().transactionsByCustomer('c/1', { limit: 100 });
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/payments/transactions?customerIds=c%2F1&limit=100');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+  });
+
   it.each([
     ['wrapped', { transactions: [own] }],
     ['bare', [own]],

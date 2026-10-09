@@ -4,7 +4,11 @@ import {
   ALICE,
   ALICE_PREFIX_42,
   BOB,
+  KEY_HASH,
+  customerRow,
+  fakeStore,
   fundingRecord,
+  headlessRecord,
   railSellSessionInput,
   railSessionInput,
   sellRecord,
@@ -13,7 +17,8 @@ import {
 import { upstreamUnavailable } from '../../src/contract.js';
 import { MeldClient, MeldHttpError } from '../../src/meld/client.js';
 import { Secret } from '../../src/secret.js';
-import { MeldRail } from '../../src/meld/rail.js';
+import { UnobservableRecord } from '../../src/funding/worker.js';
+import { CUSTOMER_TRANSACTIONS_PAGE, MeldRail } from '../../src/meld/rail.js';
 
 /** A Meld stub client exercising just the surface the Meld rail adapts, plus the spies to assert on. */
 /** One offer, so the rail's pass-through can be asserted on rather than an empty array. */
@@ -370,6 +375,64 @@ describe('MeldRail.observation', () => {
       expect(new MeldRail({} as unknown as MeldClient).observation().mapper(status)).toBe('transaction_seen');
     },
   );
+
+  describe('a headless order', () => {
+    const customers = () => {
+      const store = fakeStore();
+      store.customers.set(`app.dot|${KEY_HASH}`, customerRow());
+      return store;
+    };
+    const finderOver = (rows: unknown[]) => {
+      const transactionsByCustomer = vi.fn(async () => rows);
+      const finder = new MeldRail({ transactionsByCustomer } as unknown as MeldClient).observation(customers())
+        .headlessFinder;
+      if (finder === undefined) throw new Error('no headless finder wired');
+      return { finder, transactionsByCustomer };
+    };
+    const other = (index: number) => ({ id: `tx-${String(index)}`, orderId: `order-other-${String(index)}` });
+
+    it('is not observable without a customer lookup', () => {
+      expect(new MeldRail({} as unknown as MeldClient).observation().headlessFinder).toBeUndefined();
+    });
+
+    it("matches the order among the customer's transactions", async () => {
+      const { finder, transactionsByCustomer } = finderOver([other(0), { id: 'tx-1', orderId: 'order-1' }]);
+
+      await expect(finder(headlessRecord())).resolves.toEqual({ id: 'tx-1', status: null });
+      expect(transactionsByCustomer).toHaveBeenCalledWith('meld-customer-1', { limit: CUSTOMER_TRANSACTIONS_PAGE });
+    });
+
+    it('answers nothing yet while the order has no transaction', async () => {
+      const { finder } = finderOver([other(0)]);
+      await expect(finder(headlessRecord())).resolves.toBeUndefined();
+    });
+
+    it('refuses to choose between two transactions for one order', async () => {
+      const { finder } = finderOver([
+        { id: 'tx-1', orderId: 'order-1' },
+        { id: 'tx-2', orderId: 'order-1' },
+      ]);
+      await expect(finder(headlessRecord())).rejects.toThrow(/2 transactions for order order-1/);
+    });
+
+    it('reads a full page without the order as unanswered, not as no transaction', async () => {
+      const full = Array.from({ length: CUSTOMER_TRANSACTIONS_PAGE }, (_, index) => other(index));
+      await expect(finderOver(full).finder(headlessRecord())).rejects.toThrow(/full page/);
+      await expect(
+        finderOver([...full.slice(1), { id: 'tx-1', orderId: 'order-1', status: 'SETTLED' }]).finder(headlessRecord()),
+      ).resolves.toEqual({ id: 'tx-1', status: 'SETTLED' });
+    });
+
+    it.each([
+      ['no order', { meld_order_id: undefined }],
+      ['no customer key', { customer_key_hash: undefined }],
+      ['a customer no longer stored', { customer_key_hash: 'ff'.repeat(32) }],
+    ])('cannot observe a row with %s, without asking Meld', async (_label, overrides) => {
+      const { finder, transactionsByCustomer } = finderOver([]);
+      await expect(finder(headlessRecord(overrides))).rejects.toBeInstanceOf(UnobservableRecord);
+      expect(transactionsByCustomer).not.toHaveBeenCalled();
+    });
+  });
 
   describe('the deposit disclosure', () => {
     /** A client whose session lookup and reference search answer from fixed transactions. */

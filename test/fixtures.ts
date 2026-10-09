@@ -567,6 +567,7 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       if (previous === undefined) return undefined;
       const steps = pathTo(previous.status, to) ?? [];
       if (steps.length === 0) return { from: previous.status, record: structuredClone(previous) };
+      if (extra.claimedBy !== undefined && leases.get(id)?.by !== extra.claimedBy) return undefined;
       const updated = steps.reduce((record, step) => mergeAdvance(record, step, now, extra), previous);
       rows.set(id, updated);
       return { from: previous.status, record: structuredClone(updated) };

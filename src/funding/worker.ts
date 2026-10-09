@@ -20,6 +20,10 @@
  * without HTTP. Dispatch is on the request's explicit `rail`, never on `service_provider`, a
  * Meld-internal pin that cannot tell meld from chainflip. A rail with no observation registered
  * is not refused: the absence is passed down so the row still ages out on local grounds.
+ *
+ * A Meld Headless row is read through the rail's headless finder, by its Meld customer and order,
+ * and written with `advanceTo`: a webhook may have moved it since the claim, and a move already
+ * made is then a no-op rather than an illegal transition.
  */
 
 import { randomUUID } from "node:crypto";
@@ -84,6 +88,20 @@ export type WorkerLog = (message: string, level?: 'warn' | 'error') => void;
 export interface RailObservation {
   finder: TransactionFinder;
   mapper: TransactionMapper;
+  /** Finds a headless row's transaction. Absent, the rail's headless rows cannot be observed. */
+  headlessFinder?: TransactionFinder;
+}
+
+/**
+ * A finder's answer that this record cannot be looked up, while the rail itself may be fine: a
+ * headless row whose stored customer is gone, say. It does not count towards the failure ceiling,
+ * and the row concludes at its deadline as one that could not be asked.
+ */
+export class UnobservableRecord extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnobservableRecord';
+  }
 }
 
 /**
@@ -105,7 +123,7 @@ const FAILURE_CEILING = 3;
  * than being retried for ever.
  */
 export async function tick(
-  store: Pick<FundingStore, 'claim' | 'release' | 'update' | 'pruneRefusals'>,
+  store: Pick<FundingStore, 'claim' | 'release' | 'update' | 'advanceTo' | 'pruneRefusals'>,
   now: number,
   observations: Readonly<Partial<Record<RailName, RailObservation>>>,
   sessionMaxAgeMs: number,
@@ -159,7 +177,7 @@ export async function tick(
         const done = await advanceOne(
           record,
           now,
-          observations[record.rail],
+          observationFor(record, observations[record.rail]),
           log,
           !askingRail,
           sessionMaxAgeMs,
@@ -180,13 +198,17 @@ export async function tick(
 
         // `discovered` is populated only on the path that observed a new transaction; every other
         // advance writes just the state, and `store.update` preserves the existing provider facts.
-        const refreshed = await store.update(record.id, done.state, now, {
-          ...done.discovered,
-          // Names the lease. A zero-row write means the lease expired and another worker took the
-          // row, so `refreshed` is undefined and this tick counts nothing; reporting someone
-          // else's advance as this worker's own would double-count and hide the overlap.
-          claimedBy: lease.workerId,
-        });
+        const refreshed =
+          record.integration_mode === 'headless'
+            ? await advanceHeadless(store, record.id, done, now, lease.workerId)
+            : await store.update(record.id, done.state, now, {
+                ...done.discovered,
+                // Names the lease. A zero-row write means the lease expired and another worker took
+                // the row, so `refreshed` is undefined and this tick counts nothing; reporting
+                // someone else's advance as this worker's own would double-count and hide the
+                // overlap.
+                claimedBy: lease.workerId,
+              });
         // A deposit-address disclosure conflict does not throw any more (`mergeDeposit` records
         // it and lets an unrelated, legitimate transition through beside it, see `merge.ts`), so
         // it needs its own alarm here or it would be invisible: no error, no failed write, just a
@@ -307,6 +329,37 @@ async function prune(
   }
 }
 
+/**
+ * The observation a record is read through. A headless row is found by its Meld customer and
+ * order, not by the reference a widget session was filed under, so only the rail's headless
+ * finder can read it.
+ */
+function observationFor(record: FundingRecord, obs: RailObservation | undefined): RailObservation | undefined {
+  if (obs === undefined || record.integration_mode !== 'headless') return obs;
+  return obs.headlessFinder === undefined ? undefined : { finder: obs.headlessFinder, mapper: obs.mapper };
+}
+
+/**
+ * Write a headless row's advance under the lease, planned against the row as it now stands. A row
+ * a webhook already moved there, or past it, is left alone. `undefined` when nothing was written.
+ */
+async function advanceHeadless(
+  store: Pick<FundingStore, 'advanceTo'>,
+  id: string,
+  advance: Advance,
+  now: number,
+  claimedBy: string,
+): Promise<FundingRecord | undefined> {
+  const { discovered } = advance;
+  const result = await store.advanceTo(id, advance.state, now, {
+    claimedBy,
+    ...(discovered === undefined
+      ? {}
+      : { providerTransactionId: discovered.providerTransactionId, providerStatus: discovered.providerStatus }),
+  });
+  return result === undefined || result.record.status === result.from ? undefined : result.record;
+}
+
 /** One worker's identity and the bounds on what it may hold at a time. */
 export interface Lease {
   /** Distinguishes this worker from another replica's. Stable for the process's lifetime. */
@@ -366,9 +419,16 @@ interface Advance {
  * thing, so nothing changes here; it is recorded because a sell waiting for an on-chain deposit
  * is bounded by `session_max_age_ms` alone, and that one number decides how long this service
  * keeps looking for a seller's money.
+ *
+ * A headless order has no session expiry. A bank order can be paid until its transfer details
+ * lapse, so their `expiresAt` extends the window the same way; a card order has the window alone.
  */
 function deadlineFor(record: FundingRecord, sessionMaxAgeMs: number): number {
-  return Math.max(record.expires_at ?? 0, record.created_at + sessionMaxAgeMs);
+  return Math.max(
+    record.expires_at ?? 0,
+    record.payment_instructions?.expiresAt ?? 0,
+    record.created_at + sessionMaxAgeMs,
+  );
 }
 
 /**
@@ -459,7 +519,8 @@ async function advanceOne(
         );
         return { state: 'unobserved' };
       }
-      throw cause;
+      reportUnobservable(cause, record, log);
+      return undefined;
     }
     if (txn !== undefined) {
       // A payment was observed: capture the transaction and its status for a later conclusion,
@@ -543,7 +604,13 @@ async function advanceOne(
       `no transaction observation wired for rail "${record.rail}"`,
     );
 
-  const txn = await obs.finder(record);
+  let txn: TransactionObservation | undefined;
+  try {
+    txn = await obs.finder(record);
+  } catch (cause) {
+    reportUnobservable(cause, record, log);
+    return undefined;
+  }
   const status = txn?.status ?? record.provider_status;
   const state = obs.mapper(status ?? undefined);
   // A deposit is a fact about a live order: one riding on the move that concludes it is not
@@ -567,6 +634,12 @@ async function advanceOne(
             : {}),
         },
       };
+}
+
+/** Reports a record its finder cannot look up, which waits for its deadline; rethrows anything else. */
+function reportUnobservable(cause: unknown, record: FundingRecord, log: WorkerLog): void {
+  if (!(cause instanceof UnobservableRecord)) throw cause;
+  log(`funding worker cannot observe ${record.id}: ${cause.message}`);
 }
 
 /**
@@ -643,7 +716,7 @@ function depositIsNew(record: FundingRecord, deposit: RailDeposit): boolean {
  * `IllegalTransition` slips through a read-modify-write gap.
  */
 export function startWorker(
-  store: Pick<FundingStore, 'claim' | 'release' | 'update' | 'pruneRefusals'>,
+  store: Pick<FundingStore, 'claim' | 'release' | 'update' | 'advanceTo' | 'pruneRefusals'>,
   intervalMs: number,
   observations: Readonly<Partial<Record<RailName, RailObservation>>>,
   sessionMaxAgeMs: number,
