@@ -18,7 +18,7 @@ a service that runs in production with a development posture. See
 | `server.trusted_proxy_cidrs` | Which peers may set `X-Forwarded-For`, as CIDRs or bare addresses. Empty by default, which reads no forwarded header and buckets every caller on the socket address. Decides whether the address-keyed rate limit (the handshake routes, and any caller with no proven person behind them) is per caller or per service. Replaced `trusted_proxy_hops`: a hop count cannot validate the immediate peer, so on its own it trusted whoever connected. See below. |
 | `meld.base_url` | Travels in the same object as the key reference, so a sandbox key cannot be paired with the production endpoint by editing one field. |
 | `meld.api_key` | `{ "mode": "file", "path": ... }` or `{ "mode": "env", "var": ... }`. |
-| `meld.api_version` | Sent as `Meld-Version` on every call. Required; Meld pins behaviour to it. |
+| `meld.api_version` | Sent as `Meld-Version` on every call except the headless ones, which send `meld.headless.api_version`. Required; Meld pins behaviour to it. |
 | `meld.timeout_ms` | 500 to 30000, default 8000. |
 | `meld.discovery_scope` | `account` (default) reads the corridor catalog with the key, so only providers this account has enabled appear. `global` reads it unkeyed and is correct only where the account has every provider enabled: a mismatch advertises corridors the quote will then refuse. |
 | `meld.countries_cache_ttl_ms` | How long the country catalog (`supported/countries`) stays fresh. 60000 to 604800000, default 21600000 (6h). Meld's caching guide calls this endpoint rarely-changing and permits up to a week; the default stays under `supported.catalog_interval_ms` so the refresh pass is never served its own cached copy. |

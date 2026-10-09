@@ -80,7 +80,13 @@ export async function start(
   const cfg = await loadConfig(configPath);
   const apiKey = await resolveSecret(cfg.meld.api_key);
 
-  const meld = new MeldClient(cfg.meld.base_url, apiKey, cfg.meld.api_version, cfg.meld.timeout_ms);
+  const meld = new MeldClient(
+    cfg.meld.base_url,
+    apiKey,
+    cfg.meld.api_version,
+    cfg.meld.timeout_ms,
+    cfg.meld.headless?.api_version,
+  );
   const meldRail = new MeldRail(meld);
 
   // Live capability discovery over Meld's route catalog. Reading it at runtime is what makes the

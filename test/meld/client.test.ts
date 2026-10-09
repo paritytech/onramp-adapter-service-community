@@ -1294,3 +1294,382 @@ describe('discovery reads', () => {
     expect(body).toEqual({ ok: true });
   });
 });
+
+const HEADLESS_VERSION = '2026-05-01';
+const headless = () =>
+  new MeldClient('https://api-sb.meld.io', new Secret(KEY), VERSION, 1_000, HEADLESS_VERSION);
+const sentHeaders = (fn: ReturnType<typeof stub>) => sentInit(fn).headers as Record<string, string>;
+
+const customer = {
+  id: 'WmYYgvN8ukpV62N3m4u3ee',
+  externalId: 'ext-1',
+  status: 'ACTIVE',
+  serviceProviderCustomers: [
+    { id: 'spc-1', serviceProvider: 'SUMSUB', kyc: { status: 'APPROVED', additionalInfo: null } },
+    {
+      id: 'spc-2',
+      serviceProvider: 'BANXA',
+      kyc: { status: 'PENDING', additionalInfo: { HostedURL: 'https://banxa.example/kyc/abc' } },
+    },
+  ],
+  addresses: [],
+};
+
+const newCustomer = {
+  externalId: 'ext-1',
+  name: { firstName: 'Ada', lastName: 'Lovelace' },
+  email: 'ada@example.com',
+  dateOfBirth: '1990-03-15',
+};
+
+const kycSession = {
+  customerId: customer.id,
+  serviceProvider: 'SUMSUB',
+  status: 'PENDING',
+  url: 'https://sumsub.example/v/1',
+};
+
+const requirementsQuery = {
+  paymentMethodType: 'CREDIT_DEBIT_CARD',
+  sourceCurrencyCode: 'EUR',
+  sourceAmount: '100.00',
+  destinationCurrencyCode: 'USDC',
+  countryCode: 'DE',
+};
+
+describe('the transport options', () => {
+  it('keeps the default version and sends no idempotency key on the existing calls', async () => {
+    const fetchMock = stub(200, { quotes: [] });
+    await headless().quote(probe());
+
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(VERSION);
+    expect(sentHeaders(fetchMock)).not.toHaveProperty('X-Idempotency-Key');
+  });
+
+  it('sends X-Idempotency-Key when one is given', async () => {
+    const fetchMock = stub(200, {});
+    type Transport = {
+      send(method: 'POST', path: string, body: unknown, options: { idempotencyKey: string }): Promise<unknown>;
+    };
+    await (headless() as unknown as Transport).send('POST', '/x', {}, { idempotencyKey: 'funding-1' });
+
+    expect(sentHeaders(fetchMock)['X-Idempotency-Key']).toBe('funding-1');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(VERSION);
+  });
+
+  it('refuses a headless call when no headless version is configured, without sending it', async () => {
+    const fetchMock = stub(200, customer);
+
+    await expect(client().getCustomer('c-1')).rejects.toThrow(/meld\.headless\.api_version/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the request body out of a transport error', async () => {
+    stubNetworkFailure('ECONNRESET');
+    const error = (await headless()
+      .createCustomer(newCustomer)
+      .catch((e: unknown) => e)) as Error;
+
+    expect(error.message).toContain('ECONNRESET');
+    expect(error.message).not.toContain('ada@example.com');
+    expect(error.message).not.toContain('Lovelace');
+    expect(error.message).not.toContain('1990-03-15');
+  });
+});
+
+describe('createCustomer', () => {
+  it('POSTs an individual with the headless version and the key', async () => {
+    const fetchMock = stub(200, customer);
+    await headless().createCustomer(newCustomer);
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/accounts/customers');
+    expect(sentMethod(fetchMock)).toBe('POST');
+    expect(sentHeaders(fetchMock)).toMatchObject({
+      authorization: `BASIC ${KEY}`,
+      'Meld-Version': HEADLESS_VERSION,
+      'content-type': 'application/json',
+    });
+    expect(sentBody(fetchMock)).toEqual({ ...newCustomer, type: 'INDIVIDUAL' });
+  });
+
+  it('returns the customer with its provider KYC records', async () => {
+    stub(200, customer);
+    const created = await headless().createCustomer(newCustomer);
+
+    expect(created.id).toBe(customer.id);
+    expect(created.serviceProviderCustomers?.[1]?.kyc?.additionalInfo?.HostedURL).toBe(
+      'https://banxa.example/kyc/abc',
+    );
+  });
+
+  it('refuses a customer without an id', async () => {
+    stub(200, { status: 'ACTIVE' });
+    await expect(headless().createCustomer(newCustomer)).rejects.toThrow(/unreadable customer/);
+  });
+});
+
+describe('getCustomer', () => {
+  it('GETs the customer by its encoded id, with no body', async () => {
+    const fetchMock = stub(200, customer);
+    await headless().getCustomer('a/b c');
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/accounts/customers/a%2Fb%20c');
+    expect(sentMethod(fetchMock)).toBe('GET');
+    expect(sentInit(fetchMock).body).toBeUndefined();
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+  });
+
+  it('reads a 404 as a customer Meld does not know', async () => {
+    stub(404, { code: 'NOT_FOUND' });
+    await expect(headless().getCustomer('c-1')).resolves.toBeUndefined();
+  });
+
+  it('passes any other error through', async () => {
+    stub(500, { code: 'SERVICE_PROVIDER_ERROR' });
+    await expect(headless().getCustomer('c-1')).rejects.toBeInstanceOf(MeldHttpError);
+  });
+
+  it('keeps a KYC status it does not know rather than failing the read', async () => {
+    stub(200, {
+      id: 'c-1',
+      serviceProviderCustomers: [{ serviceProvider: 'SUMSUB', kyc: { status: 'ON_HOLD' } }],
+    });
+    const found = await headless().getCustomer('c-1');
+
+    expect(found?.serviceProviderCustomers?.[0]?.kyc?.status).toBe('ON_HOLD');
+  });
+
+  it('refuses a provider questionnaire link that is not https', async () => {
+    stub(200, {
+      id: 'c-1',
+      serviceProviderCustomers: [
+        {
+          serviceProvider: 'BANXA',
+          kyc: { status: 'PENDING', additionalInfo: { HostedURL: 'javascript:alert(1)' } },
+        },
+      ],
+    });
+    await expect(headless().getCustomer('c-1')).rejects.toThrow(/unreadable customer/);
+  });
+});
+
+describe('patchCustomer', () => {
+  it('PATCHes only the fields given', async () => {
+    const fetchMock = stub(200, customer);
+    await headless().patchCustomer('c-1', { email: 'ada@example.org' });
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/accounts/customers/c-1');
+    expect(sentMethod(fetchMock)).toBe('PATCH');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+    expect(sentBody(fetchMock)).toEqual({ email: 'ada@example.org' });
+  });
+});
+
+describe('addCustomerAddress', () => {
+  it('POSTs a residence address and returns its id', async () => {
+    const fetchMock = stub(200, { id: 'addr-1', customerId: 'c-1', type: 'RESIDENCE', status: 'ACTIVE' });
+    const address = await headless().addCustomerAddress('c-1', {
+      lineOne: '1 Main St',
+      city: 'Berlin',
+      region: 'BE',
+      postalCode: '10115',
+      countryCode: 'DE',
+    });
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/accounts/customers/c-1/addresses');
+    expect(sentMethod(fetchMock)).toBe('POST');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+    expect(sentBody(fetchMock)).toEqual({
+      type: 'RESIDENCE',
+      address: { lineOne: '1 Main St', city: 'Berlin', region: 'BE', countryCode: 'DE', postalCode: '10115' },
+    });
+    expect(address.id).toBe('addr-1');
+  });
+});
+
+describe('initiateKyc', () => {
+  const request = { serviceProvider: 'SUMSUB', mode: 'HOSTED_URL', kycShareProviders: ['BANXA'] } as const;
+
+  it('POSTs the KYC request and returns the hosted URL', async () => {
+    const fetchMock = stub(200, kycSession);
+    const started = await headless().initiateKyc('c-1', request);
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/accounts/customers/c-1/kyc/initiate');
+    expect(sentMethod(fetchMock)).toBe('POST');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+    expect(sentBody(fetchMock)).toEqual({
+      serviceProvider: 'SUMSUB',
+      mode: 'HOSTED_URL',
+      kycShareProviders: ['BANXA'],
+    });
+    expect(started).toEqual({ outcome: 'started', session: kycSession });
+  });
+
+  it('reads a 409 as KYC already started, for the caller to re-issue with PATCH', async () => {
+    stub(409, { code: 'CONFLICT' });
+    await expect(headless().initiateKyc('c-1', request)).resolves.toEqual({ outcome: 'already_shared' });
+  });
+
+  it('passes a 404 through rather than reading it as a conflict', async () => {
+    stub(404, { code: 'NOT_FOUND' });
+    await expect(headless().initiateKyc('c-1', request)).rejects.toBeInstanceOf(MeldHttpError);
+  });
+
+  it('refuses a KYC URL that is not https, since the app frames it', async () => {
+    stub(200, { ...kycSession, url: 'http://sumsub.example/v/1' });
+    await expect(headless().initiateKyc('c-1', request)).rejects.toThrow(/unreadable KYC session/);
+  });
+});
+
+describe('refreshKyc', () => {
+  it('PATCHes the same path, carrying provider fields as serviceProviderDetails', async () => {
+    const fetchMock = stub(200, kycSession);
+    const session = await headless().refreshKyc('c-1', {
+      serviceProvider: 'SUMSUB',
+      mode: 'HOSTED_URL',
+      serviceProviderDetails: { occupation: 'ENGINEER' },
+    });
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/accounts/customers/c-1/kyc/initiate');
+    expect(sentMethod(fetchMock)).toBe('PATCH');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+    expect(sentBody(fetchMock)).toEqual({
+      serviceProvider: 'SUMSUB',
+      mode: 'HOSTED_URL',
+      serviceProviderDetails: { occupation: 'ENGINEER' },
+    });
+    expect(session.url).toBe(kycSession.url);
+  });
+});
+
+describe('requirements', () => {
+  const answer = {
+    serviceProvider: 'BANXA',
+    legalAgreements: [{ type: 'TERMS_OF_SERVICE', url: 'https://banxa.example/terms', region: 'EU' }],
+    verificationRequirements: {
+      email: { required: true },
+      phone: { required: true, reverifyWithinDays: 180, requireLineType: 'MOBILE' },
+      enforced: true,
+    },
+    customerStatus: { email: { satisfied: true }, phone: { satisfied: false, reason: 'MISSING' } },
+    kycRequirements: [
+      { code: 'MELD_KYC_APPROVED', status: 'SATISFIED' },
+      { code: 'PROVIDER_EXTRA_KYC', status: 'REQUIRED', missingFields: ['occupation'] },
+    ],
+  };
+
+  it('GETs the encoded provider path with the order as the query', async () => {
+    const fetchMock = stub(200, answer);
+    await headless().requirements('BAN XA', { ...requirementsQuery, customerId: 'c/1', subdivision: 'US-CA' });
+
+    const url = new URL(sentUrl(fetchMock));
+    expect(url.pathname).toBe('/crypto/onramp/BAN%20XA/requirements');
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      ...requirementsQuery,
+      customerId: 'c/1',
+      subdivision: 'US-CA',
+    });
+    expect(sentMethod(fetchMock)).toBe('GET');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+  });
+
+  it('omits the parameters not given, so base agreements need no customer', async () => {
+    const fetchMock = stub(200, { legalAgreements: [] });
+    await headless().requirements('BANXA', requirementsQuery);
+
+    expect([...new URL(sentUrl(fetchMock)).searchParams.keys()]).toEqual(Object.keys(requirementsQuery));
+  });
+
+  it('reads agreements, contact verification and KYC requirements', async () => {
+    stub(200, answer);
+    const read = await headless().requirements('BANXA', requirementsQuery);
+
+    expect(read.legalAgreements?.[0]?.url).toBe('https://banxa.example/terms');
+    expect(read.verificationRequirements?.phone?.required).toBe(true);
+    expect(read.customerStatus?.phone).toEqual({ satisfied: false, reason: 'MISSING' });
+    expect(read.kycRequirements?.[1]?.missingFields).toEqual(['occupation']);
+  });
+
+  it('refuses an agreement link that is not https', async () => {
+    stub(200, { legalAgreements: [{ type: 'TERMS_OF_SERVICE', url: 'javascript:alert(1)' }] });
+    await expect(headless().requirements('BANXA', requirementsQuery)).rejects.toThrow(
+      /unreadable requirements/,
+    );
+  });
+});
+
+describe('startVerification', () => {
+  const verification = {
+    verificationId: 'v-1',
+    channel: 'EMAIL',
+    target: 'a•••@example.com',
+    status: 'PENDING',
+    expiresAt: '2026-08-25T02:57:26Z',
+    resendAvailableAt: '2026-08-25T02:47:56Z',
+  };
+  const phone = { channel: 'PHONE', target: '+14155550123' } as const;
+
+  it('POSTs the channel and target and returns the pending verification', async () => {
+    const fetchMock = stub(200, verification);
+    const started = await headless().startVerification('c-1', { channel: 'EMAIL', target: 'ada@example.com' });
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/accounts/customers/c-1/verifications');
+    expect(sentMethod(fetchMock)).toBe('POST');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+    expect(sentBody(fetchMock)).toEqual({ channel: 'EMAIL', target: 'ada@example.com' });
+    expect(started).toEqual({ outcome: 'sent', verification });
+  });
+
+  it('reads a 429 carrying resendAvailableAt as a cooldown', async () => {
+    stub(429, { code: 'TOO_MANY_REQUESTS', resendAvailableAt: '2026-08-25T02:47:56Z' });
+    await expect(headless().startVerification('c-1', phone)).resolves.toEqual({
+      outcome: 'cooldown',
+      resendAvailableAt: '2026-08-25T02:47:56Z',
+    });
+  });
+
+  it('reads a null resendAvailableAt as the hard cap', async () => {
+    stub(429, { code: 'TOO_MANY_REQUESTS', resendAvailableAt: null });
+    await expect(headless().startVerification('c-1', phone)).resolves.toEqual({
+      outcome: 'cooldown',
+      resendAvailableAt: null,
+    });
+  });
+
+  it('passes a 429 without resendAvailableAt through as a plain throttle', async () => {
+    stub(429, { code: 'TOO_MANY_REQUESTS' });
+    const error = await headless()
+      .startVerification('c-1', { channel: 'EMAIL', target: 'ada@example.com' })
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(MeldHttpError);
+    expect((error as MeldHttpError).resendAvailableAt).toBeUndefined();
+  });
+});
+
+describe('confirmVerification', () => {
+  it('POSTs the code to the encoded verification path', async () => {
+    const fetchMock = stub(200, { verificationId: 'v/1', status: 'VERIFIED', verifiedAt: '2026-08-25T02:50:00Z' });
+    const result = await headless().confirmVerification('c-1', 'v/1', '316856');
+
+    expect(new URL(sentUrl(fetchMock)).pathname).toBe('/accounts/customers/c-1/verifications/v%2F1/confirm');
+    expect(sentMethod(fetchMock)).toBe('POST');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+    expect(sentBody(fetchMock)).toEqual({ code: '316856' });
+    expect(result.status).toBe('VERIFIED');
+  });
+
+  it('reads FAILED with the attempts left as a number', async () => {
+    stubRaw(200, '{"verificationId":"v-1","status":"FAILED","attemptsRemaining":2}');
+    const result = await headless().confirmVerification('c-1', 'v-1', '000000');
+
+    expect(result).toMatchObject({ status: 'FAILED', attemptsRemaining: 2 });
+  });
+
+  it('refuses a status it cannot act on', async () => {
+    stub(200, { verificationId: 'v-1', status: 'PENDING' });
+    await expect(headless().confirmVerification('c-1', 'v-1', '316856')).rejects.toThrow(
+      /unreadable verification result/,
+    );
+  });
+});

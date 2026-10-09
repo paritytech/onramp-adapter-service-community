@@ -1,7 +1,7 @@
 /**
  * The only module that reads the API key.
  *
- * Three authenticated calls a browser cannot make itself, plus `authedGet` for the discovery
+ * The authenticated calls a browser cannot make itself, plus `authedGet` for the discovery
  * layer (`meld/discovery.ts`). Meld's `/network-partner/supported/*` endpoints answer without a
  * key, but a keyed call scopes them to this account's enabled providers (the same set the quote
  * endpoint prices), so the region catalog and the quote agree instead of the catalog advertising
@@ -147,6 +147,8 @@ export class MeldHttpError extends Error {
     readonly code?: string,
     readonly detail?: string,
     readonly providerDetail?: string,
+    /** A verification cooldown's end, when the body carries the key; `null` is Meld's hard cap. */
+    readonly resendAvailableAt?: string | null,
   ) {
     super(`Meld answered HTTP ${String(status)}.`);
     this.name = 'MeldHttpError';
@@ -414,6 +416,192 @@ const TRANSACTION_NOT_YET_CREATED = 'TRANSACTION_FETCH_BY_SESSION_NOT_YET_CREATE
 const transactionBySessionPath = (sessionId: string) =>
   `/payments/transactions/sessions/${encodeURIComponent(sessionId)}`;
 
+// --- headless customer ------------------------------------------------------
+
+const CUSTOMERS = '/accounts/customers';
+const customerPath = (id: string) => `${CUSTOMERS}/${encodeURIComponent(id)}`;
+const kycPath = (id: string) => `${customerPath(id)}/kyc/initiate`;
+const verificationsPath = (id: string) => `${customerPath(id)}/verifications`;
+const requirementsPath = (provider: string) => `/crypto/onramp/${encodeURIComponent(provider)}/requirements`;
+
+/** A URL the app opens or links to. Anything but https is refused before it can become a frame. */
+const httpsUrl = z.url({ protocol: /^https$/ });
+
+/**
+ * Statuses stay strings: Meld documents example values, not the full enum, and an unknown one
+ * must reach the caller as "not approved" rather than fail the whole read.
+ */
+const customerResponse = z
+  .object({
+    id: z.string().min(1),
+    externalId: z.string().nullish(),
+    status: z.string().nullish(),
+    serviceProviderCustomers: z
+      .array(
+        z
+          .object({
+            serviceProvider: z.string().min(1),
+            kyc: z
+              .object({
+                status: z.string().nullish(),
+                // PascalCase is Meld's spelling.
+                additionalInfo: z.object({ HostedURL: httpsUrl.nullish() }).loose().nullish(),
+              })
+              .loose()
+              .nullish(),
+          })
+          .loose(),
+      )
+      .nullish(),
+  })
+  .loose();
+
+export type MeldCustomer = z.infer<typeof customerResponse>;
+
+const addressResponse = z.object({ id: z.string().min(1), status: z.string().nullish() }).loose();
+
+export type MeldCustomerAddress = z.infer<typeof addressResponse>;
+
+const kycSessionResponse = z
+  .object({
+    customerId: z.string().nullish(),
+    serviceProvider: z.string().nullish(),
+    status: z.string().nullish(),
+    url: httpsUrl.nullish(),
+  })
+  .loose();
+
+export type MeldKycSession = z.infer<typeof kycSessionResponse>;
+
+const channelRequirement = z.object({ required: z.boolean().nullish() }).loose();
+const channelStatus = z.object({ satisfied: z.boolean().nullish(), reason: z.string().nullish() }).loose();
+
+const requirementsResponse = z
+  .object({
+    serviceProvider: z.string().nullish(),
+    legalAgreements: z
+      .array(z.object({ type: z.string().min(1), url: httpsUrl, region: z.string().nullish() }).loose())
+      .nullish(),
+    verificationRequirements: z
+      .object({
+        email: channelRequirement.nullish(),
+        phone: channelRequirement.nullish(),
+        enforced: z.boolean().nullish(),
+      })
+      .loose()
+      .nullish(),
+    customerStatus: z
+      .object({ email: channelStatus.nullish(), phone: channelStatus.nullish() })
+      .loose()
+      .nullish(),
+    kycRequirements: z
+      .array(
+        z
+          .object({
+            code: z.string().min(1),
+            status: z.string().min(1),
+            missingFields: z.array(z.string()).nullish(),
+          })
+          .loose(),
+      )
+      .nullish(),
+  })
+  .loose();
+
+export type MeldRequirements = z.infer<typeof requirementsResponse>;
+
+const verificationResponse = z
+  .object({
+    verificationId: z.string().min(1),
+    status: z.string().nullish(),
+    expiresAt: z.string().nullish(),
+    resendAvailableAt: z.string().nullish(),
+  })
+  .loose();
+
+export type MeldVerification = z.infer<typeof verificationResponse>;
+
+const confirmationResponse = z
+  .object({
+    verificationId: z.string().nullish(),
+    status: z.enum(['VERIFIED', 'FAILED']),
+    verifiedAt: z.string().nullish(),
+    // `parseExact` keeps a JSON number as its text.
+    attemptsRemaining: z.string().regex(/^\d{1,6}$/).transform(Number).nullish(),
+  })
+  .loose();
+
+export type MeldVerificationResult = z.infer<typeof confirmationResponse>;
+
+/** `POST /accounts/customers`. `type` is always `INDIVIDUAL` and is set by the client. */
+export interface NewCustomer {
+  externalId: string;
+  name: { firstName: string; lastName: string };
+  email: string;
+  /** `YYYY-MM-DD`. */
+  dateOfBirth: string;
+}
+
+/** `PATCH /accounts/customers/{id}`. Changing either clears that channel's verified state at Meld. */
+export interface CustomerPatch {
+  email?: string;
+  phone?: string;
+}
+
+/** The `address` of `POST /accounts/customers/{id}/addresses`; filed as `RESIDENCE`. */
+export interface CustomerAddress {
+  firstName?: string;
+  lastName?: string;
+  lineOne: string;
+  lineTwo?: string;
+  city: string;
+  region?: string;
+  postalCode: string;
+  countryCode: string;
+}
+
+/** The body of `POST` and `PATCH /accounts/customers/{id}/kyc/initiate`. */
+export interface KycRequest {
+  serviceProvider: string;
+  mode: 'HOSTED_URL' | 'TOKEN_IMPORT';
+  kycShareProviders?: readonly string[];
+  serviceProviderDetails?: Readonly<Record<string, string>>;
+}
+
+/** `GET /crypto/onramp/{provider}/requirements`. Without `customerId` only the base agreements apply. */
+export interface RequirementsQuery {
+  customerId?: string;
+  paymentMethodType: string;
+  sourceCurrencyCode: string;
+  sourceAmount: string;
+  destinationCurrencyCode: string;
+  countryCode: string;
+  destinationNetworkCode?: string;
+  subdivision?: string;
+}
+
+export interface VerificationRequest {
+  channel: 'EMAIL' | 'PHONE';
+  /** An email address, or an E.164 phone number. */
+  target: string;
+}
+
+/** A `409` on initiate: KYC was already started or shared, and a fresh URL takes the `PATCH`. */
+export type KycStart = { outcome: 'started'; session: MeldKycSession } | { outcome: 'already_shared' };
+
+/** A `429` carrying `resendAvailableAt` is a cooldown or the daily cap (`null`), not an outage. */
+export type VerificationStart =
+  | { outcome: 'sent'; verification: MeldVerification }
+  | { outcome: 'cooldown'; resendAvailableAt: string | null };
+
+interface SendOptions {
+  /** `Meld-Version` for this call. The client's `api_version` when absent. */
+  version?: string;
+  idempotencyKey?: string;
+  /** `false` omits the key; see `publicGet`. */
+  authed?: boolean;
+}
+
 // --- client -----------------------------------------------------------------
 
 export class MeldClient {
@@ -422,6 +610,7 @@ export class MeldClient {
     private readonly apiKey: Secret,
     private readonly apiVersion: string,
     private readonly timeoutMs: number,
+    private readonly headlessApiVersion?: string,
   ) {}
 
   /**
@@ -440,7 +629,7 @@ export class MeldClient {
    * `authedGet`, or the catalog advertises corridors the quote would refuse.
    */
   async publicGet(path: string): Promise<unknown> {
-    return this.send('GET', path, undefined, false);
+    return this.send('GET', path, undefined, { authed: false });
   }
 
   /**
@@ -746,6 +935,146 @@ export class MeldClient {
   }
 
   /**
+   * Meld documents this as "create, or retrieve by external id", so a repeated `externalId` may
+   * answer with the existing customer rather than a second one.
+   */
+  async createCustomer(customer: NewCustomer): Promise<MeldCustomer> {
+    const body = await this.send(
+      'POST',
+      CUSTOMERS,
+      {
+        externalId: customer.externalId,
+        name: { firstName: customer.name.firstName, lastName: customer.name.lastName },
+        email: customer.email,
+        dateOfBirth: customer.dateOfBirth,
+        type: 'INDIVIDUAL',
+      },
+      this.headless(),
+    );
+    return this.read(customerResponse, body, 'customer');
+  }
+
+  /** The customer, or nothing when Meld no longer knows the id. */
+  async getCustomer(id: string): Promise<MeldCustomer | undefined> {
+    let body: unknown;
+    try {
+      body = await this.send('GET', customerPath(id), undefined, this.headless());
+    } catch (error) {
+      if (error instanceof MeldHttpError && error.status === 404) return undefined;
+      throw error;
+    }
+    return this.read(customerResponse, body, 'customer');
+  }
+
+  async patchCustomer(id: string, patch: CustomerPatch): Promise<MeldCustomer> {
+    const body = await this.send(
+      'PATCH',
+      customerPath(id),
+      { email: patch.email, phone: patch.phone },
+      this.headless(),
+    );
+    return this.read(customerResponse, body, 'customer');
+  }
+
+  async addCustomerAddress(id: string, address: CustomerAddress): Promise<MeldCustomerAddress> {
+    const body = await this.send(
+      'POST',
+      `${customerPath(id)}/addresses`,
+      {
+        type: 'RESIDENCE',
+        address: {
+          firstName: address.firstName,
+          lastName: address.lastName,
+          lineOne: address.lineOne,
+          lineTwo: address.lineTwo,
+          city: address.city,
+          region: address.region,
+          countryCode: address.countryCode,
+          postalCode: address.postalCode,
+        },
+      },
+      this.headless(),
+    );
+    return this.read(addressResponse, body, 'customer address');
+  }
+
+  /** Starts Unified KYC. A `409` means it was already started or shared: `refreshKyc` re-issues it. */
+  async initiateKyc(id: string, request: KycRequest): Promise<KycStart> {
+    let body: unknown;
+    try {
+      body = await this.send('POST', kycPath(id), kycBody(request), this.headless());
+    } catch (error) {
+      if (error instanceof MeldHttpError && error.status === 409) return { outcome: 'already_shared' };
+      throw error;
+    }
+    return { outcome: 'started', session: this.read(kycSessionResponse, body, 'KYC session') };
+  }
+
+  /** A fresh URL for an existing KYC session, and the carrier for provider `missingFields`. */
+  async refreshKyc(id: string, request: KycRequest): Promise<MeldKycSession> {
+    const body = await this.send('PATCH', kycPath(id), kycBody(request), this.headless());
+    return this.read(kycSessionResponse, body, 'KYC session');
+  }
+
+  async requirements(provider: string, query: RequirementsQuery): Promise<MeldRequirements> {
+    const entries: [string, string | undefined][] = [
+      ['customerId', query.customerId],
+      ['paymentMethodType', query.paymentMethodType],
+      ['sourceCurrencyCode', query.sourceCurrencyCode],
+      ['sourceAmount', query.sourceAmount],
+      ['destinationCurrencyCode', query.destinationCurrencyCode],
+      ['countryCode', query.countryCode],
+      ['destinationNetworkCode', query.destinationNetworkCode],
+      ['subdivision', query.subdivision],
+    ];
+    const search = new URLSearchParams(
+      entries.filter((entry): entry is [string, string] => entry[1] !== undefined),
+    );
+    const path = `${requirementsPath(provider)}?${search.toString()}`;
+    const body = await this.send('GET', path, undefined, this.headless());
+    return this.read(requirementsResponse, body, 'requirements');
+  }
+
+  /** Sends a code. During a cooldown Meld may instead answer `200` with the pending verification. */
+  async startVerification(id: string, request: VerificationRequest): Promise<VerificationStart> {
+    let body: unknown;
+    try {
+      body = await this.send(
+        'POST',
+        verificationsPath(id),
+        { channel: request.channel, target: request.target },
+        this.headless(),
+      );
+    } catch (error) {
+      if (
+        error instanceof MeldHttpError &&
+        error.status === 429 &&
+        error.code === 'TOO_MANY_REQUESTS' &&
+        error.resendAvailableAt !== undefined
+      ) {
+        return { outcome: 'cooldown', resendAvailableAt: error.resendAvailableAt };
+      }
+      throw error;
+    }
+    return { outcome: 'sent', verification: this.read(verificationResponse, body, 'verification') };
+  }
+
+  /** `FAILED` is an answer, not an error status. An expired verification is Meld's `400`. */
+  async confirmVerification(
+    id: string,
+    verificationId: string,
+    code: string,
+  ): Promise<MeldVerificationResult> {
+    const body = await this.send(
+      'POST',
+      `${verificationsPath(id)}/${encodeURIComponent(verificationId)}/confirm`,
+      { code },
+      this.headless(),
+    );
+    return this.read(confirmationResponse, body, 'verification result');
+  }
+
+  /**
    * Prove at boot that the key works and the endpoints are real.
    *
    * A quote is the cheapest authenticated call that exercises a path the service depends on, and it
@@ -754,6 +1083,14 @@ export class MeldClient {
    */
   async verifyCredentials(probe: QuoteParams): Promise<number> {
     return (await this.quote(probe)).length;
+  }
+
+  /** A fault, not a refusal: the headless routes exist only where the version is configured. */
+  private headless(): SendOptions {
+    if (this.headlessApiVersion === undefined) {
+      throw new Error('Meld headless call without meld.headless.api_version configured.');
+    }
+    return { version: this.headlessApiVersion };
   }
 
   /** One place where an unreadable upstream body becomes an upstream failure. */
@@ -766,12 +1103,12 @@ export class MeldClient {
   }
 
   private async send(
-    method: 'GET' | 'POST',
+    method: 'GET' | 'POST' | 'PATCH',
     path: string,
     payload?: unknown,
-    // Discovery's `publicGet` sends `false` to omit the key: the same endpoint returns the global
-    // provider set unkeyed and this account's set keyed, and a deployment may want either.
-    authed = true,
+    // Discovery's `publicGet` sends `authed: false` to omit the key: the same endpoint returns the
+    // global provider set unkeyed and this account's set keyed, and a deployment may want either.
+    { version = this.apiVersion, idempotencyKey, authed = true }: SendOptions = {},
   ): Promise<unknown> {
     let response: Response;
     try {
@@ -781,9 +1118,10 @@ export class MeldClient {
           // The literal word BASIC precedes the key. This is not HTTP Basic auth and the value
           // is not base64; a plausible "fix" to either breaks every request.
           ...(authed ? { authorization: `BASIC ${this.apiKey.expose()}` } : {}),
-          'Meld-Version': this.apiVersion,
+          'Meld-Version': version,
           accept: 'application/json',
           ...(payload === undefined ? {} : { 'content-type': 'application/json' }),
+          ...(idempotencyKey === undefined ? {} : { 'X-Idempotency-Key': idempotencyKey }),
         },
         ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
         // A Meld API call has no legitimate redirect. Following one would forward some other
@@ -820,12 +1158,14 @@ export class MeldClient {
       let code: string | undefined;
       let detail: string | undefined;
       let providerDetail: string | undefined;
+      let resendAvailableAt: string | null | undefined;
       try {
         const body = (await response.json()) as {
           error?: unknown;
           code?: unknown;
           message?: unknown;
           serviceProviderDetails?: unknown;
+          resendAvailableAt?: unknown;
         };
         if (typeof body.error === 'string') code = body.error;
         else if (typeof body.code === 'string') code = body.code;
@@ -835,10 +1175,12 @@ export class MeldClient {
           const nested = (provider as { message?: unknown }).message;
           if (typeof nested === 'string') providerDetail = nested;
         }
+        const resend = body.resendAvailableAt;
+        if (typeof resend === 'string' || resend === null) resendAvailableAt = resend;
       } catch {
         // no JSON body; the status carries the signal on its own
       }
-      throw new MeldHttpError(response.status, code, detail, providerDetail);
+      throw new MeldHttpError(response.status, code, detail, providerDetail, resendAvailableAt);
     }
 
     try {
@@ -849,6 +1191,15 @@ export class MeldClient {
       throw upstreamUnavailable(`Meld ${method} ${path} returned a body that is not JSON.`);
     }
   }
+}
+
+function kycBody(request: KycRequest) {
+  return {
+    serviceProvider: request.serviceProvider,
+    mode: request.mode,
+    kycShareProviders: request.kycShareProviders,
+    serviceProviderDetails: request.serviceProviderDetails,
+  };
 }
 
 /**
