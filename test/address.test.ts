@@ -77,3 +77,23 @@ describe('canonicalizeDisclosedAddress for a sell-only code', () => {
     expect(canonicalizeDisclosedAddress(SOLANA, 'DOT_ASSETHUB')).toBeUndefined();
   });
 });
+
+describe('canonicalizeDisclosedAddress for an EVM sell-only code', () => {
+  const MIXED = '0xAbCdEf0123456789aBcDeF0123456789AbCdEf01';
+
+  it('accepts 0x plus 40 hex and lowercases it, so casings compare equal', () => {
+    expect(canonicalizeDisclosedAddress(MIXED, 'USDC_ARBITRUM')).toBe(MIXED.toLowerCase());
+    expect(canonicalizeDisclosedAddress(MIXED.toLowerCase(), 'USDC_ARBITRUM')).toBe(MIXED.toLowerCase());
+  });
+
+  it('refuses everything else, including Solana and SS58 values', () => {
+    for (const bad of ['', '0x', '0x1234', `${MIXED}ab`, MIXED.slice(2), `0x${'g'.repeat(40)}`, 'So11111111111111111111111111111111111111112', ALICE_PREFIX_0]) {
+      expect(canonicalizeDisclosedAddress(bad, 'USDC_ARBITRUM')).toBeUndefined();
+    }
+  });
+
+  it('is not accepted for the other codes', () => {
+    expect(canonicalizeDisclosedAddress(MIXED, 'USDC_SOLANA')).toBeUndefined();
+    expect(canonicalizeDisclosedAddress(MIXED, 'DOT_ASSETHUB')).toBeUndefined();
+  });
+});

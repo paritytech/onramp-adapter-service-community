@@ -5,6 +5,7 @@ import { refreshJobs } from '../src/startup.js';
 
 const DOT: OfframpLane = { code: 'DOT_ASSETHUB', chain: 'assethub' };
 const SOL: OfframpLane = { code: 'USDT_SOLANA', chain: 'solana' };
+const ARB: OfframpLane = { code: 'USDC_ARBITRUM', chain: 'arbitrum' };
 
 const m = (paymentMethodType: string, over: Record<string, unknown> = {}) => ({
   paymentMethodType,
@@ -24,22 +25,61 @@ const row = (lane: OfframpLane, country: string, methods: ReturnType<typeof m>[]
   ...over,
 });
 
+const offer = (lane: OfframpLane, min: string, max: string, currency = 'EUR') => ({ ...lane, min, max, currency });
+
 describe('mergeMethods', () => {
-  it('takes each method from the first lane that has it, with that lane tag and its own limits', () => {
+  it('lists every lane per method in lane order, with its own limits, and spans min and max', () => {
     const merged = mergeMethods([
-      row(DOT, 'DE', [m('SEPA', { min: '5' })]),
-      row(SOL, 'DE', [m('SEPA', { min: '9', currency: 'USD' }), m('CARD', { category: 'card' as const })]),
+      row(DOT, 'DE', [m('SEPA', { min: '5', max: '100' })]),
+      row(SOL, 'DE', [m('SEPA', { min: '9', max: '250' }), m('CARD', { category: 'card' as const })]),
+      row(ARB, 'DE', [m('SEPA', { min: '2', max: '90' })]),
     ]);
     expect(merged).toEqual([
-      { ...m('SEPA', { min: '5' }), lane: DOT },
-      { ...m('CARD', { category: 'card' }), lane: SOL },
+      {
+        paymentMethodType: 'SEPA',
+        category: 'bank',
+        min: '2',
+        max: '250',
+        currency: 'EUR',
+        lanes: [offer(DOT, '5', '100'), offer(SOL, '9', '250'), offer(ARB, '2', '90')],
+      },
+      {
+        paymentMethodType: 'CARD',
+        category: 'card',
+        min: '1',
+        max: '100',
+        currency: 'EUR',
+        lanes: [offer(SOL, '1', '100')],
+      },
     ]);
+  });
+
+  it('orders methods by first sight across lanes in lane order', () => {
+    const merged = mergeMethods([row(DOT, 'DE', [m('B')]), row(SOL, 'DE', [m('A'), m('B')])]);
+    expect(merged.map((x) => x.paymentMethodType)).toEqual(['B', 'A']);
+  });
+
+  it('compares decimals exactly, not as floats', () => {
+    const merged = mergeMethods([
+      row(DOT, 'DE', [m('X', { min: '0.30000000000000004', max: '9007199254740993' })]),
+      row(SOL, 'DE', [m('X', { min: '0.3', max: '9007199254740992.5' })]),
+      row(ARB, 'DE', [m('X', { min: '0.30', max: '9007199254740992.50' })]),
+    ]);
+    expect(merged[0]?.min).toBe('0.3');
+    expect(merged[0]?.max).toBe('9007199254740993');
+  });
+
+  it('keeps the first text on an exact tie and sets currency to the country fiat when given', () => {
+    const [x] = mergeMethods([row(DOT, 'DE', [m('X', { min: '1.0', currency: 'USD' })]), row(SOL, 'DE', [m('X', { min: '1.00' })])], 'EUR');
+    expect(x?.min).toBe('1.0');
+    expect(x?.currency).toBe('EUR');
+    expect(x?.lanes.map((l) => l.currency)).toEqual(['USD', 'EUR']);
   });
 
   it('drops provider rosters and extra fields, and copies the lane', () => {
     const [only] = mergeMethods([row(DOT, 'DE', [{ ...m('SEPA'), providers: ['X'] } as never])]);
     expect(only).not.toHaveProperty('providers');
-    expect(only?.lane).not.toBe(DOT);
+    expect(only?.lanes[0]).toEqual(offer(DOT, '1', '100'));
   });
 
   it('is empty when nothing routes', () => {
@@ -60,9 +100,9 @@ describe('mergeOfframpCorridors', () => {
     const fr = out[1];
     expect(fr?.name).toBe('France');
     expect(fr?.fiat).toBe('EUR');
-    expect(fr?.methods.map((x) => [x.paymentMethodType, x.lane.code])).toEqual([
-      ['SEPA', 'DOT_ASSETHUB'],
-      ['CARD', 'USDT_SOLANA'],
+    expect(fr?.methods.map((x) => [x.paymentMethodType, x.lanes.map((l) => l.code)])).toEqual([
+      ['SEPA', ['DOT_ASSETHUB']],
+      ['CARD', ['USDT_SOLANA']],
     ]);
   });
 

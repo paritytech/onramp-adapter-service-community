@@ -548,8 +548,19 @@ const configSchema = z
           .max(86_400_000)
           .default(2 * 3_600_000),
         /**
+         * Routes pass for sell jobs. Sell corridors change slowly and cost one Meld call per
+         * country per lane, so they refresh less often than buy; their staleness window is
+         * three of these.
+         */
+        sell_routes_interval_ms: z
+          .number()
+          .int()
+          .min(60_000)
+          .max(7 * 86_400_000)
+          .default(12 * 3_600_000),
+        /**
          * The sell lanes behind `GET /supported/offramp*`, in preference order: where a country's
-         * payout method is offered by more than one lane, the earliest lane wins. Codes must be
+         * payout method is offered by more than one lane, the method lists every lane in this order. Codes must be
          * ones a sell may name (delivered or sell-only), so a typo cannot reach Meld, which would
          * resolve it to Bitcoin.
          */
@@ -602,6 +613,7 @@ const configSchema = z
     renewable(cfg.meld.countries_cache_ttl_ms, 'countries_cache_ttl_ms', cfg.supported.catalog_interval_ms, 'catalog_interval_ms');
     renewable(cfg.meld.defaults_cache_ttl_ms, 'defaults_cache_ttl_ms', cfg.supported.catalog_interval_ms, 'catalog_interval_ms');
     renewable(cfg.meld.routes_cache_ttl_ms, 'routes_cache_ttl_ms', cfg.supported.routes_interval_ms, 'routes_interval_ms');
+    renewable(cfg.meld.routes_cache_ttl_ms, 'routes_cache_ttl_ms', cfg.supported.sell_routes_interval_ms, 'sell_routes_interval_ms');
 
     /**
      * Parse a URL that a field-level `z.url()` has already looked at, or give up quietly.

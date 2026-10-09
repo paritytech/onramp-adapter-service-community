@@ -295,6 +295,19 @@ describe('Onramp.supportedCorridors', () => {
     expect(await svc.supportedCorridors('DOT_ASSETHUB')).toEqual([]);
   });
 
+  it('ages sell rows over three sell intervals (36h) and buy rows over three routes intervals (6h)', async () => {
+    const store = fakeStore();
+    for (const direction of ['buy', 'sell'] as const) {
+      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction, country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+    }
+    // Rows are stamped 2e12. 10h on: buy is stale, sell still fresh. 40h on: both stale.
+    const at = (ms: number) => new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => 2_000_000_000_000 + ms, () => 'f', undefined);
+    const HOUR = 3_600_000;
+    expect(await at(10 * HOUR).supportedCorridors('DOT_ASSETHUB')).toEqual([]);
+    expect((await at(10 * HOUR).supportedCorridors('DOT_ASSETHUB', 'sell')).map((r) => r.country)).toEqual(['BR']);
+    expect(await at(40 * HOUR).supportedCorridors('DOT_ASSETHUB', 'sell')).toEqual([]);
+  });
+
   it('refuses an unknown crypto before reading', async () => {
     const svc = build(undefined);
     expect((await refusalOf(() => svc.supportedCorridors('NOPE'))).tag).toBe('WrongAssetOrChain');
@@ -439,7 +452,7 @@ describe('Onramp offramp discovery', () => {
     return { ...c, supported: { ...c.supported, offramp_lanes: lanes } };
   };
 
-  it('merges cached sell corridors across lanes, first lane winning, and ignores buy rows', async () => {
+  it('merges cached sell corridors across lanes, listing every lane, and ignores buy rows', async () => {
     const store = fakeStore();
     const put = (code: string, direction: 'buy' | 'sell', country: string, name: string, methods: unknown[]) =>
       store.upsertCorridor({ destination_currency_code: code, direction, country, name, fiat: 'BRL', methods } as never);
@@ -449,15 +462,21 @@ describe('Onramp offramp discovery', () => {
     await put('USDT_SOLANA', 'sell', 'AR', 'Argentina', [pix]);
     const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'f', undefined);
 
+    const o = (lane: (typeof lanes)[number], x: typeof pix) => ({ ...lane, min: x.min, max: x.max, currency: x.currency });
     expect(await svc.offrampCorridors()).toEqual([
-      { country: 'AR', name: 'Argentina', fiat: 'BRL', methods: [{ ...pix, lane: lanes[1] }] },
+      {
+        country: 'AR',
+        name: 'Argentina',
+        fiat: 'BRL',
+        methods: [{ ...pix, lanes: [o(lanes[1] as never, pix)] }],
+      },
       {
         country: 'BR',
         name: 'Brazil',
         fiat: 'BRL',
         methods: [
-          { ...payout, lane: lanes[0] },
-          { ...pix, lane: lanes[1] },
+          { ...payout, min: '1', lanes: [o(lanes[0] as never, payout), o(lanes[1] as never, { ...payout, min: '1' })] },
+          { ...pix, lanes: [o(lanes[1] as never, pix)] },
         ],
       },
     ]);
@@ -468,6 +487,15 @@ describe('Onramp offramp discovery', () => {
     await store.upsertCorridor({ destination_currency_code: 'USDT_SOLANA', direction: 'sell', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
     const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => 3_000_000_000_000, () => 'f', undefined);
     expect(await svc.offrampCorridors()).toEqual([]);
+  });
+
+  it('uses the sell interval for the offramp staleness window', async () => {
+    const store = fakeStore();
+    await store.upsertCorridor({ destination_currency_code: 'USDT_SOLANA', direction: 'sell', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+    const at = (ms: number) => new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => 2_000_000_000_000 + ms, () => 'f', undefined);
+    const HOUR = 3_600_000;
+    expect(await at(10 * HOUR).offrampCorridors()).toHaveLength(1);
+    expect(await at(40 * HOUR).offrampCorridors()).toEqual([]);
   });
 
   it('answers one country live, per lane in order, sell direction', async () => {
@@ -489,7 +517,14 @@ describe('Onramp offramp discovery', () => {
       country: 'US',
       fiat: 'USD',
       methods: [
-        { paymentMethodType: 'CREDIT_DEBIT_CARD', category: 'card', min: '5', max: '3000', currency: 'USD', lane: lanes[1] },
+        {
+          paymentMethodType: 'CREDIT_DEBIT_CARD',
+          category: 'card',
+          min: '5',
+          max: '3000',
+          currency: 'USD',
+          lanes: [{ ...lanes[1], min: '5', max: '3000', currency: 'USD' }],
+        },
       ],
     });
   });

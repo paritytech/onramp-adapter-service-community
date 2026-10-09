@@ -395,14 +395,14 @@ describe('startSupportedRefresh', () => {
   it('gives each pass its own cadence, both unref\'d and signal-bound', async () => {
     // One sleep per pass. `ref: false` replaces `timer.unref()`, the signal ends the loop.
     sleepCalls.length = 0;
-    const refresh = startSupportedRefresh(disco({}), fakeStore(), [JOB], { catalogMs: 90_000, routesMs: 30_000 }, () => undefined);
+    const refresh = startSupportedRefresh(disco({}), fakeStore(), [JOB], { catalogMs: 90_000, routesMs: 30_000, sellRoutesMs: 60_000 }, () => undefined);
     // The loops only sleep once the immediate boot passes have returned.
     await vi.waitFor(() => {
-      expect(sleepCalls).toHaveLength(2);
+      expect(sleepCalls).toHaveLength(3);
     });
     await refresh.stop(0);
 
-    expect(sleepCalls.map((c) => c.ms).sort((a, b) => a - b)).toEqual([30_000, 90_000]);
+    expect(sleepCalls.map((c) => c.ms).sort((a, b) => a - b)).toEqual([30_000, 60_000, 90_000]);
     for (const call of sleepCalls) {
       expect(call.opts.ref).toBe(false);
       expect(call.opts.signal).toBeInstanceOf(AbortSignal);
@@ -458,6 +458,48 @@ describe('startSupportedRefresh', () => {
     expect(countries).toHaveBeenCalledTimes(1);
 
     await refresh.stop(0);
+  });
+
+  it('runs buy routes on routesMs and sell routes on sellRoutesMs', async () => {
+    const calls: string[] = [];
+    const refresh = startSupportedRefresh(
+      { ...disco({}), corridor: async (c, _fiat, _crypto, direction) => (calls.push(direction), corridor(c)) },
+      fakeStore(),
+      [JOB, SELL_JOB],
+      { catalogMs: 100_000, routesMs: 10, sellRoutesMs: 100_000 },
+      () => undefined,
+    );
+
+    await vi.waitFor(() => {
+      expect(calls.filter((d) => d === 'buy').length).toBeGreaterThan(2);
+    });
+    // The boot pass probed sell once; its slow interval has not ticked.
+    expect(calls.filter((d) => d === 'sell')).toHaveLength(1);
+    await refresh.stop(0);
+  });
+
+  it('runs sell routes on their own interval, and defaults it to routesMs when absent', async () => {
+    const calls: string[] = [];
+    const run = async (intervals: { catalogMs: number; routesMs: number; sellRoutesMs?: number }) => {
+      calls.length = 0;
+      const refresh = startSupportedRefresh(
+        { ...disco({}), corridor: async (c, _fiat, _crypto, direction) => (calls.push(direction), corridor(c)) },
+        fakeStore(),
+        [JOB, SELL_JOB],
+        intervals,
+        () => undefined,
+      );
+      await vi.waitFor(() => {
+        expect(calls.filter((d) => d === 'sell').length).toBeGreaterThan(2);
+      });
+      const buys = calls.filter((d) => d === 'buy').length;
+      await refresh.stop(0);
+      return buys;
+    };
+    // Fast sell, slow buy: buy ran only at boot.
+    expect(await run({ catalogMs: 100_000, routesMs: 100_000, sellRoutesMs: 10 })).toBe(1);
+    // No sell interval: sell follows routesMs, so buy ticks too.
+    expect(await run({ catalogMs: 100_000, routesMs: 10 })).toBeGreaterThan(2);
   });
 
   it('keeps the previous catalog when a later country list fails', async () => {

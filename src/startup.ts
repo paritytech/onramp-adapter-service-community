@@ -262,7 +262,11 @@ export async function start(
           discovery,
           funding,
           refreshJobs(cfg.supported.offramp_lanes),
-          { catalogMs: cfg.supported.catalog_interval_ms, routesMs: cfg.supported.routes_interval_ms },
+          {
+            catalogMs: cfg.supported.catalog_interval_ms,
+            routesMs: cfg.supported.routes_interval_ms,
+            sellRoutesMs: cfg.supported.sell_routes_interval_ms,
+          },
           // warn, not info: a silently staling cache must reach an operator filtering to warn.
           (message) => {
             server.log.warn(message);

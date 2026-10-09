@@ -31,6 +31,7 @@ export const DESTINATIONS: readonly Destination[] = Object.freeze([
 export const OFFRAMP_ONLY: readonly Destination[] = Object.freeze([
   Object.freeze({ code: 'USDT_SOLANA' }),
   Object.freeze({ code: 'USDC_SOLANA' }),
+  Object.freeze({ code: 'USDC_ARBITRUM' }),
 ]);
 
 /** Is this a code that is sellable but never deliverable? */

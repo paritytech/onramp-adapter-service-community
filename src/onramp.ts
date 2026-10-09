@@ -196,9 +196,12 @@ export class Onramp {
   // surface.
   async supportedCorridors(code: string, direction?: Direction): Promise<SupportedCorridorDto[]> {
     resolveForDirection(code, this.direction(direction));
-    // The rows are written by the routes pass, so that is the cadence staleness is measured in.
-    const freshAfter = this.clock() - this.cfg.supported.routes_interval_ms * STALE_PASSES;
-    const rows = await this.funding.readCorridors(code, this.direction(direction), freshAfter);
+    // The rows are written by the routes pass, so that is the cadence staleness is measured in;
+    // sell jobs run it on their own, slower, interval.
+    const dir = this.direction(direction);
+    const interval = dir === 'sell' ? this.cfg.supported.sell_routes_interval_ms : this.cfg.supported.routes_interval_ms;
+    const freshAfter = this.clock() - interval * STALE_PASSES;
+    const rows = await this.funding.readCorridors(code, dir, freshAfter);
     return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: r.methods }));
   }
 
@@ -217,11 +220,11 @@ export class Onramp {
   }
 
   /**
-   * Every cached sell corridor across the configured offramp lanes, merged per country: the first
-   * lane (in configuration order) offering a payment method supplies it, tagged with that lane.
+   * Every cached sell corridor across the configured offramp lanes, merged per country: each
+   * payment method lists every lane (in configuration order) that offers it, with that lane's limits.
    */
   async offrampCorridors(): Promise<OfframpCorridor[]> {
-    const freshAfter = this.clock() - this.cfg.supported.routes_interval_ms * STALE_PASSES;
+    const freshAfter = this.clock() - this.cfg.supported.sell_routes_interval_ms * STALE_PASSES;
     const rows: LaneCorridor[] = [];
     for (const lane of this.cfg.supported.offramp_lanes) {
       for (const r of await this.funding.readCorridors(lane.code, 'sell', freshAfter)) {
@@ -245,8 +248,8 @@ export class Onramp {
       const c = await this.discovery.corridorForCountry(country, lane.code, 'sell');
       views.push({ lane, country: c.country, fiat: c.fiat, methods: c.methods });
     }
-    const methods = mergeMethods(views);
     const fiat = views.find((v) => v.methods.length > 0)?.fiat ?? views.find((v) => v.fiat !== '')?.fiat ?? '';
+    const methods = mergeMethods(views, fiat);
     return { country, fiat, methods };
   }
 

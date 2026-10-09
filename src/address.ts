@@ -76,9 +76,12 @@ export function normalizeAddress(input: string): string {
  * equal rather than looking like a changed address.
  */
 export function canonicalizeDisclosedAddress(input: string, code?: string): string | undefined {
-  // A sell-only code is sold on Solana: a base58 32-byte key with no checksum and no prefix, so
-  // there is nothing to normalise. It is returned exactly as given and compared case-sensitively.
-  if (code !== undefined && isOfframpOnly(code)) return solanaAddress(input);
+  // A sell-only code is sold on a chain other than Asset Hub, and that chain decides the format.
+  // Solana: base58, 32 bytes, no checksum and no prefix, returned exactly as given. EVM: `0x` plus
+  // 40 hex, lowercased so two spellings of one account compare equal.
+  if (code !== undefined && isOfframpOnly(code)) {
+    return code.endsWith('_ARBITRUM') ? evmAddress(input) : solanaAddress(input);
+  }
   // `decodeAddress('')` throws, but spelling the empty case out here rather than relying on that
   // is what stops a future, more permissive base58 decoder from ever making an empty string look
   // like a valid, if peculiar, account.
@@ -101,4 +104,9 @@ function solanaAddress(input: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** An EVM account: `0x` and 40 hex digits (checksum casing is not verified). Lowercased, or `undefined`. */
+function evmAddress(input: string): string | undefined {
+  return /^0x[0-9a-fA-F]{40}$/.test(input) ? input.toLowerCase() : undefined;
 }

@@ -54,13 +54,13 @@ describe('catalog', () => {
 });
 
 describe('sell-only codes', () => {
-  it('lists exactly the Solana codes, frozen', () => {
-    expect(OFFRAMP_ONLY.map((d) => d.code)).toEqual(['USDT_SOLANA', 'USDC_SOLANA']);
+  it('lists exactly the sell-only codes, frozen', () => {
+    expect(OFFRAMP_ONLY.map((d) => d.code)).toEqual(['USDT_SOLANA', 'USDC_SOLANA', 'USDC_ARBITRUM']);
     expect(Object.isFrozen(OFFRAMP_ONLY)).toBe(true);
   });
 
   it('are never valid for a buy, and are valid for a sell', () => {
-    for (const code of ['USDT_SOLANA', 'USDC_SOLANA']) {
+    for (const code of ['USDT_SOLANA', 'USDC_SOLANA', 'USDC_ARBITRUM']) {
       expect(() => resolveDestination(code)).toThrow(Refusal);
       expect(() => resolveForDirection(code, 'buy')).toThrow(Refusal);
       expect(resolveForDirection(code, 'sell')).toEqual({ code });
@@ -75,6 +75,7 @@ describe('sell-only codes', () => {
     expect(() => resolveSellCode('BTC')).toThrow(Refusal);
     expect(() => resolveForDirection('USDT_SOL_X', 'sell')).toThrow(Refusal);
     expect(isSellable('BTC')).toBe(false);
+    expect(isSellable('USDC_ETHEREUM')).toBe(false);
     expect(isOfframpOnly('DOT_ASSETHUB')).toBe(false);
     expect(resolveForDirection('DOT_ASSETHUB', 'sell')).toEqual({ code: 'DOT_ASSETHUB' });
     expect(isDeliveredCrypto('BTC')).toBe(false);
