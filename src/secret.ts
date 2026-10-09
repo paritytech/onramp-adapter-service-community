@@ -4,11 +4,11 @@
  * everything else.
  *
  * Two things a reader needs. Reading a value requires `expose()`, which is greppable, so
- * "where is this key used" has an exact answer: six call sites, of which the Meld key's is
+ * "where is this key used" has an exact answer: seven call sites, of which the Meld key's is
  * exactly one (the `Authorization: BASIC` header it must eventually reach), the JWT key's and the
- * customer token key's are two HKDF derivations each in `startup.ts`, and the store password's is
- * the one place `funding/store.ts` builds its pool. The webhook secret is resolved at boot and has
- * no reader. And Node cannot erase a string: the guards below
+ * customer token key's are two HKDF derivations each in `startup.ts`, the store password's is
+ * the one place `funding/store.ts` builds its pool, and the webhook secret's is the signature
+ * check in `meld/webhook.ts`. And Node cannot erase a string: the guards below
  * stop accidental disclosure through logging, serialising and inspecting, and nothing more.
  * docs/threat-model.md T2 and R5 state the limit; the value arrives as a mounted file rather than
  * from a secret manager.

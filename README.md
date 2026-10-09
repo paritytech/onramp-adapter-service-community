@@ -10,7 +10,8 @@ If you experience problems with any product or service that was built on or depl
 A backend that holds a [Meld.io](https://meld.io) partner API key so a browser application can
 buy Asset Hub tokens with a card or a bank transfer. The key never reaches a client: what crosses
 the boundary is a widget URL scoped to one buyer, with the destination address and amount pinned
-and locked server-side.
+and locked server-side. With [Meld Headless](#meld-headless) it is instead an order this service
+placed for one customer, on the same validated terms.
 
 It serves Meld. What a deployer builds on top of it is not this service's concern.
 
@@ -61,9 +62,11 @@ npm start
 
 The config path is `./config.json`, overridable with `CONFIG_PATH`.
 
-**As copied that fails**, deliberately: the example is a production-shaped template with all three
-secrets mounted as files, so `npm start` stops at `Cannot read secret file
-/run/secrets/meld-api-key`. A missing secret is always fatal.
+**As copied that fails**, deliberately: the example is a production-shaped template with every
+secret mounted as a file, so `npm start` stops at `Cannot read secret file
+/run/secrets/meld-api-key`. A missing secret is always fatal. Three are always read (the Meld key,
+the JWT signing key and the store password); the Meld webhook secret and the customer token key are
+read only with [Meld Headless](#meld-headless) enabled.
 
 For a local instance, set `environment: "development"`, `auth.mode: "insecure_dev"`, a
 `meld.base_url` that is not a production endpoint, and a `store` pointing at your Postgres. Then
@@ -84,6 +87,26 @@ ten serve the headless customer (its key proof, registration, KYC, contact verif
 requirements and orders), and `POST /webhooks/meld` takes Meld's signed status events.
 [docs/api.md](docs/api.md) is the reference.
 
+## Meld Headless
+
+Off by default. With it, a buyer pays without Meld's widget: the app registers a Meld customer,
+completes Meld's Unified KYC on Sumsub's hosted page, verifies an email or phone where a provider
+asks, and places a card or bank order through this service. A card order comes back for the Meld
+SDK to mount in the app; a bank order comes back as the transfer details to pay. Meld's signed
+webhooks move the order's funding request, and the settlement worker reads the same order as a
+backstop.
+
+The routes that act for a customer take a second credential beside the caller's JWT: a short-lived
+customer token, minted once the app signs a challenge with an sr25519 customer key, and bound to
+the caller's alias and product. The service maps the key's hash to one Meld customer and gives Meld
+a random external id. Identity details pass through to Meld and are not stored or logged.
+
+Enable it with `meld.headless.enabled`, a `meld.headless.api_version`, a `network_codes` entry for
+every destination, a `meld.webhook` block naming the URL registered in a Meld webhook profile and
+its secret, and a `customer` block with the customer token key.
+[docs/configuration.md](docs/configuration.md) has the keys and [docs/api.md](docs/api.md) the
+routes.
+
 ## Testing
 
 ```sh
@@ -96,7 +119,8 @@ The unit suite needs a Postgres; see [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Deploying it
 
 The Helm chart is in [helm/](helm/). It renders a Deployment, a Service, an Ingress, a
-NetworkPolicy and a ConfigMap holding `config.json`, with the three secrets mounted as files.
+NetworkPolicy and a ConfigMap holding `config.json`, with the secrets mounted as files: three
+always, and two more with Meld Headless enabled.
 
 **It runs exactly one replica and cannot be scaled horizontally.** The rate limiter is in-process
 and keyed on the caller's personhood alias, so a second pod gives every caller twice their ceiling
@@ -124,7 +148,8 @@ Boot is deliberately fatal on anything it cannot verify, and the message names t
 - `identifier must be a 32-byte hex value`: `auth.personhood.collections` is empty. Expected on a
   first deploy.
 - `Secret is missing or empty`: the Meld key, the JWT signing key or the store password is not
-  mounted. All three are mandatory.
+  mounted, or, with Meld Headless enabled, the Meld webhook secret or the customer token key. Each
+  is mandatory wherever it is read.
 - `Meld answered HTTP <status>`: the credential probe reached Meld and was rejected, so the key or
   `meld.base_url` is wrong. A Meld *transport* failure only warns, because a rollout must survive
   one.
@@ -155,8 +180,13 @@ an operator can tie a running pod to a commit in this repository.
 
 - **The settlement join is unverified against a live Meld.** The worker finds a transaction by the
   reference the session was filed under, and a headless order's by its Meld customer and order id.
-  Neither contract is re-verified here against a live sandbox, so a request whose transaction
-  cannot be found concludes `unobserved` rather than claiming the buyer did not pay.
+  Neither contract is re-verified here against a live sandbox. A session whose transaction cannot
+  be found concludes `unobserved` rather than claiming the buyer did not pay; a headless order whose
+  transaction does not carry its order id concludes `expired`, which does make that claim. See the
+  threat model, R10.
+- **Meld Headless bank details are read from an undocumented shape.** Meld documents no transfer
+  details for a headless onramp bank order, so they are read from its virtual-account shape and
+  any other shape refuses the order rather than showing a guessed account.
 - **`meld.api_version` has no known-good value yet.** It is required precisely so it is not guessed.
 - **The jurisdiction is pinned but not locked.** Meld exposes no `lockFields` entry for the country,
   so a buyer can change it inside Meld's flow after this service pinned one. See the threat model.
@@ -201,9 +231,12 @@ section first, because several of the things it lists are documented gaps rather
 
 Report a security issue if it demonstrates realistic impact against one or more of these:
 
-- Disclosure of the Meld API key, the JWT signing key or the CloudSQL password, or of any token
-  granting direct Meld API access, by any path at all: a response body, a log line, a trace, an
-  error message, or a crash dump
+- Disclosure of the Meld API key, the JWT signing key, the CloudSQL password, the Meld webhook
+  secret or the customer token key, or of any token granting direct Meld API access, by any path
+  at all: a response body, a log line, a trace, an error message, or a crash dump
+- Identity data a headless customer submits, a one-time code or a buyer's IP address reaching a
+  log line, the store, an audit record or a response, or a customer token accepted from a caller
+  other than the one it was minted for
 - **Open redirect via `redirectUrl`**, meaning any target this service accepts whose origin is not
   in `cors.allowed_origins`, or any form where the value we validate and the value we forward to
   the provider resolve to different hosts

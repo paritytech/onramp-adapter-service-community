@@ -77,8 +77,8 @@ a service that runs in production with a development posture. See
 > have (`server.ts`, asserted by `server.test.ts` and `server-personhood.test.ts`). And every route
 > that spends or reads a caller sits behind the personhood gate, so the JWT must be presented in an
 > `Authorization` header the attacking page cannot forge. What a `null` origin can reach is the
-> unauthenticated set (`/health`, the challenge mint, and `/meld/return`), none of which discloses
-> anything.
+> unauthenticated set (`/health`, the challenge mint, `/meld/return`, and with Meld Headless
+> `POST /webhooks/meld`, which acts only on Meld's signature), none of which discloses anything.
 >
 > Adding `credentials` while `null` is listed turns this into a cross-origin read of authenticated
 > responses. Two tests fail if anyone tries; do not delete them to make the change pass.
@@ -136,8 +136,8 @@ In process the key lives in a type whose `toString`, `toJSON` and `inspect` hook
 `[redacted]`, and reading it requires calling `expose()`, which is greppable, so *"where is the
 key used"* has an exact answer. There are five secrets (the Meld key, the JWT signing key, the
 CloudSQL password, and with headless enabled the Meld webhook secret and the customer token key)
-and six `expose()` call sites: one in the Meld client, four in `startup`'s HKDF derivations, and
-one where the store builds its pool.
+and seven `expose()` call sites: one in the Meld client, four in `startup`'s HKDF derivations, one
+in the webhook signature check, and one where the store builds its pool.
 
 > [!NOTE]
 > Node cannot erase a string. `Buffer` contents can be overwritten, but the value must become a

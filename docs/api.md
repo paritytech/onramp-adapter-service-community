@@ -760,8 +760,9 @@ every cause; the log names which check failed.
 and changes nothing.
 
 - `TRANSACTION_CRYPTO_*`: the transaction named by `payload.paymentTransactionId` is read from
-  Meld under `meld.headless.api_version`, the version Meld documents `orderId` on, and its `orderId` finds the funding request `POST /order` created. Its status (or the
-  event's, when the transaction carries none) is mapped as the worker maps it: `SETTLED` settles,
+  Meld under `meld.headless.api_version`, the version Meld documents `orderId` on, and its
+  `orderId` finds the funding request `POST /order` created. Its status (or the event's, when the
+  transaction carries none) is mapped as the worker maps it: `SETTLED` settles,
   `FAILED`, `DECLINED`, `CANCELLED` and `REFUNDED` fail, and anything else, `ERROR` included, which
   Meld calls temporary, is `transaction_seen`. The request moves forward through every state in
   between, so a payment settled before it was seen still records `transaction_seen`, with the
@@ -908,11 +909,11 @@ Meld session or transaction id is carried: those are internal join keys.
 
 ## Durable funding
 
-`POST /session` and `POST /order` write a row to Postgres (CloudSQL; the schema is versioned and migrated under an
-advisory lock, so two booting replicas cannot race it) and the funding reads read it back. The row
-is reserved **before** the rail is called, so the unique index arbitrates the idempotency key
-rather than a check-then-act race. An in-process worker advances the lifecycle, and so, for an
-order, does Meld's webhook.
+`POST /session` and `POST /order` write a row to Postgres (CloudSQL; the schema is versioned and
+migrated under an advisory lock, so two booting replicas cannot race it) and the funding reads read
+it back. The row is reserved **before** the rail is called, so the unique index arbitrates the
+idempotency key rather than a check-then-act race. An in-process worker advances the lifecycle,
+and so, for an order, does Meld's webhook.
 
 The worker finds a session's transaction by the reference the session was filed under, and an
 order's among its Meld customer's transactions (read under `meld.headless.api_version`, one page of
@@ -972,7 +973,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 401 | `Other{ CUSTOMER_TOKEN_INVALID }` | `x-customer-token` is missing, expired, or bound to another product or alias. Get a new token from `POST /customer/token`. |
 | 409 | `Other{ CUSTOMER_EXISTS }` | `POST /customer` for a key that already has a customer. Read it with `GET /customer`. |
 | 404 | `Other{ CUSTOMER_NOT_FOUND }` | A customer route other than `GET /customer` and `POST /customer`, or `POST /order`, for a key that has not registered. Register with `POST /customer`. |
-| 400 | `Other{ TERMS_STALE }` | `POST /order`: `termsAcceptedAt` does not parse, is ahead of this service's clock, or is more than an hour old. Accept the terms again. |
+| 400 | `Other{ TERMS_STALE }` | `POST /order`: `termsAcceptedAt` does not parse, is more than five minutes ahead of this service's clock, or is more than an hour old. Accept the terms again. |
 | 403 | `Other{ CUSTOMER_NOT_READY }` | `POST /order`: the provider will not take an order from this customer yet (Meld `KYC_NOT_COMPLETED` or `VERIFICATION_REQUIRED`). Nothing was placed and the key is free. |
 | 502 | `Other{ BANK_DETAILS_UNREADABLE }` | `POST /order`: Meld created a bank order whose transfer details this service cannot read. Nothing is payable; do not guess an account. |
 | 401 | `Other{ WEBHOOK_SIGNATURE_INVALID }` | `POST /webhooks/meld`: the signature headers are missing, the signature does not match, or the timestamp is unreadable or outside `meld.webhook.tolerance_ms`. |
