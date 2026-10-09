@@ -265,7 +265,7 @@ export class MeldDiscovery implements Discovery {
   // Sell's substitute for the endpoint that does not exist (`defaultFiat`'s "OFFRAMP_FIAT_LIMITS
   // catalog" below): the whole (country -> currency) map from one call, cached whole like
   // `countriesCache`, because the source data itself is one call answering for every country.
-  private offrampFiatCatalog: CacheEntry<Map<string, string>> | undefined;
+  private offrampFiatCatalog: CacheEntry<Map<string, string[]>> | undefined;
 
   constructor(
     /** Corridor GET, scoped per `discovery_scope`: keyed (this account's providers) by default. */
@@ -467,14 +467,25 @@ export class MeldDiscovery implements Discovery {
    * `defaultFiat`). `fiat-limits` is not scoped to one country -- the probe's own example, read
    * for `countryCode=GB`, came back carrying rows for AD, AU, BH and others alongside GB -- so it
    * is read once, unfiltered, and the whole (country -> currency) map is cached together, the same
-   * shape `countries` already caches whole. A country can carry more than one row (one per payment
-   * method); the first `currencyCode` seen for it is kept, on the same assumption `defaultFiat`
-   * makes for a buy: a country has one civil currency, not one per payment method.
+   * shape `countries` already caches whole.
+   *
+   * A country carries one row per payout currency a provider offers there, and most carry several:
+   * GB lists EUR before GBP, BR lists USD before BRL. The first one seen is not the country's own,
+   * and a corridor built on it quotes nothing (GB in EUR: `NO_VALID_QUOTES`; in GBP: quoted). So a
+   * country with several is given its own civil currency, the buy default, when that is among them,
+   * and the first listed otherwise.
    */
   private async offrampDefaultFiat(country: string): Promise<string> {
     const hit = this.fresh(this.offrampFiatCatalog, this.ttls.defaults);
-    if (hit !== undefined) return hit.get(country) ?? '';
+    const currencies = hit ?? (await this.readOfframpFiatCatalog());
+    const listed = currencies.get(country) ?? [];
+    if (listed.length <= 1) return listed[0] ?? '';
+    // The buy default failing is no reason to drop the country: the first listed still serves.
+    const local = await this.defaultFiat(country, 'buy').catch(() => '');
+    return listed.includes(local) ? local : (listed[0] as string);
+  }
 
+  private async readOfframpFiatCatalog(): Promise<Map<string, string[]>> {
     // A failed or unparseable read throws, as `defaultFiat` promises and as the buy side does. An
     // `''` here would read as "this country has no currency", and the refresh would drop every
     // off-ramp country until its next pass instead of holding the last known entry.
@@ -482,14 +493,16 @@ export class MeldDiscovery implements Discovery {
       await this.get(`/network-partner/supported/fiat-limits?category=${CATEGORY.sell}`),
     );
     if (!env.success) throw new Error('unparseable off-ramp fiat-limits response');
-    const catalog = new Map<string, string>();
+    const catalog = new Map<string, string[]>();
     for (const row of env.data.fiatLimits ?? []) {
-      if (row.countryCode !== undefined && row.countryCode !== null && !catalog.has(row.countryCode)) {
-        catalog.set(row.countryCode, row.currencyCode ?? '');
-      }
+      if (row.countryCode === undefined || row.countryCode === null) continue;
+      const listed = catalog.get(row.countryCode) ?? [];
+      const currency = row.currencyCode ?? '';
+      if (!listed.includes(currency)) listed.push(currency);
+      catalog.set(row.countryCode, listed);
     }
     // As with every other cache here, only a real (parsed) answer is memoised.
     this.offrampFiatCatalog = { at: this.clock(), value: catalog };
-    return catalog.get(country) ?? '';
+    return catalog;
   }
 }

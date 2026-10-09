@@ -151,6 +151,8 @@ const stubOnramp = () => ({
   supported: async () => ({ country: 'US', fiat: 'USD', crypto: 'DOT_ASSETHUB', methods: [] }),
   supportedCountries: async () => [],
   supportedCorridors: async () => [],
+    offrampCorridors: async () => [],
+    offramp: async (country: string) => ({ country, fiat: 'USD', methods: [] }),
   transaction: async () => ({ transaction: {} }),
   cancel: async () => undefined,
   get: async () => undefined,

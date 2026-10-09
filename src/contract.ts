@@ -481,6 +481,11 @@ export const supportedCountriesQuery = z.object({ destinationCurrencyCode, direc
 /** The query behind `GET /supported/corridors`: every cached corridor for one delivered crypto, buy or sell. */
 export const supportedCorridorsQuery = z.object({ destinationCurrencyCode, direction }).strict();
 
+/** The query behind `GET /supported/offramp/corridors`: takes none. */
+export const supportedOfframpCorridorsQuery = z.object({}).strict();
+
+/** The query behind `GET /supported/offramp`: one country, merged across the offramp lanes. */
+export const supportedOfframpQuery = z.object({ country }).strict();
 
 // --- responses --------------------------------------------------------------
 

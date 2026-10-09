@@ -613,7 +613,7 @@ function seenSince(record: FundingRecord): number {
  * `mergeDeposit` rather than being silently absorbed here as "no different from what we have".
  */
 function depositIsNew(record: FundingRecord, deposit: RailDeposit): boolean {
-  const canonical = canonicalizeDisclosedAddress(deposit.address);
+  const canonical = canonicalizeDisclosedAddress(deposit.address, record.destination_currency_code);
   const matchesAccepted =
     canonical !== undefined &&
     record.deposit_address === canonical &&

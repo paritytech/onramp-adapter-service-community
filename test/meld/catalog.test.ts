@@ -1,7 +1,16 @@
 import { describe, expect, it } from 'vitest';
 
 import { Refusal } from '../../src/contract.js';
-import { DESTINATIONS, resolveDestination } from '../../src/meld/catalog.js';
+import {
+  DESTINATIONS,
+  isDeliveredCrypto,
+  isOfframpOnly,
+  isSellable,
+  OFFRAMP_ONLY,
+  resolveDestination,
+  resolveForDirection,
+  resolveSellCode,
+} from '../../src/meld/catalog.js';
 
 describe('catalog', () => {
   it('offers exactly the three Asset Hub destinations Meld can deliver', () => {
@@ -41,5 +50,34 @@ describe('catalog', () => {
   it('is frozen, so a caller cannot extend the accepted set at runtime', () => {
     expect(Object.isFrozen(DESTINATIONS)).toBe(true);
     expect(Object.isFrozen(DESTINATIONS[0])).toBe(true);
+  });
+});
+
+describe('sell-only codes', () => {
+  it('lists exactly the sell-only codes, frozen', () => {
+    expect(OFFRAMP_ONLY.map((d) => d.code)).toEqual(['USDT_SOLANA', 'USDC_SOLANA', 'USDC_ARBITRUM']);
+    expect(Object.isFrozen(OFFRAMP_ONLY)).toBe(true);
+  });
+
+  it('are never valid for a buy, and are valid for a sell', () => {
+    for (const code of ['USDT_SOLANA', 'USDC_SOLANA', 'USDC_ARBITRUM']) {
+      expect(() => resolveDestination(code)).toThrow(Refusal);
+      expect(() => resolveForDirection(code, 'buy')).toThrow(Refusal);
+      expect(resolveForDirection(code, 'sell')).toEqual({ code });
+      expect(resolveSellCode(code)).toEqual({ code });
+      expect(isOfframpOnly(code)).toBe(true);
+      expect(isSellable(code)).toBe(true);
+      expect(isDeliveredCrypto(code)).toBe(true);
+    }
+  });
+
+  it('keeps the sell resolver closed to anything else, and delivered codes sellable', () => {
+    expect(() => resolveSellCode('BTC')).toThrow(Refusal);
+    expect(() => resolveForDirection('USDT_SOL_X', 'sell')).toThrow(Refusal);
+    expect(isSellable('BTC')).toBe(false);
+    expect(isSellable('USDC_ETHEREUM')).toBe(false);
+    expect(isOfframpOnly('DOT_ASSETHUB')).toBe(false);
+    expect(resolveForDirection('DOT_ASSETHUB', 'sell')).toEqual({ code: 'DOT_ASSETHUB' });
+    expect(isDeliveredCrypto('BTC')).toBe(false);
   });
 });

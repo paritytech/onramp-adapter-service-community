@@ -55,6 +55,7 @@ describe('parseConfig', () => {
     ['worker.session_max_age_ms', ['worker', 'session_max_age_ms'], 59_999, 30 * 24 * 3_600_000 + 1],
     ['supported.catalog_interval_ms', ['supported', 'catalog_interval_ms'], 59_999, 7 * 86_400_000 + 1],
     ['supported.routes_interval_ms', ['supported', 'routes_interval_ms'], 59_999, 86_400_001],
+    ['supported.sell_routes_interval_ms', ['supported', 'sell_routes_interval_ms'], 59_999, 7 * 86_400_000 + 1],
     ['auth.personhood.challenge_ttl_ms', ['auth', 'personhood', 'challenge_ttl_ms'], 999, 300_001],
     ['auth.personhood.token_ttl_s', ['auth', 'personhood', 'token_ttl_s'], 29, 3_601],
   ])('bounds %s at both ends', (_label, path, tooLow, tooHigh) => {
@@ -848,11 +849,43 @@ describe('parseConfig', () => {
 
   it('applies the supported-refresh defaults whether the block is omitted or empty', () => {
     // `.prefault({})` like cors/rate_limit: an absent or empty block is the documented defaults.
-    const defaults = { enabled: true, catalog_interval_ms: 24 * 3_600_000, routes_interval_ms: 2 * 3_600_000 };
+    const defaults = {
+      enabled: true,
+      catalog_interval_ms: 24 * 3_600_000,
+      routes_interval_ms: 2 * 3_600_000,
+      sell_routes_interval_ms: 12 * 3_600_000,
+      offramp_lanes: [{ code: 'DOT_ASSETHUB', chain: 'assethub' }],
+    };
     const omitted = rawConfig() as Record<string, unknown>;
     delete omitted.supported;
     expect(parseConfig(omitted).supported).toEqual(defaults);
     expect(parseConfig(rawConfig({ supported: {} })).supported).toEqual(defaults);
+  });
+
+  describe('supported.offramp_lanes', () => {
+    const lanes = (value: unknown) => () => parseConfig(rawConfig({ supported: { offramp_lanes: value } }));
+
+    it('accepts an ordered list of delivered and sell-only codes', () => {
+      const value = [
+        { code: 'DOT_ASSETHUB', chain: 'assethub' },
+        { code: 'USDC_ARBITRUM', chain: 'arbitrum' },
+        { code: 'USDT_SOLANA', chain: 'solana' },
+      ];
+      expect(lanes(value)()['supported'].offramp_lanes).toEqual(value);
+    });
+
+    it('refuses an empty list, an unknown code, a duplicate and an unknown key', () => {
+      expect(lanes([])).toThrow();
+      expect(lanes([{ code: 'BTC', chain: 'bitcoin' }])).toThrow(/Unknown offramp lane code/);
+      expect(
+        lanes([
+          { code: 'USDT_SOLANA', chain: 'solana' },
+          { code: 'USDT_SOLANA', chain: 'solana' },
+        ]),
+      ).toThrow(/Duplicate/);
+      expect(lanes([{ code: 'USDT_SOLANA', chain: 'solana', extra: 1 }])).toThrow();
+      expect(lanes([{ code: 'USDT_SOLANA' }])).toThrow();
+    });
   });
 
   it('gives each Meld endpoint its own cache lifetime, on the scale its data moves', () => {
@@ -874,6 +907,13 @@ describe('parseConfig', () => {
     raw.supported = { enabled: true, catalog_interval_ms: 3_600_000, routes_interval_ms: 3_600_000 };
     raw.meld = { ...(raw.meld as Record<string, unknown>), routes_cache_ttl_ms: 3_600_000 };
     expect(() => parseConfig(raw)).toThrow(/routes_cache_ttl_ms/);
+  });
+
+  it('refuses a routes cache lifetime at or above the sell routes interval', () => {
+    const raw = rawConfig() as Record<string, unknown>;
+    raw.supported = { enabled: true, sell_routes_interval_ms: 3_600_000 };
+    raw.meld = { ...(raw.meld as Record<string, unknown>), routes_cache_ttl_ms: 3_600_000 };
+    expect(() => parseConfig(raw)).toThrow(/sell_routes_interval_ms/);
   });
 
   it('leaves the lifetimes alone when the refresh is off, because nothing is renewing them', () => {

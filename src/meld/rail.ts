@@ -216,7 +216,7 @@ function depositFrom(record: FundingRecord, txn: MeldTransaction): RailDeposit |
   const details = txn.cryptoDetails;
   const named = given(details?.destinationWalletAddress);
   const former = given(details?.offrampDestinationWalletAddress);
-  if (named !== undefined && former !== undefined && !sameAccount(named, former)) return undefined;
+  if (named !== undefined && former !== undefined && !sameAccount(named, former, record.destination_currency_code)) return undefined;
   const address = named ?? former;
   const amount = given(txn.sourceAmount);
   const currency = given(txn.sourceCurrencyCode);
@@ -230,7 +230,7 @@ function given(value: string | null | undefined): string | undefined {
 }
 
 /** Whether two disclosed addresses are one account, whatever their SS58 prefix. */
-function sameAccount(a: string, b: string): boolean {
-  const canonical = canonicalizeDisclosedAddress(a);
-  return canonical !== undefined && canonical === canonicalizeDisclosedAddress(b);
+function sameAccount(a: string, b: string, code: string): boolean {
+  const canonical = canonicalizeDisclosedAddress(a, code);
+  return canonical !== undefined && canonical === canonicalizeDisclosedAddress(b, code);
 }

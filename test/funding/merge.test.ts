@@ -251,3 +251,34 @@ describe('mergeAdvance: the deposit disclosure', () => {
     expect(next.deposit_address).toBeUndefined();
   });
 });
+
+describe('mergeAdvance: a Solana deposit on a sell-only code', () => {
+  const SOLANA = 'So11111111111111111111111111111111111111112';
+  const OTHER = 'Vote111111111111111111111111111111111111111';
+  const solSell = () => ({ ...inFlight(), destination_currency_code: 'USDT_SOLANA' });
+  const sol = (address: string) => deposit({ address, currency: 'USDT_SOLANA' });
+
+  it('stores the base58 address exactly as disclosed', () => {
+    const next = mergeAdvance(solSell(), 'transaction_seen', NOW, { deposit: sol(SOLANA) });
+    expect(next.deposit_address).toBe(SOLANA);
+    expect(next.deposit_conflict_reason).toBeUndefined();
+  });
+
+  it('compares exactly: a repeat is quiet, another key or a case change is a conflict', () => {
+    const first = mergeAdvance(solSell(), 'transaction_seen', NOW, { deposit: sol(SOLANA) });
+    const same = mergeAdvance(first, 'transaction_seen', NOW + 1, { deposit: sol(SOLANA) });
+    expect(same.deposit_conflict_at).toBeUndefined();
+
+    const other = mergeAdvance(first, 'transaction_seen', NOW + 2, { deposit: sol(OTHER) });
+    expect(other.deposit_conflict_reason).toBe('address_changed');
+
+    const cased = mergeAdvance(first, 'transaction_seen', NOW + 3, { deposit: sol(SOLANA.toLowerCase()) });
+    expect(cased.deposit_address).toBe(SOLANA);
+    expect(cased.deposit_conflict_address).toBe(SOLANA.toLowerCase());
+  });
+
+  it('refuses an SS58 address on a Solana row as malformed', () => {
+    const next = mergeAdvance(solSell(), 'transaction_seen', NOW, { deposit: sol(ALICE) });
+    expect(next.deposit_conflict_reason).toBe('address_malformed');
+  });
+});

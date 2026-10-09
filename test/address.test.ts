@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { encodeAddress } from '@polkadot/util-crypto';
 
-import { normalizeAddress } from '../src/address.js';
+import { canonicalizeDisclosedAddress, normalizeAddress } from '../src/address.js';
 import { Refusal } from '../src/contract.js';
 
 // Alice, the canonical well-known account.
@@ -54,5 +54,46 @@ describe('normalizeAddress', () => {
     // plausible address that nobody controls, in a locked checkout field.
     const short = encodeAddress(ALICE_PUBKEY.slice(0, 8), 0);
     expect(() => normalizeAddress(short)).toThrow(/8 bytes, expected 32/);
+  });
+});
+
+describe('canonicalizeDisclosedAddress for a sell-only code', () => {
+  const SOLANA = 'So11111111111111111111111111111111111111112';
+
+  it('passes a base58 Solana key through unchanged', () => {
+    expect(canonicalizeDisclosedAddress(SOLANA, 'USDT_SOLANA')).toBe(SOLANA);
+    expect(canonicalizeDisclosedAddress(SOLANA, 'USDC_SOLANA')).toBe(SOLANA);
+  });
+
+  it('refuses empty, non-base58 and wrong-length values', () => {
+    expect(canonicalizeDisclosedAddress('', 'USDT_SOLANA')).toBeUndefined();
+    expect(canonicalizeDisclosedAddress('0OIl', 'USDT_SOLANA')).toBeUndefined();
+    expect(canonicalizeDisclosedAddress('abc', 'USDT_SOLANA')).toBeUndefined();
+  });
+
+  it('leaves SS58 handling for Asset Hub codes as it was', () => {
+    expect(canonicalizeDisclosedAddress(ALICE_PREFIX_42, 'DOT_ASSETHUB')).toBe(ALICE_PREFIX_0);
+    expect(canonicalizeDisclosedAddress(ALICE_PREFIX_42)).toBe(ALICE_PREFIX_0);
+    expect(canonicalizeDisclosedAddress(SOLANA, 'DOT_ASSETHUB')).toBeUndefined();
+  });
+});
+
+describe('canonicalizeDisclosedAddress for an EVM sell-only code', () => {
+  const MIXED = '0xAbCdEf0123456789aBcDeF0123456789AbCdEf01';
+
+  it('accepts 0x plus 40 hex and lowercases it, so casings compare equal', () => {
+    expect(canonicalizeDisclosedAddress(MIXED, 'USDC_ARBITRUM')).toBe(MIXED.toLowerCase());
+    expect(canonicalizeDisclosedAddress(MIXED.toLowerCase(), 'USDC_ARBITRUM')).toBe(MIXED.toLowerCase());
+  });
+
+  it('refuses everything else, including Solana and SS58 values', () => {
+    for (const bad of ['', '0x', '0x1234', `${MIXED}ab`, MIXED.slice(2), `0x${'g'.repeat(40)}`, 'So11111111111111111111111111111111111111112', ALICE_PREFIX_0]) {
+      expect(canonicalizeDisclosedAddress(bad, 'USDC_ARBITRUM')).toBeUndefined();
+    }
+  });
+
+  it('is not accepted for the other codes', () => {
+    expect(canonicalizeDisclosedAddress(MIXED, 'USDC_SOLANA')).toBeUndefined();
+    expect(canonicalizeDisclosedAddress(MIXED, 'DOT_ASSETHUB')).toBeUndefined();
   });
 });

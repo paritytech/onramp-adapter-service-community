@@ -133,7 +133,7 @@ function mergeDeposit(previous: FundingRecord, incoming: RailDeposit | undefined
   // this service's own integrity problem. `undefined` here means exactly "could not canonicalise",
   // nothing more specific, and it is handled identically to a conflicting well-formed address:
   // recorded, not disclosed, not fatal to a state move riding alongside it.
-  const canonical = canonicalizeDisclosedAddress(incoming.address);
+  const canonical = canonicalizeDisclosedAddress(incoming.address, previous.destination_currency_code);
 
   if (canonical === undefined) {
     return {

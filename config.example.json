@@ -106,6 +106,12 @@
   "supported": {
     "enabled": true,
     "catalog_interval_ms": 86400000,
-    "routes_interval_ms": 7200000
+    "routes_interval_ms": 7200000,
+    "sell_routes_interval_ms": 43200000,
+    "offramp_lanes": [
+      { "code": "DOT_ASSETHUB", "chain": "assethub" },
+      { "code": "USDC_ARBITRUM", "chain": "arbitrum" },
+      { "code": "USDC_SOLANA", "chain": "solana" }
+    ]
   }
 }

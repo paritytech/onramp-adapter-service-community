@@ -36,8 +36,10 @@ const jobKey = (job: RefreshJob): string => `${job.direction}|${job.crypto}`;
 export interface RefreshIntervals {
   /** Countries + default fiat. Meld calls both rarely-changing. */
   catalogMs: number;
-  /** Routes, which carry the limits. */
+  /** Routes, which carry the limits, for buy jobs. */
   routesMs: number;
+  /** Routes for sell jobs; absent means the same cadence as `routesMs`. */
+  sellRoutesMs?: number;
 }
 
 const message = (error: unknown): string => (error instanceof Error ? error.message : String(error));
@@ -175,9 +177,12 @@ export function startSupportedRefresh(
     }
   };
 
-  const routesPass = async (): Promise<void> => {
+  // `only` narrows a pass to one direction so buy and sell can run on their own cadences; the boot
+  // pass and tests call it bare and walk every job.
+  const routesPass = async (only?: Direction): Promise<void> => {
     for (const job of jobs) {
       if (signal.aborted) break;
+      if (only !== undefined && job.direction !== only) continue;
       let catalog = catalogs.get(jobKey(job));
       // The boot catalog pass failed. Rebuild here rather than waiting out `catalogMs`, which
       // would leave the endpoint empty for a day over a blip during a deploy.
@@ -236,7 +241,11 @@ export function startSupportedRefresh(
       await catalogPass();
       await routesPass();
     });
-    await Promise.all([every(intervals.catalogMs, catalogPass), every(intervals.routesMs, routesPass)]);
+    await Promise.all([
+      every(intervals.catalogMs, catalogPass),
+      every(intervals.routesMs, () => routesPass('buy')),
+      every(intervals.sellRoutesMs ?? intervals.routesMs, () => routesPass('sell')),
+    ]);
   })();
 
   return {
