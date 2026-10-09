@@ -2,7 +2,7 @@ import { encodeAddress } from '@polkadot/util-crypto';
 import { vi } from 'vitest';
 
 import { parseConfig, type Config } from '../src/config.js';
-import { TERMINAL_STATES, type FundingState } from '../src/funding/state.js';
+import { TERMINAL_STATES, pathTo, type FundingState } from '../src/funding/state.js';
 import type { KycCache, MeldCustomerRow } from '../src/funding/customer.js';
 import { mergeAdvance } from '../src/funding/merge.js';
 import type { FundingStore, SupportedCorridorRow } from '../src/funding/store.js';
@@ -561,6 +561,16 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       rows.set(id, updated);
       return structuredClone(updated);
     }) satisfies FundingStore['update'],
+    // The real store's path planning and merge, so a webhook test reads the same timeline.
+    advanceTo: (async (id: string, to: FundingState, now: number, extra: Parameters<FundingStore['advanceTo']>[3]) => {
+      const previous = rows.get(id);
+      if (previous === undefined) return undefined;
+      const steps = pathTo(previous.status, to) ?? [];
+      if (steps.length === 0) return { from: previous.status, record: structuredClone(previous) };
+      const updated = steps.reduce((record, step) => mergeAdvance(record, step, now, extra), previous);
+      rows.set(id, updated);
+      return { from: previous.status, record: structuredClone(updated) };
+    }) satisfies FundingStore['advanceTo'],
     upsertCorridor: async (row: Omit<SupportedCorridorRow, 'updated_at'>) => {
       // A far-future stamp so a row is always "fresh" against any test clock's read window.
       corridors.set(`${row.destination_currency_code}|${row.direction}|${row.country}`, {
@@ -600,12 +610,26 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       customers.set(`${found.product_id}|${found.customer_key_hash}`, updated);
       return structuredClone(updated);
     }) satisfies FundingStore['updateKycCache'],
+    mergeKycCache: (async (meldCustomerId: string, patch: KycCache, now: number) => {
+      const found = [...customers.values()].find((c) => c.meld_customer_id === meldCustomerId);
+      if (found === undefined) return undefined;
+      const { providers, ...rest } = structuredClone(patch);
+      const merged: KycCache = {
+        ...found.kyc_cache,
+        ...rest,
+        ...(providers === undefined ? {} : { providers: { ...found.kyc_cache.providers, ...providers } }),
+      };
+      const updated = { ...found, kyc_cache: merged, updated_at: now };
+      customers.set(`${found.product_id}|${found.customer_key_hash}`, updated);
+      return structuredClone(updated);
+    }) satisfies FundingStore['mergeKycCache'],
     deleteCustomer: (async (productId: string, customerKeyHash: string, meldCustomerId: string) => {
       const key = `${productId}|${customerKeyHash}`;
       if (customers.get(key)?.meld_customer_id !== meldCustomerId) return false;
       return customers.delete(key);
     }) satisfies FundingStore['deleteCustomer'],
     webhookEvents,
+    webhookEventSeen: (async (eventId: string) => webhookEvents.has(eventId)) satisfies FundingStore['webhookEventSeen'],
     recordWebhookEvent: (async (eventId: string) => {
       if (webhookEvents.has(eventId)) return false;
       webhookEvents.add(eventId);

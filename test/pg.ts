@@ -279,6 +279,37 @@ export async function whileRowLocked<T>(schema: string, id: string, body: () => 
 }
 
 /**
+ * Run `body` in a transaction on a connection of its own, committed when `body` returns, so a test
+ * can hold the locks its writes take while a store's statement waits on them.
+ */
+export async function inTransaction<T>(
+  schema: string,
+  body: (query: (sql: string) => Promise<Record<string, unknown>[]>) => Promise<T>,
+): Promise<T> {
+  const cfg = baseConfig();
+  const pool = new Pool({
+    host: cfg.host,
+    port: cfg.port,
+    database: cfg.database,
+    user: cfg.user,
+    password: cfg.password.expose(),
+    options: `-c search_path="${schema}"`,
+    max: 1,
+  });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await body(async (sql) => (await client.query(sql)).rows as Record<string, unknown>[]);
+    await client.query('COMMIT');
+    return result;
+  } finally {
+    await client.query('ROLLBACK').catch(() => undefined);
+    client.release();
+    await pool.end();
+  }
+}
+
+/**
  * Run arbitrary SQL against one schema, outside any store, and return its rows.
  *
  * Here rather than in the suite that wants it, because building a second connection by hand means

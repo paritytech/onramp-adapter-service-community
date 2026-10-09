@@ -722,7 +722,7 @@ afterEach(async () => {
     expect(meldRequests).toBe(0);
   });
 
-  it('boots with Meld Headless and serves the customer routes', async () => {
+  it('boots with Meld Headless and serves the customer and webhook routes', async () => {
     const baseUrl = await fakeMeld({ quotes: [] });
     const path = await writeConfig('headless-ok', baseUrl);
     const raw = JSON.parse(await readFile(path, 'utf8')) as { meld: Record<string, unknown>; customer?: unknown };
@@ -738,6 +738,10 @@ afterEach(async () => {
     const response = await handle.app.inject({ method: 'GET', url: '/customer', headers: { 'x-dev-product-id': 'app.dot' } });
     expect(response.statusCode).toBe(401);
     expect(response.json().error.value.code).toBe('CUSTOMER_TOKEN_INVALID');
+
+    const unsigned = await handle.app.inject({ method: 'POST', url: '/webhooks/meld', payload: { eventType: 'WEBHOOK_TEST' } });
+    expect(unsigned.statusCode).toBe(401);
+    expect(unsigned.json().error.value.code).toBe('WEBHOOK_SIGNATURE_INVALID');
   });
 
   it('boots in personhood mode and serves the handshake', async () => {

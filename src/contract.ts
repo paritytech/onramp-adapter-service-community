@@ -266,6 +266,25 @@ export const bankDetailsUnreadable = (detail: string) =>
     detail,
   );
 
+/**
+ * `401`: a Meld webhook whose signature does not verify or whose timestamp is outside the
+ * tolerance. One code for every cause, so a sender learns nothing about which check failed.
+ */
+export const webhookSignatureInvalid = (detail: string) =>
+  new Refusal(
+    401,
+    { tag: 'Other', value: { code: 'WEBHOOK_SIGNATURE_INVALID', message: 'The webhook signature was not accepted.' } },
+    detail,
+  );
+
+/** `503`: a verified Meld webhook that could not be applied. Meld redelivers it. */
+export const webhookNotApplied = (detail: string) =>
+  new Refusal(
+    503,
+    { tag: 'Other', value: { code: 'WEBHOOK_NOT_APPLIED', message: 'The webhook could not be applied yet.' } },
+    detail,
+  );
+
 // --- requests ---------------------------------------------------------------
 
 /**

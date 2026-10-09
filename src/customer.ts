@@ -57,7 +57,7 @@ export interface CustomerLog {
 }
 
 /** Meld's Unified KYC provider, and the only one this service starts KYC with. */
-const UNIFIED_KYC = 'SUMSUB';
+export const UNIFIED_KYC = 'SUMSUB';
 
 const FINAL_KYC: ReadonlySet<KycState> = new Set(['approved', 'rejected', 'expired']);
 

@@ -4,6 +4,7 @@ import {
   FUNDING_STATES,
   IllegalTransition,
   TERMINAL_STATES,
+  pathTo,
   transition,
   type FundingState,
 } from '../../src/funding/state.js';
@@ -96,5 +97,37 @@ describe('the funding state machine', () => {
     expect(error.from).toBe('settled');
     expect(error.to).toBe('session_opened');
     expect(error.message).toContain('illegal funding transition');
+  });
+
+  describe('pathTo', () => {
+    it('walks through the states a report skipped', () => {
+      expect(pathTo('session_opened', 'settled')).toEqual(['transaction_seen', 'settled']);
+      expect(pathTo('session_opened', 'failed')).toEqual(['transaction_seen', 'failed']);
+      expect(pathTo('created', 'settled')).toEqual(['session_opened', 'transaction_seen', 'settled']);
+      expect(pathTo('transaction_seen', 'settled')).toEqual(['settled']);
+    });
+
+    it('is empty for the state a row is already in', () => {
+      expect(pathTo('transaction_seen', 'transaction_seen')).toEqual([]);
+      expect(pathTo('settled', 'settled')).toEqual([]);
+    });
+
+    it('has no way out of a terminal state, nor back to an earlier one', () => {
+      expect(pathTo('settled', 'failed')).toBeUndefined();
+      expect(pathTo('expired', 'settled')).toBeUndefined();
+      expect(pathTo('transaction_seen', 'session_opened')).toBeUndefined();
+    });
+
+    it('only ever proposes moves `transition` accepts', () => {
+      for (const from of FUNDING_STATES) {
+        for (const to of FUNDING_STATES) {
+          const path = pathTo(from, to);
+          if (path === undefined) continue;
+          let at: FundingState = from;
+          for (const step of path) at = transition(at, step);
+          expect(at).toBe(to);
+        }
+      }
+    });
   });
 });

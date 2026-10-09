@@ -60,7 +60,7 @@ import type {
  * where a wrong guess concludes a sale that is still live. The real list comes from one observed
  * sandbox sell, which needs a provider that off-ramps the asset.
  */
-const MELD_STATUS_TO_STATE: TransactionMapper = (status) => {
+export const MELD_STATUS_TO_STATE: TransactionMapper = (status) => {
   const value = status?.toUpperCase();
   if (value === 'SETTLED' || value === 'COMPLETED' || value === 'SUCCESS' || value === 'SUCCEEDED') return 'settled';
   if (

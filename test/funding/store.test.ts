@@ -14,6 +14,7 @@ import {
 import {
   createSchema,
   dropSchema,
+  inTransaction,
   openIn,
   rawQuery,
   storePassword,
@@ -1253,13 +1254,83 @@ describe('headless funding rows', () => {
   });
 });
 
+describe('advancing a row to a reported state', () => {
+  type AdvanceSurface = Pick<FundingStore, 'create' | 'byId' | 'update' | 'advanceTo'>;
+  const onBothStores = (body: (store: AdvanceSurface) => Promise<void>) => async () => {
+    await withStore(body);
+    await body(fakeStore());
+  };
+
+  it(
+    'walks a row through the states between, writing the transaction facts once',
+    onBothStores(async (store) => {
+      await store.create(headlessRecord());
+      const result = await store.advanceTo('funding-1', 'settled', 1_700_000_000_100, {
+        providerTransactionId: 'tx-1',
+        providerStatus: 'SETTLED',
+      });
+      expect(result?.from).toBe('session_opened');
+      expect(result?.record).toMatchObject({
+        status: 'settled',
+        provider_transaction_id: 'tx-1',
+        provider_status: 'SETTLED',
+        status_history: [
+          { status: 'session_opened', at: 1_700_000_000_000 },
+          { status: 'transaction_seen', at: 1_700_000_000_100 },
+          { status: 'settled', at: 1_700_000_000_100 },
+        ],
+      });
+      expect(await store.byId('funding-1')).toEqual(result?.record);
+    }),
+  );
+
+  it(
+    'plans against the row as it stands, after a move made since it was last read',
+    onBothStores(async (store) => {
+      await store.create(headlessRecord());
+      await store.update('funding-1', 'transaction_seen', 1_700_000_000_050, { providerTransactionId: 'tx-1' });
+      const result = await store.advanceTo('funding-1', 'failed', 1_700_000_000_100, { providerStatus: 'FAILED' });
+      expect(result?.from).toBe('transaction_seen');
+      expect(result?.record.status_history.map((entry) => entry.status)).toEqual([
+        'session_opened',
+        'transaction_seen',
+        'failed',
+      ]);
+    }),
+  );
+
+  it(
+    'writes nothing for a row already there, or one that cannot get there',
+    onBothStores(async (store) => {
+      await store.create(headlessRecord({ id: 'seen', meld_order_id: 'order-seen', status: 'transaction_seen' }));
+      await store.create(headlessRecord({ id: 'settled', meld_order_id: 'order-settled', status: 'settled' }));
+      const unmoved = await store.advanceTo('seen', 'transaction_seen', 2, { providerStatus: 'SETTLING' });
+      expect(unmoved).toEqual({ from: 'transaction_seen', record: await store.byId('seen') });
+      expect(unmoved?.record.provider_status).toBeUndefined();
+
+      const concluded = await store.advanceTo('settled', 'failed', 2, { providerStatus: 'FAILED' });
+      expect(concluded).toEqual({ from: 'settled', record: await store.byId('settled') });
+      expect(concluded?.record.status).toBe('settled');
+
+      expect(await store.advanceTo('missing', 'settled', 2, {})).toBeUndefined();
+    }),
+  );
+});
+
 /**
  * The customer and webhook surface, run against Postgres and against the in-memory fake, so the
  * fake the route suites write through cannot drift from the table's constraints.
  */
 type CustomerSurface = Pick<
   FundingStore,
-  'customerByKey' | 'customerByMeldId' | 'insertCustomer' | 'updateKycCache' | 'deleteCustomer' | 'recordWebhookEvent'
+  | 'customerByKey'
+  | 'customerByMeldId'
+  | 'insertCustomer'
+  | 'updateKycCache'
+  | 'mergeKycCache'
+  | 'deleteCustomer'
+  | 'webhookEventSeen'
+  | 'recordWebhookEvent'
 >;
 
 const onBoth = (body: (store: CustomerSurface) => Promise<void>) => async () => {
@@ -1344,6 +1415,73 @@ describe('meld customers', () => {
   );
 
   it(
+    'merges KYC states: kyc replaces, providers merge entry by entry',
+    onBoth(async (store) => {
+      await store.insertCustomer(customerRow({ kyc_cache: { kyc: 'pending', providers: { BANXA: 'pending' } } }));
+      const merged = await store.mergeKycCache('meld-customer-1', { providers: { NOAH: 'approved' } }, 1_700_000_000_500);
+      expect(merged).toEqual(
+        customerRow({
+          kyc_cache: { kyc: 'pending', providers: { BANXA: 'pending', NOAH: 'approved' } },
+          updated_at: 1_700_000_000_500,
+        }),
+      );
+      await store.mergeKycCache('meld-customer-1', { kyc: 'approved', providers: { BANXA: 'rejected' } }, 1_700_000_000_600);
+      expect((await store.customerByMeldId('meld-customer-1'))?.kyc_cache).toEqual({
+        kyc: 'approved',
+        providers: { BANXA: 'rejected', NOAH: 'approved' },
+      });
+    }),
+  );
+
+  it(
+    'merges providers into a cache that has none, and adds none when the patch has none',
+    onBoth(async (store) => {
+      await store.insertCustomer(customerRow());
+      await store.mergeKycCache('meld-customer-1', { kyc: 'pending' }, 1);
+      expect((await store.customerByMeldId('meld-customer-1'))?.kyc_cache).toEqual({ kyc: 'pending' });
+      await store.mergeKycCache('meld-customer-1', { providers: { NOAH: 'pending' } }, 2);
+      expect((await store.customerByMeldId('meld-customer-1'))?.kyc_cache).toEqual({
+        kyc: 'pending',
+        providers: { NOAH: 'pending' },
+      });
+      expect(await store.mergeKycCache('meld-customer-404', { kyc: 'approved' }, 3)).toBeUndefined();
+    }),
+  );
+
+  it('merges onto a cache another writer changed while the merge waited, losing neither', async () => {
+    const schema = await createSchema();
+    const store = await openIn(schema);
+    try {
+      await store.insertCustomer(customerRow({ kyc_cache: { kyc: 'pending' } }));
+      let merging: Promise<unknown> | undefined;
+      await inTransaction(schema, async (query) => {
+        await query(
+          `UPDATE meld_customers SET kyc_cache = '{"kyc":"pending","providers":{"NOAH":"approved"}}' ` +
+            "WHERE meld_customer_id = 'meld-customer-1'",
+        );
+        merging = store.mergeKycCache('meld-customer-1', { providers: { BANXA: 'approved' } }, 5);
+        // Commit only once the merge is queued behind this transaction's row lock.
+        for (;;) {
+          const waiting = await query(
+            "SELECT 1 FROM pg_locks WHERE locktype = 'transactionid' AND NOT granted " +
+              'AND transactionid::text = pg_current_xact_id()::text',
+          );
+          if (waiting.length > 0) break;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      });
+      await merging;
+      expect((await store.customerByMeldId('meld-customer-1'))?.kyc_cache).toEqual({
+        kyc: 'pending',
+        providers: { NOAH: 'approved', BANXA: 'approved' },
+      });
+    } finally {
+      await store.close();
+      await dropSchema(schema);
+    }
+  });
+
+  it(
     'removes a mapping only while it still names the Meld customer read',
     onBoth(async (store) => {
       await store.insertCustomer(customerRow());
@@ -1393,7 +1531,9 @@ describe('meld webhook events', () => {
   it(
     'records an event once and reports every redelivery as a duplicate',
     onBoth(async (store) => {
+      expect(await store.webhookEventSeen('evt-1')).toBe(false);
       expect(await store.recordWebhookEvent('evt-1', 'TRANSACTION_CRYPTO_PENDING', 1)).toBe(true);
+      expect(await store.webhookEventSeen('evt-1')).toBe(true);
       expect(await store.recordWebhookEvent('evt-1', 'TRANSACTION_CRYPTO_PENDING', 2)).toBe(false);
       expect(await store.recordWebhookEvent('evt-2', 'TRANSACTION_CRYPTO_PENDING', 3)).toBe(true);
     }),

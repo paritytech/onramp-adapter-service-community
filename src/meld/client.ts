@@ -931,8 +931,9 @@ export class MeldClient {
     };
   }
 
-  async transaction(id: string): Promise<MeldTransaction> {
-    const body = await this.send('GET', transactionPath(id));
+  /** `headless` reads under the headless version, the only one Meld documents `orderId` on. */
+  async transaction(id: string, options: { headless?: boolean } = {}): Promise<MeldTransaction> {
+    const body = await this.send('GET', transactionPath(id), undefined, options.headless === true ? this.headless() : {});
     return this.read(singleTransactionResponse, body, 'transaction');
   }
 

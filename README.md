@@ -79,9 +79,9 @@ the rules on where each secret may come from.
 ## The API
 
 Thirteen routes: the authenticated Meld calls and funding reads, the two public personhood handshake
-routes, the widget's return landing, and a liveness probe. With Meld Headless enabled, ten more
-serve the headless customer: its key proof, registration, KYC, contact verification, provider
-requirements and orders.
+routes, the widget's return landing, and a liveness probe. With Meld Headless enabled, eleven more:
+ten serve the headless customer (its key proof, registration, KYC, contact verification, provider
+requirements and orders), and `POST /webhooks/meld` takes Meld's signed status events.
 [docs/api.md](docs/api.md) is the reference.
 
 ## Testing
@@ -145,7 +145,8 @@ an operator can tie a running pod to a commit in this repository.
 
 ## What is deliberately absent
 
-- **Webhook ingress and reconciliation.** Session status is polled through `GET /funding/:id`.
+- **Webhooks for widget sessions.** Meld's webhooks move headless orders only; a widget session is
+  concluded by the settlement worker, and its status is polled through `GET /funding/:id`.
 - **A second funding rail.** Chainflip is registered and refuses: it swaps on-chain assets and has
   no fiat leg, so a card purchase has no correct source asset.
 - **Horizontal scaling.** The rate limiter is in-process, which pins one replica; see Deploying it.
@@ -214,6 +215,8 @@ Report a security issue if it demonstrates realistic impact against one or more 
 - Remote code execution in a realistic deployment
 - Server-side request forgery, or any path that induces a request to a host other than the
   configured Meld endpoint
+- A Meld webhook acted on without a signature made with `meld.webhook.secret` over
+  `meld.webhook.url` and the exact body, or with a timestamp outside `meld.webhook.tolerance_ms`
 
 ### What is not worth reporting
 
@@ -228,9 +231,8 @@ Report a security issue if it demonstrates realistic impact against one or more 
   `per_address_max` (default 30). That the alias is contextual on the product id *and* on the
   People collection, so one person's effective ceiling multiplies with
   `allowed_products.length x collections.length`, is already recorded as residual **R13** in the
-  threat model.
-- Webhook ingress and reconciliation. Both are deliberately absent from this version. Session
-  status, by contrast, has shipped: `GET /funding` and `GET /funding/:id`.
+  threat model. `GET /health` and `POST /webhooks/meld` are exempt by design: the webhook's
+  deliveries come from a few Meld addresses, and its signature is checked before anything else.
 
 ### Reporting a vulnerability
 

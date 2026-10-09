@@ -2,7 +2,7 @@
  * The HTTP surface: the authenticated routes (every one wrapped in `asCaller`, so a grep answers
  * which and how many), the two public handshake routes, the widget's return landing, and a
  * liveness probe. With Meld Headless enabled, the customer key, customer, requirements and order
- * routes join the authenticated set.
+ * routes join the authenticated set, and Meld's signed webhook joins the public one.
  *
  * Two invariants live here rather than in the docs, because both are easy to break locally:
  * every failure becomes a response in one of exactly three places (the error handler, the
@@ -16,6 +16,7 @@ import rateLimit, { type FastifyRateLimitStoreCtor } from '@fastify/rate-limit';
 import Fastify, {
   type FastifyError,
   type FastifyInstance,
+  type FastifyPluginAsync,
   type FastifyReply,
   type FastifyRequest,
 } from 'fastify';
@@ -28,6 +29,7 @@ import { callerGate } from './caller.js';
 import { toOriginMatcher, type Config } from './config.js';
 import { customerAuth, customerGate, type CustomerKeys } from './customer-auth.js';
 import type { CustomerLog, CustomerService } from './customer.js';
+import type { MeldWebhooks } from './meld/webhook.js';
 import type { PersonhoodService } from './personhood.js';
 import {
   createOrderRequest,
@@ -39,6 +41,7 @@ import {
   requirementsQuery,
   verificationConfirmation,
   verificationRequest,
+  webhookSignatureInvalid,
   quoteRequest,
   supportedQuery,
   supportedCountriesQuery,
@@ -89,6 +92,13 @@ type CustomerPort = Pick<
 /** Built like `Onramp`, from the app's loggers. Called only when Meld Headless is enabled. */
 type CustomerFactory = (audit: AuditLog, log: CustomerLog) => CustomerPort;
 
+type WebhookPort = Pick<MeldWebhooks, 'signatureFault' | 'handle'>;
+
+const MELD_WEBHOOK = '/webhooks/meld';
+
+/** Meld's events are small; the rest of the service keeps its 16 KiB limit. */
+const MELD_WEBHOOK_BODY_LIMIT = 64 * 1024;
+
 /**
  * Where log lines go. Defaults to stdout; a test passes a stream it can read.
  *
@@ -106,6 +116,7 @@ export async function buildServer(
   logDestination?: LogDestination,
   customerKeys?: CustomerKeys,
   makeCustomers?: CustomerFactory,
+  webhooks?: WebhookPort,
 ): Promise<FastifyInstance> {
   const app = Fastify({
     // A request id on every log line and every error body, so a support conversation can
@@ -229,8 +240,12 @@ export async function buildServer(
     // `routeOptions.url` is the matched route pattern; `request.url` is the raw target, so
     // `/health?probe=1` missed this and got throttled: exactly the outage the exemption
     // exists to prevent, triggered by any orchestrator that adds a cache-buster.
+    //
+    // Meld's webhook is exempt too: its deliveries come from a few Meld addresses, so one address
+    // bucket would throttle them, and a throttled delivery is retried for hours rather than lost.
+    // The signature check is what stands in front of it.
     allowList: (request: { routeOptions: { url?: string | undefined } }) =>
-      request.routeOptions.url === '/health',
+      request.routeOptions.url === '/health' || request.routeOptions.url === MELD_WEBHOOK,
     timeWindow: cfg.rate_limit.window_seconds * 1_000,
     // No `errorResponseBuilder`: the handler below shapes every response. A builder here was
     // silently overwritten by it, turning a 429 into "malformed request".
@@ -473,6 +488,8 @@ export async function buildServer(
       const query = parse(requirementsQuery, request.query);
       return reply.send(await customers.requirements(subject, keyHash, query));
     });
+
+    if (webhooks === undefined) throw new Error('meld.headless.enabled requires the webhook service.');
   }
 
   /**
@@ -676,5 +693,34 @@ export async function buildServer(
     return send(500, { tag: 'Other', value: { code: 'INTERNAL', message: 'Something went wrong.' } });
   });
 
+  // Registered last: the scope takes the error handler above as it stands when it loads.
+  if (customer !== undefined && webhooks !== undefined) await app.register(meldWebhookRoute(webhooks));
+
   return app;
+}
+
+/**
+ * Meld's webhook, in its own scope. No caller auth: the signature is the authentication, and it is
+ * checked over the body's exact bytes, so the scope takes the body as bytes and JSON is read only
+ * after the check. No CORS: Meld calls server to server. `200` acknowledges, `401` refuses the
+ * signature, and Meld redelivers on anything else.
+ */
+function meldWebhookRoute(webhooks: WebhookPort): FastifyPluginAsync {
+  return async (scope) => {
+    scope.removeAllContentTypeParsers();
+    scope.addContentTypeParser('application/json', { parseAs: 'buffer' }, (_request, body: Buffer, done) => {
+      done(null, body);
+    });
+    scope.post(MELD_WEBHOOK, { bodyLimit: MELD_WEBHOOK_BODY_LIMIT }, async (request, reply) => {
+      const header = (name: string) => {
+        const value = request.headers[name];
+        return typeof value === 'string' ? value : undefined;
+      };
+      const body = Buffer.isBuffer(request.body) ? request.body : Buffer.alloc(0);
+      const fault = webhooks.signatureFault(header('meld-signature'), header('meld-signature-timestamp'), body);
+      if (fault !== undefined) throw webhookSignatureInvalid(fault);
+      await webhooks.handle(body, request.log);
+      return reply.code(200).send();
+    });
+  };
 }

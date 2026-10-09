@@ -10,7 +10,8 @@ Meld Headless enabled (`meld.headless.enabled`), ten more make nineteen: `POST /
 `POST /customer/token` and `GET /requirements` take caller auth, and `GET /customer`,
 `POST /customer`, `POST /customer/kyc`, `POST /customer/details`, `POST /customer/verifications`,
 `POST /customer/verifications/confirm` and `POST /order` also take a customer token. The unauthenticated
-remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
+remainder is `GET /health`, `GET /meld/return`, the two handshake routes and, with Meld Headless
+enabled, `POST /webhooks/meld`, which Meld's signature authenticates instead.
 
 | Endpoint | Proxies | Purpose |
 | --- | --- | --- |
@@ -26,6 +27,7 @@ remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
 | `POST /customer/verifications/confirm` | `POST .../verifications/{id}/confirm` | Headless only. Checks a code. Customer token. |
 | `GET /requirements` | `GET /crypto/onramp/{provider}/requirements` | Headless only. What a provider needs before an order: agreements, verifications, fields. Caller auth, customer token optional. |
 | `POST /order` | `POST /crypto/order/headless/onramp` | Headless only. Places a card or bank order for the caller's customer and persists a durable funding request. Customer token. |
+| `POST /webhooks/meld` | `GET /payments/transactions/{id}` | Headless only. Meld's signed webhook: moves a headless order's funding request and refreshes a customer's KYC states. No caller auth, no CORS, not rate limited. |
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
@@ -54,8 +56,8 @@ endpoint for `CRYPTO_OFFRAMP` (it answers `404` for every country); the substitu
 
 ## Bounds a caller will meet
 
-- Request body limit **16 KiB**. Whole request and idle connection bounded by
-  `server.request_timeout_ms`.
+- Request body limit **16 KiB**, and **64 KiB** on `POST /webhooks/meld`. Whole request and idle
+  connection bounded by `server.request_timeout_ms`.
 - CORS allows **`GET` and `POST` only**, against an allowlist. Never a wildcard: any page could
   otherwise spend the operator's Meld quota from a visitor's browser. An empty allowlist disables
   browser access entirely. The request headers allowed are exactly `content-type`,
@@ -63,7 +65,8 @@ endpoint for `CRYPTO_OFFRAMP` (it answers `404` for every country); the substitu
 - `GET /funding` returns at most **100 rows**, newest first, and does not page.
 - Rate limited per proven person where one exists (`per_person_max`, default 120) and per calling
   address otherwise (`per_address_max`, default 30), with a `429` carrying `retry-after`.
-  `/health` is exempt, so a throttled instance cannot be declared dead.
+  `/health` is exempt, so a throttled instance cannot be declared dead, and so is
+  `POST /webhooks/meld`, whose deliveries come from a few Meld addresses.
 - The per-person alias is contextual on the product id and on the People collection, so the
   effective ceiling is `per_person_max x allowed_products.length x collections.length`. See
   threat model R13.
@@ -733,6 +736,56 @@ What Meld answers decides the row, as on `POST /session`:
 Each outcome is audited as `order.created`, `order.rail_refused` or `order.orphaned`, with the
 committed terms, the order kind and Meld's order id, never the order body or the IP.
 
+## `POST /webhooks/meld`
+
+Present only when `meld.headless.enabled` is true. Register `meld.webhook.url` as the URL of a Meld
+webhook profile subscribed to at least `CUSTOMER_KYC_STATUS_CHANGE` and `TRANSACTION_CRYPTO_PENDING`,
+`_TRANSFERRING`, `_COMPLETE` and `_FAILED`, and mount the profile's secret as `meld.webhook.secret`.
+
+**Signature.** Every delivery carries `meld-signature` and `meld-signature-timestamp`. The service
+computes HMAC-SHA256, keyed with the secret, over
+
+```
+<meld-signature-timestamp> + "." + <meld.webhook.url> + "." + <raw request body>
+```
+
+and accepts the delivery only when `meld-signature` equals its base64url encoding **with** `=`
+padding (Java's `Base64.getUrlEncoder()`), compared in constant time, and the timestamp is an ISO
+8601 time within `meld.webhook.tolerance_ms` of this service's clock, either side. The URL is the
+configured one, never the address the request arrived at, and the body is the bytes received, never
+a re-serialisation. Anything else is `401 Other{ WEBHOOK_SIGNATURE_INVALID }`, the same body for
+every cause; the log names which check failed.
+
+**What a verified event does.** A delivery whose event id has been applied before answers `200`
+and changes nothing.
+
+- `TRANSACTION_CRYPTO_*`: the transaction named by `payload.paymentTransactionId` is read from
+  Meld under `meld.headless.api_version`, the version Meld documents `orderId` on, and its `orderId` finds the funding request `POST /order` created. Its status (or the
+  event's, when the transaction carries none) is mapped as the worker maps it: `SETTLED` settles,
+  `FAILED`, `DECLINED`, `CANCELLED` and `REFUNDED` fail, and anything else, `ERROR` included, which
+  Meld calls temporary, is `transaction_seen`. The request moves forward through every state in
+  between, so a payment settled before it was seen still records `transaction_seen`, with the
+  transaction id and Meld's status. A request already there, already concluded, or further on is
+  left as it is. An order this service does not hold, or a transaction naming no order, is
+  acknowledged and logged.
+- `CUSTOMER_KYC_STATUS_CHANGE`: the customer named by `payload.customerId` has its stored KYC states
+  merged, never replaced: `SUMSUB`'s status is the customer's KYC, another `serviceProvider`'s, and
+  `payload.kycRecipient`, that provider's. An unknown customer is acknowledged and logged. Meld
+  does not promise delivery order, so the cache can briefly lag or regress until the next
+  `GET /customer` replaces it from Meld.
+- `WEBHOOK_TEST` and every other event type: acknowledged.
+
+Meld's statuses here are its claim about the payment, never delivery: `settled` says what Meld
+reported, exactly as it does when the worker sets it.
+
+**Responses.** `200` with an empty body acknowledges, including a verified body that is not a
+readable event, since redelivering it cannot help. `401` refuses the signature. A verified event
+that could not be applied, because Meld or the store did not answer, is
+`503 Other{ WEBHOOK_NOT_APPLIED }`, and Meld redelivers it: an event id is recorded only once its
+event has been applied, and applying one twice changes nothing the first application did not.
+Log lines carry the event type and id, Meld's order and customer ids, the funding id and statuses,
+never the body, the signature or the secret.
+
 ## `POST /funding/:id/cancel`
 
 **Cancelling withdraws the payment surface without concluding the request.** `cancelled_at` is a
@@ -858,7 +911,8 @@ Meld session or transaction id is carried: those are internal join keys.
 `POST /session` and `POST /order` write a row to Postgres (CloudSQL; the schema is versioned and migrated under an
 advisory lock, so two booting replicas cannot race it) and the funding reads read it back. The row
 is reserved **before** the rail is called, so the unique index arbitrates the idempotency key
-rather than a check-then-act race. An in-process worker advances the lifecycle.
+rather than a check-then-act race. An in-process worker advances the lifecycle, and so, for an
+order, does Meld's webhook.
 
 Two bounds keep that loop from becoming a standing cost:
 
@@ -913,6 +967,8 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 400 | `Other{ TERMS_STALE }` | `POST /order`: `termsAcceptedAt` does not parse, is ahead of this service's clock, or is more than an hour old. Accept the terms again. |
 | 403 | `Other{ CUSTOMER_NOT_READY }` | `POST /order`: the provider will not take an order from this customer yet (Meld `KYC_NOT_COMPLETED` or `VERIFICATION_REQUIRED`). Nothing was placed and the key is free. |
 | 502 | `Other{ BANK_DETAILS_UNREADABLE }` | `POST /order`: Meld created a bank order whose transfer details this service cannot read. Nothing is payable; do not guess an account. |
+| 401 | `Other{ WEBHOOK_SIGNATURE_INVALID }` | `POST /webhooks/meld`: the signature headers are missing, the signature does not match, or the timestamp is unreadable or outside `meld.webhook.tolerance_ms`. |
+| 503 | `Other{ WEBHOOK_NOT_APPLIED }` | `POST /webhooks/meld`: a verified event could not be applied yet. Meld redelivers it. |
 | 400 | `Other{ HEADLESS_DISABLED }` | `POST /quote` with `integrationMode: "headless"` on a deployment without `meld.headless.enabled`. |
 | 429 | `Other{ VERIFICATION_COOLDOWN }` | `POST /customer/verifications` during Meld's resend cooldown. `resendAvailableAt` in the value says when another code may be sent; `null` is the daily cap. |
 | 400 | `Other{ VERIFICATION_EXPIRED }` | `POST /customer/verifications/confirm` for a verification that expired or is no longer pending. Ask for a new code. |

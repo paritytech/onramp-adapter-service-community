@@ -23,6 +23,7 @@ import { MeldClient, MeldHttpError } from './meld/client.js';
 import { MeldDiscovery } from './meld/discovery.js';
 import { Onramp } from './onramp.js';
 import { MeldRail } from './meld/rail.js';
+import { MeldWebhooks } from './meld/webhook.js';
 import { DIRECTIONS, type RailName, type RailRegistry } from './rail.js';
 import { PersonhoodService, type PersonhoodDeps } from './personhood.js';
 import { chainReader } from './personhood/chain.js';
@@ -171,6 +172,9 @@ export async function start(
       logDestination,
       headless,
       (audit, log) => new CustomerService(cfg, meld, funding, audit, log),
+      headless === undefined || cfg.meld.webhook === undefined
+        ? undefined
+        : new MeldWebhooks(cfg.meld.webhook, headless.webhookSecret, meld, funding),
     );
     // A non-optional handle for the callbacks below: `app` has to be declared outside this block
     // so the `catch` can close it, and TypeScript cannot narrow a mutable binding inside a closure.

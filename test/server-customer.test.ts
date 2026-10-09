@@ -60,6 +60,13 @@ const stubOnramp = () => ({
   list: async () => [],
 });
 
+const stubWebhooks = {
+  signatureFault: () => 'not under test',
+  handle: async () => {
+    throw new Error('not under test');
+  },
+};
+
 let app: FastifyInstance | undefined;
 afterEach(async () => {
   await app?.close();
@@ -80,8 +87,14 @@ const serve = async (
 ) => {
   const meld = options.meld ?? fakeCustomerMeld();
   const store = options.store ?? fakeStore();
-  const instance = await buildServer(cfg, options.onramp ?? stubOnramp, options.personhood, options.sink, KEYS, (audit, log) =>
-    new CustomerService(cfg, meld, store, audit, log),
+  const instance = await buildServer(
+    cfg,
+    options.onramp ?? stubOnramp,
+    options.personhood,
+    options.sink,
+    KEYS,
+    (audit, log) => new CustomerService(cfg, meld, store, audit, log),
+    stubWebhooks,
   );
   app = instance;
   return instance;
@@ -129,6 +142,7 @@ describe('customer key routes', () => {
       ['POST', '/customer/verifications/confirm'],
       ['GET', '/requirements'],
       ['POST', '/order'],
+      ['POST', '/webhooks/meld'],
     ] as const;
     for (const [method, url] of routes) {
       const response = await instance.inject({ method, url, headers: DEV, ...(method === 'POST' ? { payload: {} } : {}) });
@@ -139,6 +153,15 @@ describe('customer key routes', () => {
 
   it('refuse to build when headless is enabled without the customer service', async () => {
     await expect(buildServer(headless(), stubOnramp, undefined, undefined, KEYS)).rejects.toThrow(/requires the customer service/);
+  });
+
+  it('refuse to build when headless is enabled without the webhook service', async () => {
+    const cfg = headless();
+    await expect(
+      buildServer(cfg, stubOnramp, undefined, undefined, KEYS, (audit, log) =>
+        new CustomerService(cfg, fakeCustomerMeld(), fakeStore(), audit, log),
+      ),
+    ).rejects.toThrow(/requires the webhook service/);
   });
 
   it('refuse to build when headless is enabled without the keys', async () => {

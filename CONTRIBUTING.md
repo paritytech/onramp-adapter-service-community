@@ -74,7 +74,6 @@ then applies the type, area, and priority labels.
 
 ## Open work
 
-- A **webhook receiver** for `TRANSACTION_CRYPTO_*`. Deferred: Meld's webhook auth is undocumented.
 - A **sandbox key from Meld**, the only thing between "built against a fake" and "verified against
   a live Meld".
 

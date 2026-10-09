@@ -1421,6 +1421,17 @@ describe('createCustomer', () => {
   });
 });
 
+describe('transaction, headless', () => {
+  it('reads under the headless version only when asked', async () => {
+    const fetchMock = stub(200, { transaction: { id: 'tx-1', orderId: 'order-1' } });
+    expect(await headless().transaction('tx-1', { headless: true })).toMatchObject({ orderId: 'order-1' });
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+
+    await headless().transaction('tx-1');
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Record<string, string>)['Meld-Version']).toBe(VERSION);
+  });
+});
+
 describe('getCustomer', () => {
   it('GETs the customer by its encoded id, with no body', async () => {
     const fetchMock = stub(200, customer);

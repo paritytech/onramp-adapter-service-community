@@ -28,7 +28,7 @@ import type { CorridorDto } from '../meld/discovery.js';
 import type { Direction, RailName } from '../rail.js';
 import type { Secret } from '../secret.js';
 import type { FundingState } from './state.js';
-import { TERMINAL_STATES } from './state.js';
+import { TERMINAL_STATES, pathTo } from './state.js';
 import {
   MIGRATIONS,
   MIGRATIONS_TABLE,
@@ -210,7 +210,8 @@ const RESERVE_QUERY =
 /**
  * The one per-row mutation. It writes every mutable column, not only the status: unchanged ones
  * are re-bound from the merged record inside `update`, which is why the list is long. Driven by the
- * worker and by `Onramp`, which uses it to release a reservation and to open a session.
+ * worker, by `Onramp`, which uses it to release a reservation and to open a session, and by Meld's
+ * webhooks through `advanceTo`.
  *
  * The eight deposit-shaped columns ($12-$19) are here for exactly one writer: the worker's
  * observation finder, through `mergeAdvance`/`mergeDeposit`. Every other caller's merged record
@@ -241,7 +242,8 @@ const CUSTOMER_COLUMNS = 'product_id, customer_key_hash, meld_customer_id, exter
 /**
  * The store. Owns the pool and every statement; the rest of the service talks to it only through
  * `reserve`, `create`, `byId`, `byAlias`, `byMeldOrderId`, `cancel`, `byReference`, `list`,
- * `pruneRefusals`, `claim`, `release`, `update`, the corridor and customer methods, and `close`.
+ * `pruneRefusals`, `claim`, `release`, `update`, `advanceTo`, the corridor, customer and webhook
+ * methods, and `close`.
  */
 export class FundingStore {
   private constructor(private readonly pool: Pool) {}
@@ -687,58 +689,37 @@ export class FundingStore {
     now: number,
     extra?: UpdateExtra,
   ): Promise<FundingRecord | undefined> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      try {
-        const locked = await client.query<Row>(
-          `SELECT ${COLUMNS} FROM funding_requests WHERE id = $1 FOR UPDATE`,
-          [id],
-        );
-        const row = locked.rows[0];
-        if (row === undefined) {
-          await client.query('COMMIT');
-          return undefined;
-        }
-        const previous = rowToRecord(row);
-        const updated = mergeAdvance(previous, to, now, extra);
+    return this.locked(id, async (previous, client) => {
+      if (previous === undefined) return undefined;
+      const updated = mergeAdvance(previous, to, now, extra);
+      // The row exists but the lease moved on: report it the same way as a missing row, so the
+      // worker counts nothing as advanced rather than reporting someone else's work as its own.
+      return (await this.write(client, id, updated, extra?.claimedBy)) ? updated : undefined;
+    });
+  }
 
-        const written = await client.query(UPDATE_QUERY, [
-          updated.status,
-          JSON.stringify(updated.status_history),
-          updated.provider_transaction_id ?? null,
-          updated.provider_session_id ?? null,
-          updated.provider_status ?? null,
-          updated.widget_url ?? null,
-          updated.hosted_widget_url ?? null,
-          updated.expires_at ?? null,
-          updated.client_reference ?? null,
-          updated.reason ?? null,
-          updated.updated_at,
-          updated.deposit_address ?? null,
-          updated.deposit_amount ?? null,
-          updated.deposit_currency ?? null,
-          updated.deposit_memo ?? null,
-          updated.deposit_observed_at ?? null,
-          updated.deposit_conflict_address ?? null,
-          updated.deposit_conflict_reason ?? null,
-          updated.deposit_conflict_at ?? null,
-          updated.meld_order_id ?? null,
-          storedInstructions(updated.payment_instructions),
-          id,
-          extra?.claimedBy ?? null,
-        ]);
-        await client.query('COMMIT');
-        // The row exists but the lease moved on: report it the same way as a missing row, so the
-        // worker counts nothing as advanced rather than reporting someone else's work as its own.
-        return written.rowCount === 1 ? updated : undefined;
-      } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
-      }
-    } finally {
-      client.release();
-    }
+  /**
+   * Bring a request to `to` through whatever states lie between, under the same row lock as
+   * `update`, so the path is planned against the row as it now stands rather than a stale read.
+   *
+   * Nothing is written when the row is already there or cannot get there (a concluded row, or a
+   * report behind the row). `from` is the state the row was found in; `record` is the row after
+   * the write, or as found when nothing was written. `undefined` when no row has this id.
+   */
+  async advanceTo(
+    id: string,
+    to: FundingState,
+    now: number,
+    extra: Pick<UpdateExtra, 'providerTransactionId' | 'providerStatus'>,
+  ): Promise<{ from: FundingState; record: FundingRecord } | undefined> {
+    return this.locked(id, async (previous, client) => {
+      if (previous === undefined) return undefined;
+      const steps = pathTo(previous.status, to) ?? [];
+      if (steps.length === 0) return { from: previous.status, record: previous };
+      const updated = steps.reduce((record, step) => mergeAdvance(record, step, now, extra), previous);
+      await this.write(client, id, updated, undefined);
+      return { from: previous.status, record: updated };
+    });
   }
 
   // Upsert one supported-corridor row (crypto, direction, country); `updated_at` stamped here.
@@ -826,6 +807,21 @@ export class FundingStore {
   }
 
   /**
+   * Merge KYC states into a customer's cache in one statement, so a concurrent write to the cache
+   * is kept rather than overwritten: `kyc` replaces, `providers` merges entry by entry.
+   * `undefined` when no such customer is recorded.
+   */
+  async mergeKycCache(meldCustomerId: string, patch: KycCache, now: number): Promise<MeldCustomerRow | undefined> {
+    return this.customer(
+      "UPDATE meld_customers SET kyc_cache = kyc_cache || ($1::jsonb - 'providers') || " +
+        "CASE WHEN $1::jsonb ? 'providers' THEN jsonb_build_object('providers', " +
+        "COALESCE(kyc_cache -> 'providers', '{}'::jsonb) || ($1::jsonb -> 'providers')) ELSE '{}'::jsonb END, " +
+        `updated_at = $2 WHERE meld_customer_id = $3 RETURNING ${CUSTOMER_COLUMNS}`,
+      [JSON.stringify(patch), now, meldCustomerId],
+    );
+  }
+
+  /**
    * Remove a key's mapping, only while it still names `meldCustomerId`, so a mapping a newer
    * registration wrote is never removed on the strength of a read of the old one. `true` when a
    * row was removed.
@@ -835,6 +831,12 @@ export class FundingStore {
       'DELETE FROM meld_customers WHERE product_id = $1 AND customer_key_hash = $2 AND meld_customer_id = $3',
       [productId, customerKeyHash, meldCustomerId],
     );
+    return result.rowCount === 1;
+  }
+
+  /** Whether an event id has been recorded. */
+  async webhookEventSeen(eventId: string): Promise<boolean> {
+    const result = await this.pool.query('SELECT 1 FROM meld_webhook_events WHERE event_id = $1', [eventId]);
     return result.rowCount === 1;
   }
 
@@ -881,6 +883,59 @@ export class FundingStore {
     const result = await this.pool.query<CustomerRow>(sql, params);
     const row = result.rows[0];
     return row === undefined ? undefined : { ...row, kyc_cache: kycCache(row.kyc_cache) };
+  }
+
+  /** Run `body` in one transaction holding the row's `FOR UPDATE` lock. */
+  private async locked<T>(
+    id: string,
+    body: (previous: FundingRecord | undefined, client: PoolClient) => Promise<T>,
+  ): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      try {
+        const locked = await client.query<Row>(`SELECT ${COLUMNS} FROM funding_requests WHERE id = $1 FOR UPDATE`, [id]);
+        const row = locked.rows[0];
+        const result = await body(row === undefined ? undefined : rowToRecord(row), client);
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Write a merged record's mutable columns. `false` when the lease named moved on. */
+  private async write(client: PoolClient, id: string, updated: FundingRecord, claimedBy: string | undefined): Promise<boolean> {
+    const written = await client.query(UPDATE_QUERY, [
+      updated.status,
+      JSON.stringify(updated.status_history),
+      updated.provider_transaction_id ?? null,
+      updated.provider_session_id ?? null,
+      updated.provider_status ?? null,
+      updated.widget_url ?? null,
+      updated.hosted_widget_url ?? null,
+      updated.expires_at ?? null,
+      updated.client_reference ?? null,
+      updated.reason ?? null,
+      updated.updated_at,
+      updated.deposit_address ?? null,
+      updated.deposit_amount ?? null,
+      updated.deposit_currency ?? null,
+      updated.deposit_memo ?? null,
+      updated.deposit_observed_at ?? null,
+      updated.deposit_conflict_address ?? null,
+      updated.deposit_conflict_reason ?? null,
+      updated.deposit_conflict_at ?? null,
+      updated.meld_order_id ?? null,
+      storedInstructions(updated.payment_instructions),
+      id,
+      claimedBy ?? null,
+    ]);
+    return written.rowCount === 1;
   }
 }
 

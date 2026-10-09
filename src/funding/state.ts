@@ -102,3 +102,27 @@ export function transition(from: FundingState, to: FundingState): FundingState {
   if (!TRANSITIONS[from].has(to)) throw new IllegalTransition(from, to);
   return to;
 }
+
+/**
+ * The shortest run of legal transitions from `from` to `to`, excluding `from`: `[]` when they are
+ * the same state, `undefined` when `to` cannot be reached. A report that skips a state (a payment
+ * settled before it was seen) is applied through the states it skipped, so the timeline still
+ * shows each one.
+ */
+export function pathTo(from: FundingState, to: FundingState): FundingState[] | undefined {
+  const reachedFrom = new Map<FundingState, FundingState>();
+  const queue: FundingState[] = [from];
+  for (let state = queue.shift(); state !== undefined; state = queue.shift()) {
+    if (state === to) {
+      const path: FundingState[] = [];
+      for (let step = state; step !== from; step = reachedFrom.get(step) ?? from) path.unshift(step);
+      return path;
+    }
+    for (const next of TRANSITIONS[state]) {
+      if (next === from || reachedFrom.has(next)) continue;
+      reachedFrom.set(next, state);
+      queue.push(next);
+    }
+  }
+  return undefined;
+}
