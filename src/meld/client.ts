@@ -90,6 +90,7 @@ const SESSION_TYPE: Readonly<Record<Direction, 'BUY' | 'SELL'>> = Object.freeze(
  */
 const QUOTE = '/payments/crypto/quote';
 const CREATE_WIDGET_SESSION = '/crypto/session/widget';
+const HEADLESS_ONRAMP_ORDER = '/crypto/order/headless/onramp';
 const transactionPath = (id: string) => `/payments/transactions/${encodeURIComponent(id)}`;
 /**
  * Search by the reference the session was filed under.
@@ -117,6 +118,8 @@ const transactionPath = (id: string) => `/payments/transactions/${encodeURICompo
  */
 const transactionSearchPath = (reference: string) =>
   `/payments/transactions?externalSessionIds=${encodeURIComponent(reference)}`;
+const transactionsByCustomerPath = (customerId: string) =>
+  `/payments/transactions?customerIds=${encodeURIComponent(customerId)}`;
 
 /**
  * Meld answered, and said no.
@@ -204,6 +207,13 @@ const quoteSchema = z
 const quoteEnvelope = z.object({ quotes: z.array(z.unknown()).nullish() }).loose();
 
 type MeldQuote = z.infer<typeof quoteSchema>;
+
+/** Which surface an offer or an order is for: Meld's widget, or the headless order API. */
+export type IntegrationMode = 'widget' | 'headless';
+
+export interface QuoteOptions {
+  integrationMode?: IntegrationMode;
+}
 
 /** What Meld's quote endpoint is asked for, on a buy. */
 export interface QuoteParams {
@@ -367,6 +377,10 @@ const transactionResponse = z
     // Both join keys, because the re-check below has to see whichever one Meld populates.
     externalSessionId: z.string().nullish(),
     externalCustomerId: z.string().nullish(),
+    /** The headless order's `id`. Meld shows it only on an offramp example so far. */
+    orderId: z.string().nullish(),
+    customerId: z.string().nullish(),
+    customer: z.object({ id: z.string().nullish() }).loose().nullish(),
     sourceAmount: scalarAmount.nullish(),
     destinationAmount: scalarAmount.nullish(),
     /** The asset the transaction moves; on a sell, the crypto the provider expects. */
@@ -400,6 +414,15 @@ export type MeldTransaction = z.infer<typeof transactionResponse>;
 const transactionSearchResponse = z.union([
   z.array(transactionResponse),
   z.object({ transactions: z.array(transactionResponse) }).loose(),
+]);
+
+/** Meld documents the single read both wrapped in `transaction` and bare, so either is read. */
+const singleTransactionResponse = z.union([
+  z
+    .object({ transaction: transactionResponse })
+    .loose()
+    .transform((body) => body.transaction),
+  transactionResponse,
 ]);
 
 /** The per-session lookup's answer: the one transaction, wrapped. Meld's reference documents it
@@ -594,6 +617,51 @@ export type VerificationStart =
   | { outcome: 'sent'; verification: MeldVerification }
   | { outcome: 'cooldown'; resendAvailableAt: string | null };
 
+/** `POST /crypto/order/headless/onramp`, exactly the documented fields. */
+export interface HeadlessOrderInput {
+  customerId: string;
+  externalOrderId: string;
+  serviceProvider: string;
+  paymentMethodType: string;
+  countryCode: string;
+  /** A decimal string, as Meld's order example sends it. */
+  sourceAmount: string;
+  sourceCurrencyCode: string;
+  destinationCurrencyCode: string;
+  destinationWalletAddress: string;
+  destinationNetworkCode: string;
+  /** The buyer's public IP, not this server's. */
+  clientIpAddress: string;
+  verification?: { agreementAcceptedAt: string };
+}
+
+export interface HeadlessOrder {
+  id: string;
+  paymentMethodType: string;
+  /** Read with every number kept as its exact text, for `parseBankInstructions`. */
+  paymentMethodResponseDetails: unknown;
+  /**
+   * The body as Meld sent it, numbers included, for the Meld SDK. It may hold short-lived
+   * credentials scoped to the order: never log it.
+   */
+  raw: unknown;
+}
+
+/** Meld's `403` codes for a customer the provider will not take yet. */
+export type CustomerNotReadyCode = 'KYC_NOT_COMPLETED' | 'VERIFICATION_REQUIRED';
+
+export type HeadlessOrderResult =
+  | { outcome: 'created'; order: HeadlessOrder }
+  | { outcome: 'customer_not_ready'; code: CustomerNotReadyCode };
+
+const headlessOrderResponse = z
+  .object({
+    id: z.string().min(1),
+    paymentMethodType: z.string().min(1),
+    paymentMethodResponseDetails: z.unknown(),
+  })
+  .loose();
+
 interface SendOptions {
   /** `Meld-Version` for this call. The client's `api_version` when absent. */
   version?: string;
@@ -639,15 +707,18 @@ export class MeldClient {
    * ("[sourceAmount] must not be null"). A buyer who wants "20 of the destination asset" is served by
    * the caller solving for the fiat against forward quotes, not by a reverse question.
    */
-  async quote(params: QuoteParams): Promise<MeldQuote[]> {
+  async quote(params: QuoteParams, { integrationMode = 'widget' }: QuoteOptions = {}): Promise<MeldQuote[]> {
     assertLegs('buy', params.sourceCurrencyCode, params.destinationCurrencyCode);
-    return this.postQuote({
-      countryCode: params.countryCode,
-      sourceCurrencyCode: params.sourceCurrencyCode,
-      destinationCurrencyCode: params.destinationCurrencyCode,
-      sourceAmount: params.sourceAmount,
-      paymentMethodType: params.paymentMethodType,
-    });
+    return this.postQuote(
+      {
+        countryCode: params.countryCode,
+        sourceCurrencyCode: params.sourceCurrencyCode,
+        destinationCurrencyCode: params.destinationCurrencyCode,
+        sourceAmount: params.sourceAmount,
+        paymentMethodType: params.paymentMethodType,
+      },
+      integrationMode,
+    );
   }
 
   /**
@@ -687,8 +758,16 @@ export class MeldClient {
    * this line. Duplicating the partial-offer handling per direction would give the sell path its
    * own copy of the rule that one bad provider must not discard the others.
    */
-  private async postQuote(request: Record<string, string>): Promise<MeldQuote[]> {
-    const body = await this.send('POST', QUOTE, request);
+  private async postQuote(
+    request: Record<string, string>,
+    integrationMode: IntegrationMode = 'widget',
+  ): Promise<MeldQuote[]> {
+    // Under an older `Meld-Version` Meld ignores `integrationMode` and answers widget offers, so
+    // the headless query never goes out without the headless version.
+    const body =
+      integrationMode === 'headless'
+        ? await this.send('POST', `${QUOTE}?integrationMode=HEADLESS`, request, this.headless())
+        : await this.send('POST', QUOTE, request);
 
     const offers = this.read(quoteEnvelope, body, 'quote').quotes ?? [];
     const readable = offers.flatMap((offer) => {
@@ -854,7 +933,82 @@ export class MeldClient {
 
   async transaction(id: string): Promise<MeldTransaction> {
     const body = await this.send('GET', transactionPath(id));
-    return this.read(transactionResponse, body, 'transaction');
+    return this.read(singleTransactionResponse, body, 'transaction');
+  }
+
+  /**
+   * The customer's transactions, re-checked as `transactionByReference` re-checks its rows: an
+   * ignored filter would answer with other customers' transactions.
+   *
+   * Under the headless version, which is where Meld documents this search and the order it joins.
+   */
+  async transactionsByCustomer(customerId: string): Promise<MeldTransaction[]> {
+    const body = await this.send('GET', transactionsByCustomerPath(customerId), undefined, this.headless());
+    const parsed = this.read(transactionSearchResponse, body, 'transaction search');
+    const rows = Array.isArray(parsed) ? parsed : parsed.transactions;
+    const mine = rows.filter((row) => row.customer?.id === customerId || row.customerId === customerId);
+    if (rows.length > 0 && mine.length === 0) {
+      throw new Error(
+        `Meld returned ${String(rows.length)} transaction(s) for a customer and none carried its id back. ` +
+          'The customer filter is not what this client expects.',
+      );
+    }
+    return mine;
+  }
+
+  /**
+   * Places a headless onramp order. `idempotencyKey` is the funding id, so a retry returns the
+   * original order. `redirectUrl` is never sent: Meld rejects it on this endpoint.
+   */
+  async createHeadlessOrder(input: HeadlessOrderInput, idempotencyKey: string): Promise<HeadlessOrderResult> {
+    assertLegs('buy', input.sourceCurrencyCode, input.destinationCurrencyCode);
+    let response: { body: unknown; text: string };
+    try {
+      response = await this.exchange(
+        'POST',
+        HEADLESS_ONRAMP_ORDER,
+        {
+          customerId: input.customerId,
+          externalOrderId: input.externalOrderId,
+          serviceProvider: input.serviceProvider,
+          paymentMethodType: input.paymentMethodType,
+          countryCode: input.countryCode,
+          sourceAmount: input.sourceAmount,
+          sourceCurrencyCode: input.sourceCurrencyCode,
+          destinationCurrencyCode: input.destinationCurrencyCode,
+          destinationWalletAddress: input.destinationWalletAddress,
+          destinationNetworkCode: input.destinationNetworkCode,
+          clientIpAddress: input.clientIpAddress,
+          verification:
+            input.verification === undefined
+              ? undefined
+              : { agreementAcceptedAt: input.verification.agreementAcceptedAt },
+        },
+        { ...this.headless(), idempotencyKey },
+      );
+    } catch (error) {
+      if (
+        error instanceof MeldHttpError &&
+        error.status === 403 &&
+        (error.code === 'KYC_NOT_COMPLETED' || error.code === 'VERIFICATION_REQUIRED')
+      ) {
+        return { outcome: 'customer_not_ready', code: error.code };
+      }
+      throw error;
+    }
+    const parsed = headlessOrderResponse.safeParse(response.body);
+    // No parse detail: it can quote the body, and the body can hold order credentials.
+    if (!parsed.success) throw upstreamUnavailable('Meld returned an unreadable headless order.');
+    return {
+      outcome: 'created',
+      order: {
+        id: parsed.data.id,
+        paymentMethodType: parsed.data.paymentMethodType,
+        paymentMethodResponseDetails: parsed.data.paymentMethodResponseDetails,
+        // Already parsed once as `body`, so this cannot throw.
+        raw: JSON.parse(response.text) as unknown,
+      },
+    };
   }
 
   /**
@@ -1106,10 +1260,20 @@ export class MeldClient {
     method: 'GET' | 'POST' | 'PATCH',
     path: string,
     payload?: unknown,
+    options: SendOptions = {},
+  ): Promise<unknown> {
+    return (await this.exchange(method, path, payload, options)).body;
+  }
+
+  /** `send`, also returning the response text for a caller that must forward it unaltered. */
+  private async exchange(
+    method: 'GET' | 'POST' | 'PATCH',
+    path: string,
+    payload?: unknown,
     // Discovery's `publicGet` sends `authed: false` to omit the key: the same endpoint returns the
     // global provider set unkeyed and this account's set keyed, and a deployment may want either.
     { version = this.apiVersion, idempotencyKey, authed = true }: SendOptions = {},
-  ): Promise<unknown> {
+  ): Promise<{ body: unknown; text: string }> {
     let response: Response;
     try {
       response = await fetch(new URL(path, this.baseUrl), {
@@ -1184,7 +1348,8 @@ export class MeldClient {
     }
 
     try {
-      return parseExact(await response.text());
+      const text = await response.text();
+      return { body: parseExact(text), text };
     } catch {
       // An HTML error page or an empty body throws here. Unhandled that becomes a 500 with an
       // upstream payload in the log, so it is caught and the text dropped.
@@ -1230,7 +1395,7 @@ const MAX_TIME_VALUE = 8.64e15;
  * ISO without an offset (shifted by the host's zone, differently per deployment), magnitudes
  * `Date` cannot hold, and a bare year that `Date.parse` would expand.
  */
-function toEpochMillis(value: string | number | null | undefined): number | undefined {
+export function toEpochMillis(value: string | number | null | undefined): number | undefined {
   const raw = typeof value === 'number' ? String(value) : value;
   if (typeof raw !== 'string') return undefined;
 

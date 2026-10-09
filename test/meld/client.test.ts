@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Refusal } from '../../src/contract.js';
+import { parseBankInstructions } from '../../src/meld/bank-instructions.js';
 import {
   MeldClient,
   MeldHttpError,
@@ -957,12 +958,35 @@ describe('transaction', () => {
     expect(init.headers).not.toHaveProperty('content-type');
   });
 
-  it('refuses a transaction body it cannot read', async () => {
+  it.each([
+    ['bare', { status: 'PENDING' }],
+    ['wrapped', { transaction: { status: 'PENDING' } }],
+  ])('refuses a %s transaction body it cannot read', async (_label, body) => {
     // The whole `transactionResponse` schema could be replaced with accept-anything and nothing
-    // failed. If Meld wraps the record (`{transaction: {...}}`), this is the test that says so
-    // on first contact rather than a 503 nobody can explain.
-    stub(200, { transaction: { id: 'tx-1', status: 'PENDING' } });
+    // failed.
+    stub(200, body);
     await expect(client().transaction('tx-1')).rejects.toThrow(/unreadable transaction/);
+  });
+
+  it.each([
+    ['bare', (record: object) => record],
+    ['wrapped in transaction', (record: object) => ({ transaction: record })],
+  ])('reads the order and customer off a %s record', async (_label, shape) => {
+    // Meld documents the read both ways (reference: transactions, "CONFLICT on wrapping").
+    stub(
+      200,
+      shape({
+        id: 'tx-1',
+        status: 'PENDING',
+        orderId: 'order-1',
+        customerId: 'c-1',
+        customer: { id: 'c-1', accountId: 'acc-1' },
+      }),
+    );
+
+    const txn = await client().transaction('tx-1');
+    expect(txn).toMatchObject({ id: 'tx-1', status: 'PENDING', orderId: 'order-1', customerId: 'c-1' });
+    expect(txn.customer?.id).toBe('c-1');
   });
 
   it('forwards the status verbatim, treating it as opaque', async () => {
@@ -1346,17 +1370,6 @@ describe('the transport options', () => {
     expect(sentHeaders(fetchMock)).not.toHaveProperty('X-Idempotency-Key');
   });
 
-  it('sends X-Idempotency-Key when one is given', async () => {
-    const fetchMock = stub(200, {});
-    type Transport = {
-      send(method: 'POST', path: string, body: unknown, options: { idempotencyKey: string }): Promise<unknown>;
-    };
-    await (headless() as unknown as Transport).send('POST', '/x', {}, { idempotencyKey: 'funding-1' });
-
-    expect(sentHeaders(fetchMock)['X-Idempotency-Key']).toBe('funding-1');
-    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(VERSION);
-  });
-
   it('refuses a headless call when no headless version is configured, without sending it', async () => {
     const fetchMock = stub(200, customer);
 
@@ -1671,5 +1684,271 @@ describe('confirmVerification', () => {
     await expect(headless().confirmVerification('c-1', 'v-1', '316856')).rejects.toThrow(
       /unreadable verification result/,
     );
+  });
+});
+
+describe('quote, headless', () => {
+  const offers = {
+    quotes: [
+      {
+        serviceProvider: 'BANXA',
+        sourceAmount: 20,
+        sourceCurrencyCode: 'USD',
+        destinationAmount: 19,
+        destinationCurrencyCode: 'USDC_ASSETHUB',
+      },
+    ],
+  };
+
+  it('asks for headless offers on the query, under the headless version', async () => {
+    const fetchMock = stub(200, { quotes: [] });
+    await headless().quote(probe(), { integrationMode: 'headless' });
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/payments/crypto/quote?integrationMode=HEADLESS');
+    expect(sentMethod(fetchMock)).toBe('POST');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+    expect(sentBody(fetchMock)).toEqual(probe());
+  });
+
+  it.each([
+    ['no options', () => headless().quote(probe())],
+    ['an explicit widget mode', () => headless().quote(probe(), { integrationMode: 'widget' })],
+    ['a client without headless configured', () => client().quote(probe())],
+  ])('sends the widget quote byte for byte as before with %s', async (_label, call) => {
+    const fetchMock = stub(200, offers);
+    await call();
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/payments/crypto/quote');
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(VERSION);
+    expect(sentInit(fetchMock).body).toBe(
+      '{"countryCode":"US","sourceCurrencyCode":"USD","destinationCurrencyCode":"USDC_ASSETHUB",' +
+        '"sourceAmount":"20","paymentMethodType":"CREDIT_DEBIT_CARD"}',
+    );
+  });
+
+  it('refuses a headless quote without a headless version, without sending it', async () => {
+    const fetchMock = stub(200, offers);
+
+    await expect(client().quote(probe(), { integrationMode: 'headless' })).rejects.toThrow(
+      /meld\.headless\.api_version/,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('passes the headless fields of an offer through', async () => {
+    stubRaw(
+      200,
+      '{"quotes":[{"serviceProvider":"BANXA","sourceAmount":101.20,"sourceCurrencyCode":"EUR",' +
+        '"destinationAmount":100,"destinationCurrencyCode":"USDC_ASSETHUB","integrationMode":"HEADLESS",' +
+        '"destinationNetworkCode":"POLKADOT_ASSETHUB","kycMode":"ASYNC","isNativeAvailable":false}]}',
+    );
+    const [offer] = await headless().quote(probe(), { integrationMode: 'headless' });
+
+    expect(offer).toMatchObject({
+      sourceAmount: '101.20',
+      destinationNetworkCode: 'POLKADOT_ASSETHUB',
+      kycMode: 'ASYNC',
+      isNativeAvailable: false,
+    });
+  });
+});
+
+const orderInput = () => ({
+  customerId: 'WmYYgvN8ukpV62N3m4u3ee',
+  externalOrderId: 'funding-1',
+  serviceProvider: 'BANXA',
+  paymentMethodType: 'CREDIT_DEBIT_CARD',
+  countryCode: 'DE',
+  sourceAmount: '101.20',
+  sourceCurrencyCode: 'EUR',
+  destinationCurrencyCode: 'USDC_ASSETHUB',
+  destinationWalletAddress: '15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5',
+  destinationNetworkCode: 'POLKADOT_ASSETHUB',
+  clientIpAddress: '203.0.113.24',
+});
+
+const ORDER_SECRET = 'pi_3Ord3r_secret_scoped_to_the_order';
+const orderResponse = {
+  id: 'order-1',
+  customerId: 'WmYYgvN8ukpV62N3m4u3ee',
+  externalOrderId: 'funding-1',
+  paymentMethodType: 'CREDIT_DEBIT_CARD',
+  paymentMethodResponseDetails: { renderMode: 'SDK_NATIVE', clientSecret: ORDER_SECRET },
+  payload: { sourceAmount: '101.20' },
+};
+
+describe('createHeadlessOrder', () => {
+  it('POSTs exactly the documented fields with the headless version and the idempotency key', async () => {
+    const fetchMock = stub(201, orderResponse);
+    await headless().createHeadlessOrder(orderInput(), 'funding-1');
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/crypto/order/headless/onramp');
+    expect(sentMethod(fetchMock)).toBe('POST');
+    expect(sentHeaders(fetchMock)).toEqual({
+      authorization: `BASIC ${KEY}`,
+      'Meld-Version': HEADLESS_VERSION,
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'X-Idempotency-Key': 'funding-1',
+    });
+    expect(sentInit(fetchMock).body).toBe(JSON.stringify(orderInput()));
+    expect(sentBody(fetchMock).sourceAmount).toBe('101.20');
+    expect(sentBody(fetchMock)).not.toHaveProperty('redirectUrl');
+    expect(sentBody(fetchMock)).not.toHaveProperty('verification');
+  });
+
+  it('sends the terms acceptance as the verification block', async () => {
+    const fetchMock = stub(201, orderResponse);
+    await headless().createHeadlessOrder(
+      { ...orderInput(), verification: { agreementAcceptedAt: '2026-10-08T10:00:00Z' } },
+      'funding-1',
+    );
+
+    expect(sentBody(fetchMock).verification).toEqual({ agreementAcceptedAt: '2026-10-08T10:00:00Z' });
+  });
+
+  it('returns the order id and method with the whole body verbatim', async () => {
+    stub(201, orderResponse);
+
+    await expect(headless().createHeadlessOrder(orderInput(), 'funding-1')).resolves.toEqual({
+      outcome: 'created',
+      order: {
+        id: 'order-1',
+        paymentMethodType: 'CREDIT_DEBIT_CARD',
+        paymentMethodResponseDetails: orderResponse.paymentMethodResponseDetails,
+        raw: orderResponse,
+      },
+    });
+  });
+
+  it('keeps numbers as numbers in raw and as exact text in the details', async () => {
+    stubRaw(
+      201,
+      '{"id":"order-2","paymentMethodType":"SEPA","sdkVersion":2,"payload":{"sourceAmount":101.20},' +
+        '"paymentMethodResponseDetails":{"amount":101.20,"currency":"EUR","iban":"DE89370400440532013000"}}',
+    );
+    const result = await headless().createHeadlessOrder(
+      { ...orderInput(), paymentMethodType: 'SEPA' },
+      'funding-2',
+    );
+    if (result.outcome !== 'created') throw new Error(result.outcome);
+
+    expect(result.order.raw).toEqual({
+      id: 'order-2',
+      paymentMethodType: 'SEPA',
+      sdkVersion: 2,
+      payload: { sourceAmount: 101.2 },
+      paymentMethodResponseDetails: { amount: 101.2, currency: 'EUR', iban: 'DE89370400440532013000' },
+    });
+    expect(result.order.paymentMethodResponseDetails).toEqual({
+      amount: '101.20',
+      currency: 'EUR',
+      iban: 'DE89370400440532013000',
+    });
+    expect(
+      parseBankInstructions(result.order.paymentMethodType, result.order.paymentMethodResponseDetails).amount,
+    ).toBe('101.20');
+  });
+
+  it.each(['KYC_NOT_COMPLETED', 'VERIFICATION_REQUIRED'])(
+    'reads a 403 %s as a customer not ready',
+    async (code) => {
+      stub(403, { code, message: 'Customer is not ready for this provider' });
+
+      await expect(headless().createHeadlessOrder(orderInput(), 'funding-1')).resolves.toEqual({
+        outcome: 'customer_not_ready',
+        code,
+      });
+    },
+  );
+
+  it.each([
+    [403, 'WHITELABEL_NOT_ENABLED'],
+    [400, 'KYC_NOT_COMPLETED'],
+  ])('passes a %s %s through', async (status, code) => {
+    stub(status, { code });
+    await expect(headless().createHeadlessOrder(orderInput(), 'funding-1')).rejects.toBeInstanceOf(MeldHttpError);
+  });
+
+  it('refuses a body without an order id and keeps the body out of the error', async () => {
+    stub(201, { ...orderResponse, id: { token: ORDER_SECRET } });
+    const error = (await headless()
+      .createHeadlessOrder(orderInput(), 'funding-1')
+      .catch((e: unknown) => e)) as Error;
+
+    expect(error).toBeInstanceOf(Refusal);
+    expect(error.message).toMatch(/unreadable headless order/);
+    expect(error.message).not.toContain(ORDER_SECRET);
+    expect(JSON.stringify(error)).not.toContain(ORDER_SECRET);
+  });
+
+  it('keeps the request out of a transport error', async () => {
+    stubNetworkFailure('ECONNRESET');
+    const error = (await headless()
+      .createHeadlessOrder(orderInput(), 'funding-1')
+      .catch((e: unknown) => e)) as Error;
+
+    expect(error.message).toContain('ECONNRESET');
+    expect(error.message).not.toContain('203.0.113.24');
+    expect(error.message).not.toContain(orderInput().destinationWalletAddress);
+  });
+
+  it('refuses crossed legs and a missing headless version before sending', async () => {
+    const fetchMock = stub(201, orderResponse);
+
+    await expect(
+      headless().createHeadlessOrder(
+        { ...orderInput(), sourceCurrencyCode: 'USDC_ASSETHUB', destinationCurrencyCode: 'EUR' },
+        'funding-1',
+      ),
+    ).rejects.toThrow(/legs are crossed/);
+    await expect(client().createHeadlessOrder(orderInput(), 'funding-1')).rejects.toThrow(
+      /meld\.headless\.api_version/,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('transactionsByCustomer', () => {
+  const own = { id: 'tx-1', status: 'PENDING', orderId: 'order-1', customer: { id: 'c/1' } };
+
+  it('GETs the customer filter under the headless version', async () => {
+    const fetchMock = stub(200, { transactions: [own] });
+    await headless().transactionsByCustomer('c/1');
+
+    expect(sentUrl(fetchMock)).toBe('https://api-sb.meld.io/payments/transactions?customerIds=c%2F1');
+    expect(sentMethod(fetchMock)).toBe('GET');
+    expect(sentInit(fetchMock).body).toBeUndefined();
+    expect(sentHeaders(fetchMock)['Meld-Version']).toBe(HEADLESS_VERSION);
+  });
+
+  it.each([
+    ['wrapped', { transactions: [own] }],
+    ['bare', [own]],
+  ])('reads a %s collection with each row\'s order id', async (_label, body) => {
+    stub(200, body);
+    const rows = await headless().transactionsByCustomer('c/1');
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.orderId).toBe('order-1');
+  });
+
+  it('keeps rows naming the customer either way and drops another customer\'s', async () => {
+    stub(200, {
+      transactions: [own, { id: 'tx-2', customerId: 'c/1' }, { id: 'tx-3', customer: { id: 'c-2' } }],
+    });
+    const rows = await headless().transactionsByCustomer('c/1');
+
+    expect(rows.map((row) => row.id)).toEqual(['tx-1', 'tx-2']);
+  });
+
+  it('throws when rows came back and none carry the customer', async () => {
+    stub(200, { transactions: [{ id: 'tx-3', customer: { id: 'c-2' } }, { id: 'tx-4' }] });
+    await expect(headless().transactionsByCustomer('c/1')).rejects.toThrow(/customer filter/);
+  });
+
+  it('reads an empty collection as no transactions yet', async () => {
+    stub(200, { transactions: [] });
+    await expect(headless().transactionsByCustomer('c/1')).resolves.toEqual([]);
   });
 });
