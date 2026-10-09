@@ -13,6 +13,7 @@ import { TERMINAL_STATES, transition } from './state.js';
 
 import type { FundingState } from './state.js';
 import type { FundingFailure } from '../contract.js';
+import type { BankInstructions } from '../meld/bank-instructions.js';
 import type { RailDeposit } from '../rail.js';
 import { sameAmount } from './amount.js';
 import type { DepositConflictReason, FundingRecord } from './types.js';
@@ -75,6 +76,8 @@ export function mergeAdvance(
     expires_at: extra?.expiresAt ?? previous.expires_at,
     client_reference: extra?.releaseReference === true ? undefined : previous.client_reference,
     reason: extra?.reason ?? previous.reason,
+    meld_order_id: extra?.meldOrderId ?? previous.meld_order_id,
+    payment_instructions: extra?.paymentInstructions ?? previous.payment_instructions,
     ...merged,
   };
 }
@@ -230,4 +233,8 @@ export interface UpdateExtra {
        * than rejecting the whole advance.
        */
       deposit?: RailDeposit;
+      /** Written when a headless row's Meld order is created. */
+      meldOrderId?: string;
+      /** The bank order's transfer details, written with `meldOrderId`. */
+      paymentInstructions?: BankInstructions;
 }

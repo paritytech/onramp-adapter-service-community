@@ -1281,6 +1281,7 @@ export class Onramp {
       deposit_currency: undefined,
       deposit_memo: undefined,
       deposit_observed_at: undefined,
+      integration_mode: 'widget',
       status: terms.status,
       reason: terms.reason,
       status_history: [{ status: terms.status, at: terms.now }],

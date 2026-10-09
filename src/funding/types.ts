@@ -9,6 +9,7 @@
  */
 
 import type { FundingFailure } from '../contract.js';
+import type { BankInstructions } from '../meld/bank-instructions.js';
 import type { Direction, RailName } from '../rail.js';
 import { TERMINAL_STATES, type FundingState } from './state.js';
 
@@ -28,6 +29,14 @@ export interface TimelineEntry {
  * `mergeDeposit` in `funding/merge.ts`, the one place any is produced.
  */
 export type DepositConflictReason = 'address_changed' | 'address_malformed' | 'terms_changed';
+
+/**
+ * How the buyer pays: on the provider's page (`widget`), or through this service's own screens
+ * on a Meld Headless order (`headless`). Enforced by `funding_integration_mode_known`.
+ */
+export const INTEGRATION_MODES = ['widget', 'headless'] as const;
+
+export type IntegrationMode = (typeof INTEGRATION_MODES)[number];
 
 /**
  * The durable record of one funding request.
@@ -138,6 +147,16 @@ export interface FundingRecord {
   /** When the conflict was recorded. The worker skips a report naming the conflicting address
    *  already on file (`depositIsNew`), so it is stamped once per conflicting address. */
   deposit_conflict_at?: number | undefined;
+  /** `widget` for every row written before the column existed (v8 -> v9). */
+  integration_mode: IntegrationMode;
+  /** The Meld order id, on a headless row once its order is created. */
+  meld_order_id?: string | undefined;
+  /** The customer key hash the headless order was placed for. */
+  customer_key_hash?: string | undefined;
+  /** When the buyer accepted the provider's terms for a headless order. */
+  terms_accepted_at?: number | undefined;
+  /** What the payer sends on a headless bank order. Never the card order, which is not stored. */
+  payment_instructions?: BankInstructions | undefined;
   status_history: TimelineEntry[];
   created_at: number;
   updated_at: number;

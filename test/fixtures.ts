@@ -2,9 +2,11 @@ import { encodeAddress } from '@polkadot/util-crypto';
 
 import { parseConfig, type Config } from '../src/config.js';
 import { TERMINAL_STATES, type FundingState } from '../src/funding/state.js';
+import type { KycCache, MeldCustomerRow } from '../src/funding/customer.js';
 import { mergeAdvance } from '../src/funding/merge.js';
 import type { FundingStore, SupportedCorridorRow } from '../src/funding/store.js';
 import { directionTermsViolation, type FundingRecord } from '../src/funding/types.js';
+import type { BankInstructions } from '../src/meld/bank-instructions.js';
 import type { Direction, RailBuySession, RailSellSession } from '../src/rail.js';
 
 const ALICE_PUBKEY = new Uint8Array([
@@ -256,6 +258,7 @@ export const fundingRecord = (overrides: Partial<FundingRecord> = {}): FundingRe
   widget_url: undefined,
   hosted_widget_url: undefined,
   expires_at: undefined,
+  integration_mode: 'widget',
   status: 'session_opened',
   status_history: [{ status: 'session_opened', at: 1_700_000_000_000 }],
   created_at: 1_700_000_000_000,
@@ -285,6 +288,50 @@ export const sellRecord = (overrides: Partial<FundingRecord> = {}): FundingRecor
     ...overrides,
   });
 
+/** A customer key hash as `customerKeyHash` produces it: 64 lowercase hex characters. */
+export const KEY_HASH = '0b'.repeat(32);
+
+/** Transfer details as `parseBankInstructions` returns them for a SEPA order. */
+export const bankInstructions = (overrides: Partial<BankInstructions> = {}): BankInstructions => ({
+  rail: 'SEPA',
+  amount: '101.20',
+  currency: 'EUR',
+  accountHolderName: 'Meld Virtual Account',
+  iban: 'DE89370400440532013000',
+  bic: 'COBADEFFXXX',
+  reference: 'MELD-REF-1',
+  expiresAt: 1_700_000_900_000,
+  ...overrides,
+});
+
+/** A headless bank buy whose Meld order exists: every v9 column set. */
+export const headlessRecord = (overrides: Partial<FundingRecord> = {}): FundingRecord =>
+  fundingRecord({
+    integration_mode: 'headless',
+    fiat: 'EUR',
+    country: 'DE',
+    payment_method_type: 'SEPA',
+    service_provider: 'NOAH',
+    source_amount: '101.20',
+    meld_order_id: 'order-1',
+    customer_key_hash: KEY_HASH,
+    terms_accepted_at: 1_699_999_990_000,
+    payment_instructions: bankInstructions(),
+    ...overrides,
+  });
+
+/** One `meld_customers` row, overridable. */
+export const customerRow = (overrides: Partial<MeldCustomerRow> = {}): MeldCustomerRow => ({
+  product_id: 'app.dot',
+  customer_key_hash: KEY_HASH,
+  meld_customer_id: 'meld-customer-1',
+  external_id: '2f1c6b1e-6a43-4b8e-9d0a-5e7f3c2b1a90',
+  kyc_cache: {},
+  created_at: 1_700_000_000_000,
+  updated_at: 1_700_000_000_000,
+  ...overrides,
+});
+
 /**
  * An in-memory stand-in for `FundingStore`, honouring the parts of its contract the callers rely
  * on: the state machine refuses an illegal transition, `update` answers `undefined` for a row that
@@ -305,6 +352,9 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
   // In-memory supported-corridors cache, keyed `${code}|${direction}|${country}`, mirroring the
   // real table's v7 -> v8 primary key.
   const corridors = new Map<string, SupportedCorridorRow>();
+  // Keyed `${product_id}|${customer_key_hash}`, the real table's primary key.
+  const customers = new Map<string, MeldCustomerRow>();
+  const webhookEvents = new Set<string>();
 
   /** The row already holding this record's (alias, product, reference), if any. */
   const held = (record: FundingRecord): FundingRecord | undefined =>
@@ -461,6 +511,40 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       [...corridors.values()]
         .filter((r) => r.destination_currency_code === code && r.direction === direction && r.updated_at >= freshAfter)
         .map((r) => structuredClone(r)),
+    byMeldOrderId: (async (meldOrderId: string) =>
+      structuredClone([...rows.values()].find((r) => r.meld_order_id === meldOrderId))) satisfies FundingStore['byMeldOrderId'],
+    customers,
+    customerByKey: (async (productId: string, customerKeyHash: string) =>
+      structuredClone(customers.get(`${productId}|${customerKeyHash}`))) satisfies FundingStore['customerByKey'],
+    customerByMeldId: (async (meldCustomerId: string) =>
+      structuredClone([...customers.values()].find((c) => c.meld_customer_id === meldCustomerId))) satisfies FundingStore['customerByMeldId'],
+    // Mirrors the real insert: a clash on the key returns the holder, a clash on either Meld id
+    // under another key throws, as the two unique constraints do.
+    insertCustomer: (async (row: MeldCustomerRow) => {
+      const key = `${row.product_id}|${row.customer_key_hash}`;
+      const holder = customers.get(key);
+      if (holder !== undefined) return structuredClone(holder);
+      for (const c of customers.values()) {
+        if (c.meld_customer_id === row.meld_customer_id || c.external_id === row.external_id) {
+          throw new Error('duplicate key value violates unique constraint on meld_customers');
+        }
+      }
+      customers.set(key, structuredClone(row));
+      return structuredClone(row);
+    }) satisfies FundingStore['insertCustomer'],
+    updateKycCache: (async (meldCustomerId: string, cache: KycCache, now: number) => {
+      const found = [...customers.values()].find((c) => c.meld_customer_id === meldCustomerId);
+      if (found === undefined) return undefined;
+      const updated = { ...found, kyc_cache: structuredClone(cache), updated_at: now };
+      customers.set(`${found.product_id}|${found.customer_key_hash}`, updated);
+      return structuredClone(updated);
+    }) satisfies FundingStore['updateKycCache'],
+    webhookEvents,
+    recordWebhookEvent: (async (eventId: string) => {
+      if (webhookEvents.has(eventId)) return false;
+      webhookEvents.add(eventId);
+      return true;
+    }) satisfies FundingStore['recordWebhookEvent'],
     close: async () => undefined,
   };
 }

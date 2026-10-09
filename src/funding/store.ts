@@ -20,8 +20,10 @@
  */
 
 import { Pool, types as pgTypes, type PoolClient, type PoolConfig } from 'pg';
+import { z } from 'zod';
 
 import type { FundingFailure } from '../contract.js';
+import type { BankInstructions } from '../meld/bank-instructions.js';
 import type { CorridorDto } from '../meld/discovery.js';
 import type { Direction, RailName } from '../rail.js';
 import type { Secret } from '../secret.js';
@@ -37,7 +39,8 @@ import {
   type Migration,
 } from './schema.js';
 import { mergeAdvance, type UpdateExtra } from './merge.js';
-import type { DepositConflictReason, FundingRecord, TimelineEntry } from './types.js';
+import { KYC_CACHE, type KycCache, type MeldCustomerRow } from './customer.js';
+import type { DepositConflictReason, FundingRecord, IntegrationMode, TimelineEntry } from './types.js';
 
 /**
  * Read `BIGINT` as a number, not a string.
@@ -172,6 +175,11 @@ export const COLUMN_LIST = [
   'deposit_conflict_address',
   'deposit_conflict_reason',
   'deposit_conflict_at',
+  'integration_mode',
+  'meld_order_id',
+  'customer_key_hash',
+  'terms_accepted_at',
+  'payment_instructions',
   'status_history',
   'created_at',
   'updated_at',
@@ -210,7 +218,10 @@ const RESERVE_QUERY =
  * them), so binding them unconditionally on every update is not a new way for them to be written,
  * only the one place they finally can be.
  *
- * `$21` is the claim guard. When the caller holds a lease the update matches only while that lease
+ * `meld_order_id` and `payment_instructions` ($20-$21) are written once, when a headless order is
+ * created. The other headless columns are fixed at reservation and are not here.
+ *
+ * `$23` is the claim guard. When the caller holds a lease the update matches only while that lease
  * is still theirs; `Onramp` passes null and matches on the id alone, because a request path is not
  * leased and is the only writer of the row it just reserved.
  */
@@ -221,14 +232,16 @@ const UPDATE_QUERY =
   '    client_reference = $9, reason = $10, updated_at = $11, ' +
   '    deposit_address = $12, deposit_amount = $13, deposit_currency = $14, deposit_memo = $15, ' +
   '    deposit_observed_at = $16, deposit_conflict_address = $17, deposit_conflict_reason = $18, ' +
-  '    deposit_conflict_at = $19 ' +
-  'WHERE id = $20 AND ($21::text IS NULL OR claimed_by = $21)';
+  '    deposit_conflict_at = $19, meld_order_id = $20, payment_instructions = $21 ' +
+  'WHERE id = $22 AND ($23::text IS NULL OR claimed_by = $23)';
+
+const CUSTOMER_COLUMNS = 'product_id, customer_key_hash, meld_customer_id, external_id, kyc_cache, created_at, updated_at';
 
 
 /**
  * The store. Owns the pool and every statement; the rest of the service talks to it only through
- * `reserve`, `create`, `byId`, `byAlias`, `cancel`, `byReference`, `list`, `pruneRefusals`,
- * `claim`, `release`, `update` and `close`.
+ * `reserve`, `create`, `byId`, `byAlias`, `byMeldOrderId`, `cancel`, `byReference`, `list`,
+ * `pruneRefusals`, `claim`, `release`, `update`, the corridor and customer methods, and `close`.
  */
 export class FundingStore {
   private constructor(private readonly pool: Pool) {}
@@ -475,6 +488,11 @@ export class FundingStore {
     ]);
   }
 
+  /** The headless row a Meld order belongs to. Unscoped: Meld names the order, not the caller. */
+  async byMeldOrderId(meldOrderId: string): Promise<FundingRecord | undefined> {
+    return this.one(`SELECT ${COLUMNS} FROM funding_requests WHERE meld_order_id = $1`, [meldOrderId]);
+  }
+
   /**
    * Withdraw a request's settlement surface, at the caller's request.
    *
@@ -705,6 +723,8 @@ export class FundingStore {
           updated.deposit_conflict_address ?? null,
           updated.deposit_conflict_reason ?? null,
           updated.deposit_conflict_at ?? null,
+          updated.meld_order_id ?? null,
+          storedInstructions(updated.payment_instructions),
           id,
           extra?.claimedBy ?? null,
         ]);
@@ -753,6 +773,68 @@ export class FundingStore {
     return result.rows;
   }
 
+  /** The Meld customer a caller's customer key maps to, within one product. */
+  async customerByKey(productId: string, customerKeyHash: string): Promise<MeldCustomerRow | undefined> {
+    return this.customer(
+      `SELECT ${CUSTOMER_COLUMNS} FROM meld_customers WHERE product_id = $1 AND customer_key_hash = $2`,
+      [productId, customerKeyHash],
+    );
+  }
+
+  /** Unscoped: a webhook names the Meld customer, not the caller. */
+  async customerByMeldId(meldCustomerId: string): Promise<MeldCustomerRow | undefined> {
+    return this.customer(`SELECT ${CUSTOMER_COLUMNS} FROM meld_customers WHERE meld_customer_id = $1`, [
+      meldCustomerId,
+    ]);
+  }
+
+  /**
+   * Record a key's Meld customer, or return the one already recorded for that key.
+   *
+   * Two first visits for one key can each create a Meld customer; the first insert wins and the
+   * loser is handed the winner's row, so the key never maps to two customers. A clash on either
+   * Meld id under a different key is not absorbed: one Meld customer answering for two keys is a
+   * fault.
+   */
+  async insertCustomer(row: MeldCustomerRow): Promise<MeldCustomerRow> {
+    const inserted = await this.customer(
+      `INSERT INTO meld_customers (${CUSTOMER_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7) ` +
+        `ON CONFLICT (product_id, customer_key_hash) DO NOTHING RETURNING ${CUSTOMER_COLUMNS}`,
+      [
+        row.product_id,
+        row.customer_key_hash,
+        row.meld_customer_id,
+        row.external_id,
+        JSON.stringify(row.kyc_cache),
+        row.created_at,
+        row.updated_at,
+      ],
+    );
+    if (inserted !== undefined) return inserted;
+    const existing = await this.customerByKey(row.product_id, row.customer_key_hash);
+    if (existing === undefined) throw new Error('meld customer insert conflicted with no row holding the key');
+    return existing;
+  }
+
+  /** Replace a customer's KYC cache. `undefined` when no such customer is recorded. */
+  async updateKycCache(meldCustomerId: string, cache: KycCache, now: number): Promise<MeldCustomerRow | undefined> {
+    return this.customer(
+      'UPDATE meld_customers SET kyc_cache = $1, updated_at = $2 WHERE meld_customer_id = $3 ' +
+        `RETURNING ${CUSTOMER_COLUMNS}`,
+      [JSON.stringify(cache), now, meldCustomerId],
+    );
+  }
+
+  /** `true` the first time an event id is seen, `false` on every redelivery. */
+  async recordWebhookEvent(eventId: string, eventType: string, now: number): Promise<boolean> {
+    const result = await this.pool.query(
+      'INSERT INTO meld_webhook_events (event_id, event_type, received_at) VALUES ($1, $2, $3) ' +
+        'ON CONFLICT (event_id) DO NOTHING',
+      [eventId, eventType, now],
+    );
+    return result.rowCount === 1;
+  }
+
   /**
    * Close the pool. `startup`'s `close` calls this last, after the server.
    *
@@ -781,6 +863,53 @@ export class FundingStore {
     const result = await this.pool.query<Row>(sql, params);
     return result.rows.map(rowToRecord);
   }
+
+  private async customer(sql: string, params: unknown[]): Promise<MeldCustomerRow | undefined> {
+    const result = await this.pool.query<CustomerRow>(sql, params);
+    const row = result.rows[0];
+    return row === undefined ? undefined : { ...row, kyc_cache: kycCache(row.kyc_cache) };
+  }
+}
+
+/** `pg` hands JSONB back parsed, so the JSON columns arrive as `unknown` and are validated here. */
+type CustomerRow = Omit<MeldCustomerRow, 'kyc_cache'> & { kyc_cache: unknown };
+
+function kycCache(value: unknown): KycCache {
+  const parsed = KYC_CACHE.safeParse(value);
+  if (!parsed.success) throw new Error('a meld_customers row holds a kyc_cache this build cannot read');
+  return parsed.data;
+}
+
+/**
+ * The stored form of `BankInstructions`, checked on every read: a payer is shown these, so a row
+ * edited by hand or written by another build must fail rather than display a guessed account.
+ */
+const STORED_INSTRUCTIONS: z.ZodType<BankInstructions> = z
+  .object({
+    rail: z.string().min(1),
+    amount: z.string().min(1),
+    currency: z.string().min(1),
+    accountHolderName: z.string().exactOptional(),
+    bankName: z.string().exactOptional(),
+    iban: z.string().exactOptional(),
+    bic: z.string().exactOptional(),
+    accountNumber: z.string().exactOptional(),
+    routingNumber: z.string().exactOptional(),
+    pixKey: z.string().exactOptional(),
+    reference: z.string().exactOptional(),
+    expiresAt: z.number().int().exactOptional(),
+  })
+  .strict();
+
+function paymentInstructions(row: Row): BankInstructions | undefined {
+  if (row.payment_instructions === null) return undefined;
+  const parsed = STORED_INSTRUCTIONS.safeParse(row.payment_instructions);
+  if (!parsed.success) throw new Error(`funding request ${row.id} holds payment_instructions this build cannot read`);
+  return parsed.data;
+}
+
+function storedInstructions(instructions: BankInstructions | undefined): string | null {
+  return instructions === undefined ? null : JSON.stringify(instructions);
 }
 
 /** A row as `pg` returns it: snake_case, JSON string for history. */
@@ -816,6 +945,11 @@ interface Row {
   deposit_conflict_address: string | null;
   deposit_conflict_reason: DepositConflictReason | null;
   deposit_conflict_at: number | null;
+  integration_mode: IntegrationMode;
+  meld_order_id: string | null;
+  customer_key_hash: string | null;
+  terms_accepted_at: number | null;
+  payment_instructions: unknown;
   status_history: string;
   created_at: number;
   updated_at: number;
@@ -846,6 +980,10 @@ function rowToRecord(row: Row): FundingRecord {
     deposit_conflict_address: row.deposit_conflict_address ?? undefined,
     deposit_conflict_reason: row.deposit_conflict_reason ?? undefined,
     deposit_conflict_at: row.deposit_conflict_at ?? undefined,
+    meld_order_id: row.meld_order_id ?? undefined,
+    customer_key_hash: row.customer_key_hash ?? undefined,
+    terms_accepted_at: row.terms_accepted_at ?? undefined,
+    payment_instructions: paymentInstructions(row),
     status_history: JSON.parse(row.status_history) as TimelineEntry[],
   } satisfies FundingRecord;
 }
@@ -890,6 +1028,11 @@ function recordToRow(r: FundingRecord): unknown[] {
     deposit_conflict_address: r.deposit_conflict_address ?? null,
     deposit_conflict_reason: r.deposit_conflict_reason ?? null,
     deposit_conflict_at: r.deposit_conflict_at ?? null,
+    integration_mode: r.integration_mode,
+    meld_order_id: r.meld_order_id ?? null,
+    customer_key_hash: r.customer_key_hash ?? null,
+    terms_accepted_at: r.terms_accepted_at ?? null,
+    payment_instructions: storedInstructions(r.payment_instructions),
     status_history: JSON.stringify(r.status_history),
     created_at: r.created_at,
     updated_at: r.updated_at,

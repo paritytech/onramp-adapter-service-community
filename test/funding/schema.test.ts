@@ -13,7 +13,17 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { ALICE, BOB, fakeStore, fundingRecord, sellRecord } from '../fixtures.js';
+import {
+  ALICE,
+  BOB,
+  KEY_HASH,
+  bankInstructions,
+  customerRow,
+  fakeStore,
+  fundingRecord,
+  headlessRecord,
+  sellRecord,
+} from '../fixtures.js';
 import { createSchema, dropSchema, openIn, rawQuery as query, withStore } from '../pg.js';
 
 import { MIGRATION_LOCK_TIMEOUT_MS, SCHEMA_VERSION, freshSchema, type Migration } from '../../src/funding/schema.js';
@@ -173,6 +183,11 @@ describe('the column contract', () => {
           widget_url: 'https://meldcrypto.com/session/slot',
           hosted_widget_url: 'https://meldcrypto.com/s/slot',
           expires_at: 1_950_000_000_000,
+          integration_mode: 'headless',
+          meld_order_id: 'order-slot',
+          customer_key_hash: KEY_HASH,
+          terms_accepted_at: 1_750_000_000_000,
+          payment_instructions: bankInstructions(),
         }),
       );
       await store.close();
@@ -182,7 +197,8 @@ describe('the column contract', () => {
           schema,
           'SELECT id, created_at, updated_at, service_provider, country, client_reference, ' +
             'provider_session_id, provider_transaction_id, provider_status, widget_url, ' +
-            'hosted_widget_url, expires_at FROM funding_requests',
+            'hosted_widget_url, expires_at, integration_mode, meld_order_id, customer_key_hash, ' +
+            'terms_accepted_at, payment_instructions FROM funding_requests',
         )
       )[0];
       expect(row).toEqual({
@@ -198,6 +214,11 @@ describe('the column contract', () => {
         widget_url: 'https://meldcrypto.com/session/slot',
         hosted_widget_url: 'https://meldcrypto.com/s/slot',
         expires_at: 1_950_000_000_000,
+        integration_mode: 'headless',
+        meld_order_id: 'order-slot',
+        customer_key_hash: KEY_HASH,
+        terms_accepted_at: 1_750_000_000_000,
+        payment_instructions: bankInstructions(),
       });
     } finally {
       await dropSchema(schema);
@@ -308,8 +329,24 @@ describe('creating a fresh schema', () => {
   });
 });
 
+/** The statements `freshSchema()` gained whole at v8 -> v9, which no older database has. */
+const newAtV9 = (sql: string): boolean => /meld_customers|meld_webhook_events|funding_by_meld_order/.test(sql);
+
+/** One `freshSchema()` statement minus what v8 -> v9 adds to `funding_requests`. */
+const atV8 = (sql: string): string =>
+  sql
+    .replace(" integration_mode TEXT NOT NULL DEFAULT 'widget',", '')
+    .replace(' meld_order_id TEXT,', '')
+    .replace(' customer_key_hash TEXT,', '')
+    .replace(' terms_accepted_at BIGINT,', '')
+    .replace(' payment_instructions JSONB,', '')
+    .replace(", CONSTRAINT funding_integration_mode_known CHECK (integration_mode IN ('widget', 'headless'))", '');
+
+/** A v8 database's DDL. */
+const v8Schema = (): string[] => freshSchema().filter((sql) => !newAtV9(sql)).map(atV8);
+
 /**
- * `freshSchema()` minus everything the v5 -> v6 and v6 -> v7 migrations add: a v5 funding table.
+ * `freshSchema()` minus everything the v5 -> v6 and later migrations add: a v5 funding table.
  *
  * Derived from the current shape rather than written out, so the two cannot drift in the parts
  * neither migration touches, and an addition that is not stripped here fails loudly when the
@@ -317,7 +354,7 @@ describe('creating a fresh schema', () => {
  * says the fixture was not kept up, rather than passing while proving less.
  */
 const atV5 = (sql: string): string =>
-  sql
+  atV8(sql)
     .replace(" direction TEXT NOT NULL DEFAULT 'buy',", '')
     .replace(' crypto_amount TEXT,', '')
     .replace(' deposit_address TEXT,', '')
@@ -345,11 +382,14 @@ const atV5 = (sql: string): string =>
       ', country)',
     );
 
+/** A v5 database's DDL. */
+const v5Schema = (): string[] => freshSchema().filter((sql) => !newAtV9(sql)).map(atV5);
+
 describe('the v5 -> v6 migration', () => {
   /** A v5 database with one buy row in it, stamped at 5. Returns the schema name. */
   const atVersionFive = async (): Promise<string> => {
     const schema = await createSchema();
-    for (const sql of freshSchema().map(atV5)) await raw(schema, sql);
+    for (const sql of v5Schema()) await raw(schema, sql);
     await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
     await raw(schema, 'INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)');
     await raw(
@@ -378,8 +418,8 @@ describe('the v5 -> v6 migration', () => {
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Not just [5, 6]: `openIn` always walks to `SCHEMA_VERSION`, so a database stamped at 5
-      // takes the v6, v7 and v8 steps in one boot.
-      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8]);
+      // takes every later step in one boot.
+      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8, 9]);
     } finally {
       await dropSchema(schema);
     }
@@ -404,38 +444,98 @@ describe('the v5 -> v6 migration', () => {
   });
 });
 
+describe('the v8 -> v9 migration', () => {
+  /** A v8 database with one widget buy in it, stamped at 8. Returns the schema name. */
+  const atVersionEight = async (): Promise<string> => {
+    const schema = await createSchema();
+    for (const sql of v8Schema()) await raw(schema, sql);
+    await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
+    await raw(schema, 'INSERT INTO schema_migrations (version, applied_at) VALUES (8, 0)');
+    await raw(
+      schema,
+      'INSERT INTO funding_requests (id, subject_alias, product_id, destination_currency_code, ' +
+        'wallet_address, source_amount, fiat, payment_method_type, rail, status, status_history, ' +
+        "created_at, updated_at) VALUES ('widget', 'alias-abc', 'app.dot', 'USDC_ASSETHUB', " +
+        "'0x0', '25.00', 'USD', 'CREDIT_DEBIT_CARD', 'meld', 'session_opened', '[]', 1, 1)",
+    );
+    return schema;
+  };
+
+  it('calls every existing row a widget row and leaves the headless terms empty', async () => {
+    const schema = await atVersionEight();
+    try {
+      const store = await openIn(schema);
+      const carried = await store.byId('widget');
+      expect(carried?.integration_mode).toBe('widget');
+      expect(carried?.meld_order_id).toBeUndefined();
+      expect(carried?.customer_key_hash).toBeUndefined();
+      expect(carried?.terms_accepted_at).toBeUndefined();
+      expect(carried?.payment_instructions).toBeUndefined();
+      await store.close();
+
+      const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
+      expect(applied.map((r) => Number(r.version))).toEqual([8, 9]);
+    } finally {
+      await dropSchema(schema);
+    }
+  });
+
+  it('takes a headless row, a customer and a webhook event on the migrated shape', async () => {
+    const schema = await atVersionEight();
+    try {
+      const store = await openIn(schema);
+      await store.create(headlessRecord({ id: 'headless' }));
+      expect(await store.byMeldOrderId('order-1')).toEqual(headlessRecord({ id: 'headless' }));
+      expect(await store.insertCustomer(customerRow())).toEqual(customerRow());
+      expect(await store.recordWebhookEvent('evt-1', 'WEBHOOK_TEST', 1)).toBe(true);
+      expect(await store.recordWebhookEvent('evt-1', 'WEBHOOK_TEST', 2)).toBe(false);
+      await store.close();
+    } finally {
+      await dropSchema(schema);
+    }
+  });
+});
+
+describe('the integration mode constraint', () => {
+  it('refuses a mode the vocabulary does not have', async () => {
+    await withStore(async (store) => {
+      await expect(
+        store.create(fundingRecord({ id: 'embedded', integration_mode: 'embedded' as never })),
+      ).rejects.toThrow(/funding_integration_mode_known/);
+    });
+  });
+});
+
 describe('a fresh database and a migrated one are the same database', () => {
   /** Every column, in physical order, with the facts a dump or a `COPY` would care about. */
-  const columnsOf = async (schema: string) =>
+  const columnsOf = async (schema: string, table: string) =>
     query(
       schema,
       'SELECT ordinal_position, column_name, data_type, is_nullable, column_default ' +
-        "FROM information_schema.columns WHERE table_name = 'funding_requests' " +
+        `FROM information_schema.columns WHERE table_name = '${table}' ` +
         'AND table_schema = current_schema() ORDER BY ordinal_position',
     );
 
   /** Every constraint, by name, as Postgres itself renders the definition. */
-  const constraintsOf = async (schema: string) =>
+  const constraintsOf = async (schema: string, table: string) =>
     query(
       schema,
       'SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint ' +
-        "WHERE conrelid = 'funding_requests'::regclass ORDER BY conname",
+        `WHERE conrelid = '${table}'::regclass ORDER BY conname`,
     );
 
-  /** As `columnsOf`/`constraintsOf`, for `supported_corridors`: the v7 -> v8 pair grew this table too. */
-  const corridorColumnsOf = async (schema: string) =>
-    query(
-      schema,
-      'SELECT ordinal_position, column_name, data_type, is_nullable, column_default ' +
-        "FROM information_schema.columns WHERE table_name = 'supported_corridors' " +
-        'AND table_schema = current_schema() ORDER BY ordinal_position',
-    );
-  const corridorConstraintsOf = async (schema: string) =>
-    query(
-      schema,
-      'SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint ' +
-        "WHERE conrelid = 'supported_corridors'::regclass ORDER BY conname",
-    );
+  /** Every index, by name, with its definition minus the schema it lives in. */
+  const indexesOf = async (schema: string, table: string) =>
+    (
+      await query(
+        schema,
+        'SELECT indexname, indexdef FROM pg_indexes ' +
+          `WHERE tablename = '${table}' AND schemaname = current_schema() ORDER BY indexname`,
+      )
+    ).map((row) => ({ ...row, indexdef: String(row.indexdef).replace(`${schema}.`, '') }));
+
+  /** Every table a migration has grown or created. */
+  const TABLES = ['funding_requests', 'supported_corridors', 'meld_customers', 'meld_webhook_events'];
 
   it('agrees column for column and constraint for constraint', async () => {
     // This is the test that was missing, and the omission shipped a real divergence:
@@ -456,19 +556,18 @@ describe('a fresh database and a migrated one are the same database', () => {
     try {
       await (await openIn(fresh)).close();
 
-      for (const sql of freshSchema().map(atV5)) await raw(migrated, sql);
+      for (const sql of v5Schema()) await raw(migrated, sql);
       await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
       await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)');
       await (await openIn(migrated)).close();
 
-      expect(await columnsOf(migrated)).toEqual(await columnsOf(fresh));
-      expect(await constraintsOf(migrated)).toEqual(await constraintsOf(fresh));
-      // `supported_corridors` grew the same way at v7 -> v8 (`SUPPORTED_CORRIDORS_DIRECTION_COLUMN`
-      // and `SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT`, shared between `freshSchema()` and the
-      // migration for the identical reason), so it is asserted here too rather than in a fixture
-      // that only proves the table exists.
-      expect(await corridorColumnsOf(migrated)).toEqual(await corridorColumnsOf(fresh));
-      expect(await corridorConstraintsOf(migrated)).toEqual(await corridorConstraintsOf(fresh));
+      // `supported_corridors` grew at v7 -> v8 and the two Meld tables arrived at v8 -> v9, each
+      // from constants shared with `freshSchema()`, so every table is compared, indexes included.
+      for (const table of TABLES) {
+        expect(await columnsOf(migrated, table)).toEqual(await columnsOf(fresh, table));
+        expect(await constraintsOf(migrated, table)).toEqual(await constraintsOf(fresh, table));
+        expect(await indexesOf(migrated, table)).toEqual(await indexesOf(fresh, table));
+      }
     } finally {
       await dropSchema(fresh);
       await dropSchema(migrated);
@@ -566,9 +665,11 @@ describe('the real migration chain', () => {
       // add a column that is already there and this fails loudly, which is how the omission is
       // caught.
       // supported_corridors is a v5 table, so a v1 database has none: filter it out before stripping
-      // the later funding_requests columns, or its own ` country TEXT,` would be mangled too.
+      // the later funding_requests columns, or its own ` country TEXT,` would be mangled too. The
+      // v9 tables and index go the same way.
       const v1 = freshSchema()
         .filter((sql) => !sql.includes('supported_corridors'))
+        .filter((sql) => !newAtV9(sql))
         .map((sql) =>
           sql
             .replace(' country TEXT,', '')
@@ -656,12 +757,19 @@ describe('the real migration chain', () => {
       expect(disputed?.deposit_address).toBe(ALICE);
       expect(disputed?.deposit_conflict_address).toBe(BOB);
       expect(disputed?.deposit_conflict_reason).toBe('address_changed');
+      // v9: the oldest row is a widget row, and the headless columns and tables are reachable.
+      expect(carried?.integration_mode).toBe('widget');
+      await store.create(headlessRecord({ id: 'headless', client_reference: undefined }));
+      expect((await store.byMeldOrderId('order-1'))?.id).toBe('headless');
+      await store.insertCustomer(customerRow());
+      expect((await store.customerByMeldId('meld-customer-1'))?.customer_key_hash).toBe(KEY_HASH);
+      expect(await store.recordWebhookEvent('evt-1', 'WEBHOOK_TEST', 1)).toBe(true);
       await store.close();
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     } finally {
       await dropSchema(schema);
     }
@@ -706,6 +814,8 @@ describe('applying a migration', () => {
         " direction TEXT NOT NULL DEFAULT 'buy', crypto_amount TEXT, deposit_address TEXT," +
         ' deposit_amount TEXT, deposit_currency TEXT, deposit_memo TEXT, deposit_observed_at BIGINT,' +
         ' deposit_conflict_address TEXT, deposit_conflict_reason TEXT, deposit_conflict_at BIGINT,' +
+        " integration_mode TEXT NOT NULL DEFAULT 'widget', meld_order_id TEXT, customer_key_hash TEXT," +
+        ' terms_accepted_at BIGINT, payment_instructions JSONB,' +
         ' claimed_by TEXT, claimed_until BIGINT)',
     );
     return schema;

@@ -3,14 +3,13 @@
  *
  * The SQLite migration chain is gone, and deleting it was the point of moving. v0->v1->v2->v3
  * existed to bring an on-disk SQLite file forward in place; the Postgres chain is
- * 1->2->3->4->5->6->7->8, with 3->4 adding `cancelled_at`, 4->5 adding the supported-corridors
+ * 1->2->3->4->5->6->7->8->9, with 3->4 adding `cancelled_at`, 4->5 adding the supported-corridors
  * cache, 5->6 adding the sell direction and the terms only a sell commits, 6->7 recording a
- * deposit-address disclosure conflict, and 7->8 putting a direction into the supported-corridors
- * cache. Nothing was ever
- * deployed, so that chain migrated a population of
- * zero, and CloudSQL starts from an empty database, so porting it would have meant carrying three
- * migrations for no rows, expressed against an engine this service has left. The v3 shape is the v1 shape
- * here.
+ * deposit-address disclosure conflict, 7->8 putting a direction into the supported-corridors
+ * cache, and 8->9 adding Meld Headless customers, webhook dedupe and headless order terms.
+ * Nothing was ever deployed, so the SQLite chain migrated a population of zero, and CloudSQL
+ * starts from an empty database, so porting it would have meant carrying three migrations for no
+ * rows, expressed against an engine this service has left. The v3 shape is the v1 shape here.
  *
  * The machinery stays, because the next migration is not hypothetical: `schema_migrations` records
  * what has run, and `store.ts` takes a `pg_advisory_lock` around the whole sequence so two booting
@@ -20,9 +19,10 @@
 
 import { DIRECTIONS } from '../rail.js';
 import { FUNDING_STATES } from './state.js';
+import { INTEGRATION_MODES } from './types.js';
 
 /** The current schema version. Bump with each migration added here. */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /** A migration: bring the previous version's rows to this version's shape. */
 export interface Migration {
@@ -225,11 +225,60 @@ const DEPOSIT_CONFLICT_CONSTRAINT =
   "deposit_conflict_reason IS NULL OR deposit_conflict_reason IN ('address_changed', 'address_malformed', 'terms_changed'))";
 
 /**
+ * The headless columns on `funding_requests`, shared by `freshSchema()` and v8 -> v9.
+ *
+ * `integration_mode` defaults to `widget` because every earlier row was a widget session; the
+ * default is catalog-only on Postgres 11+, so existing rows are not rewritten. The rest stay null
+ * on widget rows. `payment_instructions` is the parsed `BankInstructions` of a bank order, never
+ * the card order body.
+ */
+const HEADLESS_COLUMNS = [
+  " integration_mode TEXT NOT NULL DEFAULT 'widget'",
+  ' meld_order_id TEXT',
+  ' customer_key_hash TEXT',
+  ' terms_accepted_at BIGINT',
+  ' payment_instructions JSONB',
+];
+
+const INTEGRATION_MODE_CONSTRAINT = `CONSTRAINT funding_integration_mode_known CHECK (integration_mode IN (${INTEGRATION_MODES.map((m) => `'${m}'`).join(', ')}))`;
+
+/** Unique: each order is created under its own funding id, so a webhook names at most one row. */
+const MELD_ORDER_INDEX =
+  'CREATE UNIQUE INDEX funding_by_meld_order ON funding_requests (meld_order_id) WHERE meld_order_id IS NOT NULL';
+
+/**
+ * One Meld customer per `(product_id, customer_key_hash)`. Both Meld ids are unique, so one Meld
+ * customer can never answer for two keys.
+ */
+const MELD_CUSTOMERS_TABLE =
+  'CREATE TABLE meld_customers (' +
+  ' product_id TEXT NOT NULL,' +
+  ' customer_key_hash TEXT NOT NULL,' +
+  ' meld_customer_id TEXT NOT NULL,' +
+  ' external_id TEXT NOT NULL,' +
+  " kyc_cache JSONB NOT NULL DEFAULT '{}'," +
+  ' created_at BIGINT NOT NULL,' +
+  ' updated_at BIGINT NOT NULL,' +
+  ' CONSTRAINT meld_customers_pkey PRIMARY KEY (product_id, customer_key_hash),' +
+  ' CONSTRAINT meld_customers_meld_customer_id_key UNIQUE (meld_customer_id),' +
+  ' CONSTRAINT meld_customers_external_id_key UNIQUE (external_id)' +
+  ')';
+
+/** Meld redelivers webhooks; an event id seen once is not applied again. */
+const MELD_WEBHOOK_EVENTS_TABLE =
+  'CREATE TABLE meld_webhook_events (' +
+  ' event_id TEXT NOT NULL,' +
+  ' event_type TEXT NOT NULL,' +
+  ' received_at BIGINT NOT NULL,' +
+  ' CONSTRAINT meld_webhook_events_pkey PRIMARY KEY (event_id)' +
+  ')';
+
+/**
  * The ordered migration list.
  *
  * A fresh database is created at `SCHEMA_VERSION` directly by `freshSchema()`, so this list is
  * what an existing database walks through, one step at a time. The next migration appends
- * `{ from: 8, to: 9, sql: [...] }` and bumps `SCHEMA_VERSION`; `store.ts` needs no change.
+ * `{ from: 9, to: 10, sql: [...] }` and bumps `SCHEMA_VERSION`; `store.ts` needs no change.
  *
  * This chain is one-way. A build expecting v1 refuses a v2 database: the version check is
  * `!==`, deliberately, because reading a shape you do not understand is worse than not starting.
@@ -490,6 +539,22 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE supported_corridors ADD ${SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT}`,
     ],
   },
+  {
+    from: 8,
+    to: 9,
+    /**
+     * v8 -> v9: Meld Headless. Five appended nullable-or-defaulted columns and one `CHECK` on
+     * `funding_requests`, sized like the v6 -> v7 constraint (one full-table scan under the same
+     * lock); a partial index that covers no existing row; and two new, empty tables.
+     */
+    sql: [
+      ...HEADLESS_COLUMNS.map((column) => `ALTER TABLE funding_requests ADD COLUMN${column}`),
+      `ALTER TABLE funding_requests ADD ${INTEGRATION_MODE_CONSTRAINT}`,
+      MELD_ORDER_INDEX,
+      MELD_CUSTOMERS_TABLE,
+      MELD_WEBHOOK_EVENTS_TABLE,
+    ],
+  },
 ];
 
 /**
@@ -547,6 +612,8 @@ export function freshSchema(): string[] {
       // table.
       DEPOSIT_COLUMNS.map((column) => `${column},`).join('') +
       DEPOSIT_CONFLICT_COLUMNS.map((column) => `${column},`).join('') +
+      // In the order the v8 -> v9 migration appends them.
+      HEADLESS_COLUMNS.map((column) => `${column},`).join('') +
       // The vocabulary, enforced by the database rather than only by the state machine.
       // `update()` validates transitions inside its transaction, but `create()` writes whatever
       // status it is handed; both production callers are correct and nothing at the storage layer
@@ -557,6 +624,7 @@ export function freshSchema(): string[] {
       // an existing table. Same text on both paths, so the two tables are the same table.
       DIRECTION_CONSTRAINTS.map((constraint) => ` ${constraint}`).join(',') +
       `, ${DEPOSIT_CONFLICT_CONSTRAINT}` +
+      `, ${INTEGRATION_MODE_CONSTRAINT}` +
       ')',
     'CREATE INDEX funding_by_alias ON funding_requests (subject_alias, product_id, created_at DESC, id DESC)',
     // Partial, matching the `WHERE client_reference IS NOT NULL` predicate exactly: a refused row
@@ -569,6 +637,9 @@ export function freshSchema(): string[] {
     // The supported-corridors cache, at the current (v8) shape. See the v7 -> v8 migration for
     // what an existing database walks through to reach the same table.
     SUPPORTED_CORRIDORS_TABLE_CURRENT,
+    MELD_ORDER_INDEX,
+    MELD_CUSTOMERS_TABLE,
+    MELD_WEBHOOK_EVENTS_TABLE,
   ];
 }
 

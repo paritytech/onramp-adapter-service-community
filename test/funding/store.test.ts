@@ -1,10 +1,21 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { ALICE, BOB, fundingRecord, sellRecord } from '../fixtures.js';
+import {
+  ALICE,
+  BOB,
+  KEY_HASH,
+  bankInstructions,
+  customerRow,
+  fakeStore,
+  fundingRecord,
+  headlessRecord,
+  sellRecord,
+} from '../fixtures.js';
 import {
   createSchema,
   dropSchema,
   openIn,
+  rawQuery,
   storePassword,
   terminateBackends,
   whileRowLocked,
@@ -1168,6 +1179,209 @@ describe('the supported-corridors cache', () => {
       expect((await store.readCorridors('DOT_ASSETHUB', 'sell'))[0]?.methods).toEqual([payout]);
     });
   });
+});
+
+describe('headless funding rows', () => {
+  it('round-trips every headless column', async () => {
+    await withStore(async (store) => {
+      await store.create(headlessRecord());
+      expect(await store.byId('funding-1')).toEqual(headlessRecord());
+    });
+  });
+
+  it('writes the order id and transfer details on update and keeps them on later advances', async () => {
+    await withStore(async (store) => {
+      await store.create(
+        headlessRecord({
+          status: 'created',
+          status_history: [{ status: 'created', at: 1_700_000_000_000 }],
+          meld_order_id: undefined,
+          payment_instructions: undefined,
+        }),
+      );
+      await store.update('funding-1', 'session_opened', 1_700_000_000_100, {
+        meldOrderId: 'order-1',
+        paymentInstructions: bankInstructions(),
+      });
+      const seen = await store.update('funding-1', 'transaction_seen', 1_700_000_000_200, {
+        providerTransactionId: 'tx-1',
+      });
+
+      expect(seen).toMatchObject({ meld_order_id: 'order-1', payment_instructions: bankInstructions() });
+      expect(await store.byId('funding-1')).toEqual(seen);
+      // Fixed at reservation, never touched by an advance.
+      expect(seen).toMatchObject({
+        integration_mode: 'headless',
+        customer_key_hash: KEY_HASH,
+        terms_accepted_at: 1_699_999_990_000,
+      });
+    });
+  });
+
+  it('finds a row by its Meld order id, and only that row', async () => {
+    await withStore(async (store) => {
+      await store.create(record({ id: 'widget' }));
+      await store.create(headlessRecord({ id: 'headless' }));
+      expect((await store.byMeldOrderId('order-1'))?.id).toBe('headless');
+      expect(await store.byMeldOrderId('order-2')).toBeUndefined();
+    });
+  });
+
+  it('refuses a second row naming the same Meld order', async () => {
+    await withStore(async (store) => {
+      await store.create(headlessRecord({ id: 'first' }));
+      await expect(store.create(headlessRecord({ id: 'second' }))).rejects.toThrow(/funding_by_meld_order/);
+    });
+  });
+
+  it('refuses to read transfer details it did not write, without echoing them', async () => {
+    const schema = await createSchema();
+    try {
+      const store = await openIn(schema);
+      await store.create(headlessRecord());
+      await rawQuery(
+        schema,
+        `UPDATE funding_requests SET payment_instructions = '{"rail":"SEPA","iban":"DE89370400440532013000"}'`,
+      );
+      const read = store.byId('funding-1');
+      await expect(read).rejects.toThrow(/funding request funding-1 holds payment_instructions/);
+      await expect(read).rejects.not.toThrow(/DE89/);
+      await store.close();
+    } finally {
+      await dropSchema(schema);
+    }
+  });
+});
+
+/**
+ * The customer and webhook surface, run against Postgres and against the in-memory fake, so the
+ * fake the route suites write through cannot drift from the table's constraints.
+ */
+type CustomerSurface = Pick<
+  FundingStore,
+  'customerByKey' | 'customerByMeldId' | 'insertCustomer' | 'updateKycCache' | 'recordWebhookEvent'
+>;
+
+const onBoth = (body: (store: CustomerSurface) => Promise<void>) => async () => {
+  await withStore(body);
+  await body(fakeStore());
+};
+
+describe('meld customers', () => {
+  it(
+    'stores a customer and finds it by key and by Meld id',
+    onBoth(async (store) => {
+      expect(await store.insertCustomer(customerRow())).toEqual(customerRow());
+      expect(await store.customerByKey('app.dot', KEY_HASH)).toEqual(customerRow());
+      expect(await store.customerByMeldId('meld-customer-1')).toEqual(customerRow());
+      expect(await store.customerByKey('app.other', KEY_HASH)).toBeUndefined();
+      expect(await store.customerByMeldId('meld-customer-2')).toBeUndefined();
+    }),
+  );
+
+  it(
+    'returns the first customer when a second insert names the same key',
+    onBoth(async (store) => {
+      await store.insertCustomer(customerRow());
+      const second = await store.insertCustomer(
+        customerRow({ meld_customer_id: 'meld-customer-2', external_id: 'external-2', created_at: 2 }),
+      );
+      expect(second).toEqual(customerRow());
+      expect(await store.customerByMeldId('meld-customer-2')).toBeUndefined();
+    }),
+  );
+
+  it(
+    'keeps one key per product: the same hash under another product is another customer',
+    onBoth(async (store) => {
+      await store.insertCustomer(customerRow());
+      const other = customerRow({ product_id: 'app.other', meld_customer_id: 'meld-customer-2', external_id: 'external-2' });
+      expect(await store.insertCustomer(other)).toEqual(other);
+    }),
+  );
+
+  it.each([
+    ['Meld customer id', { meld_customer_id: 'meld-customer-1', external_id: 'external-2' }],
+    ['external id', { meld_customer_id: 'meld-customer-2', external_id: customerRow().external_id }],
+  ])(
+    'refuses one %s answering for two keys',
+    (_name, ids) =>
+      onBoth(async (store) => {
+        await store.insertCustomer(customerRow());
+        await expect(store.insertCustomer(customerRow({ customer_key_hash: '0c'.repeat(32), ...ids }))).rejects.toThrow(
+          /duplicate key value violates unique constraint/,
+        );
+      })(),
+  );
+
+  it('throws rather than inventing a row when the key conflicts and no holder can be read', async () => {
+    await withStore(async (store) => {
+      await store.insertCustomer(customerRow());
+      vi.spyOn(store, 'customerByKey').mockResolvedValue(undefined);
+      await expect(store.insertCustomer(customerRow())).rejects.toThrow(/conflicted with no row holding the key/);
+    });
+  });
+
+  it(
+    'replaces the KYC cache and stamps the update',
+    onBoth(async (store) => {
+      await store.insertCustomer(customerRow());
+      const cache = { kyc: 'approved', providers: { NOAH: 'pending' } } as const;
+      const updated = await store.updateKycCache('meld-customer-1', cache, 1_700_000_000_500);
+      expect(updated).toEqual(customerRow({ kyc_cache: cache, updated_at: 1_700_000_000_500 }));
+      expect(await store.customerByKey('app.dot', KEY_HASH)).toEqual(updated);
+
+      await store.updateKycCache('meld-customer-1', { kyc: 'rejected' }, 1_700_000_000_600);
+      expect((await store.customerByMeldId('meld-customer-1'))?.kyc_cache).toEqual({ kyc: 'rejected' });
+    }),
+  );
+
+  it(
+    'reports a KYC update for an unknown customer as nothing updated',
+    onBoth(async (store) => {
+      expect(await store.updateKycCache('meld-customer-404', { kyc: 'approved' }, 1)).toBeUndefined();
+    }),
+  );
+
+  it('reads an omitted cache as empty, from the column default', async () => {
+    const schema = await createSchema();
+    try {
+      const store = await openIn(schema);
+      await rawQuery(
+        schema,
+        'INSERT INTO meld_customers (product_id, customer_key_hash, meld_customer_id, external_id, created_at, updated_at) ' +
+          `VALUES ('app.dot', '${KEY_HASH}', 'meld-customer-1', 'external-1', 1, 1)`,
+      );
+      expect((await store.customerByKey('app.dot', KEY_HASH))?.kyc_cache).toEqual({});
+      await store.close();
+    } finally {
+      await dropSchema(schema);
+    }
+  });
+
+  it('refuses to read a KYC cache outside the vocabulary', async () => {
+    const schema = await createSchema();
+    try {
+      const store = await openIn(schema);
+      await store.insertCustomer(customerRow());
+      await rawQuery(schema, `UPDATE meld_customers SET kyc_cache = '{"kyc":"APPROVED"}'`);
+      await expect(store.customerByMeldId('meld-customer-1')).rejects.toThrow(/kyc_cache this build cannot read/);
+      await store.close();
+    } finally {
+      await dropSchema(schema);
+    }
+  });
+});
+
+describe('meld webhook events', () => {
+  it(
+    'records an event once and reports every redelivery as a duplicate',
+    onBoth(async (store) => {
+      expect(await store.recordWebhookEvent('evt-1', 'TRANSACTION_CRYPTO_PENDING', 1)).toBe(true);
+      expect(await store.recordWebhookEvent('evt-1', 'TRANSACTION_CRYPTO_PENDING', 2)).toBe(false);
+      expect(await store.recordWebhookEvent('evt-2', 'TRANSACTION_CRYPTO_PENDING', 3)).toBe(true);
+    }),
+  );
 });
 
 describe('closing the store', () => {
