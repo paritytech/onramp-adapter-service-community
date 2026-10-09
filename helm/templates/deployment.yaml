@@ -278,6 +278,18 @@ spec:
               subPath: {{ .Values.secrets.jwtKey.key | quote }}
               readOnly: true
             {{- end }}
+            {{- if and .Values.meld.headless.enabled .Values.secrets.meldWebhookSecret.existingSecret }}
+            - name: meld-webhook-secret
+              mountPath: {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.meldWebhookSecret.key | quote }}
+              subPath: {{ .Values.secrets.meldWebhookSecret.key | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.meld.headless.enabled .Values.secrets.customerTokenKey.existingSecret }}
+            - name: customer-token-key
+              mountPath: {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.customerTokenKey.key | quote }}
+              subPath: {{ .Values.secrets.customerTokenKey.key | quote }}
+              readOnly: true
+            {{- end }}
       volumes:
         # `/tmp` carries a `sizeLimit`. Without one an `emptyDir` is bounded only by the node's
         # disk, and the kubelet evicts the pod under node disk pressure: with one replica, a full
@@ -309,6 +321,20 @@ spec:
         - name: jwt-key
           secret:
             secretName: {{ .Values.secrets.jwtKey.existingSecret }}
+            optional: false
+            defaultMode: 0400
+        {{- end }}
+        {{- if and .Values.meld.headless.enabled .Values.secrets.meldWebhookSecret.existingSecret }}
+        - name: meld-webhook-secret
+          secret:
+            secretName: {{ .Values.secrets.meldWebhookSecret.existingSecret }}
+            optional: false
+            defaultMode: 0400
+        {{- end }}
+        {{- if and .Values.meld.headless.enabled .Values.secrets.customerTokenKey.existingSecret }}
+        - name: customer-token-key
+          secret:
+            secretName: {{ .Values.secrets.customerTokenKey.existingSecret }}
             optional: false
             defaultMode: 0400
         {{- end }}

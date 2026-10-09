@@ -24,6 +24,14 @@ a service that runs in production with a development posture. See
 | `meld.countries_cache_ttl_ms` | How long the country catalog (`supported/countries`) stays fresh. 60000 to 604800000, default 21600000 (6h). Meld's caching guide calls this endpoint rarely-changing and permits up to a week; the default stays under `supported.catalog_interval_ms` so the refresh pass is never served its own cached copy. |
 | `meld.defaults_cache_ttl_ms` | How long a country's default fiat (`defaults/{country}`) stays fresh. 60000 to 604800000, default 21600000 (6h). Same reasoning as the country catalog. Previously uncached entirely, which cost a Meld call on every `GET /supported` and on every country of every refresh pass. |
 | `meld.routes_cache_ttl_ms` | How long a discovered corridor (`supported/routes`) stays fresh. 60000 to 86400000, default 900000 (15m). Short because this is the endpoint carrying the amount limits, and it is the one that gates a charge. Must stay under `supported.routes_interval_ms`. |
+| `meld.headless` | Meld Headless: card and bank orders without the widget. Optional; absent means off. |
+| `meld.headless.enabled` | Default `false`. When `true`, `meld.webhook` and `customer` are required, and so is a `network_codes` entry for every catalog destination. |
+| `meld.headless.api_version` | Sent as `Meld-Version` on the headless calls. **Required, no default**, like `meld.api_version`; Meld documents `2026-05-01` for them. |
+| `meld.headless.kyc_share_providers` | Providers Meld may share the customer's Unified KYC with. Default `[]`, which shares with none. |
+| `meld.headless.network_codes` | Destination code to Meld network code. An order's `destinationNetworkCode` must equal the entry for its destination. Keys must be catalog destinations. Default `{}`. |
+| `meld.webhook.url` | The https URL registered at Meld, verbatim: it is part of the signed string, so any difference fails every signature. |
+| `meld.webhook.secret` | A `secretSource` for Meld's webhook signing secret. Meld issues it, so no length floor is applied. |
+| `meld.webhook.tolerance_ms` | How far a signature timestamp may sit from now. 1000 to 900000, default 300000. |
 | `meld.boot_probe` | The quote requested at boot to prove the key and the endpoint. Operator-supplied, because it has to be a request Meld will actually accept; `destination_code` must be one this service delivers, since Meld resolves an unknown one to Bitcoin rather than refusing it. |
 | `auth.mode` | `personhood` \| `insecure_dev`. **Required, no default.** `personhood` verifies a ring-VRF proof on chain before spending the key; `insecure_dev` trusts a dev header and is refused anywhere but `development`. It gives every caller of a product the same alias, so funding rows and idempotency keys are shared between them. |
 | `auth.personhood.jwt_key` | Where the JWT signing key is read from: a second `Secret`, redacted like the Meld key. Required when `mode` is `personhood`, and **at least 32 bytes**: `openssl rand -base64 32`. |
@@ -31,6 +39,9 @@ a service that runs in production with a development posture. See
 | `auth.personhood.collections` | The People collections a proof may open against, tried in order. Each is `{ identifier, ring_exponent }`. A **list** because personhood is not one population: full persons (`pop:polkadot.network/people`) and lite persons (`pop:polkadot.network/people-lite`) live in different collections, and pinning one silently refuses everyone in the other. The exponent rides with the collection because it is the ring domain, a property of the collection rather than of the deployment. The real ids are ASCII names **space-padded to 32 bytes**; do not trim the trailing `0x20`. |
 | `auth.personhood.challenge_ttl_ms` | How long a challenge stays acceptable; the freshness that stops replay. 1000 to 300000. |
 | `auth.personhood.token_ttl_s` | How long a redeemed session JWT is valid; the browser keeps it this long. 30 to 3600. |
+| `customer.token_key` | A `secretSource` for the customer token key, **at least 32 bytes**. HKDF-derived into the customer challenge key (`onramp:customer-challenge`) and the customer token key (`onramp:customer-token`). Required when headless is enabled. |
+| `customer.token_ttl_s` | How long a customer token is valid. 30 to 3600, default 600. |
+| `customer.challenge_ttl_s` | How long a customer challenge stays acceptable. 10 to 300, default 120. |
 | `limits[]` | Per `(destination, currency)`: `code`, `min`, `max`, `currency`. **Optional, and no longer what decides whether a pair is buyable**: live discovery is. A row *tightens* Meld's live bound for the pair it names, so this is where a business ceiling stricter than Meld's goes; a pair with no row stays buyable at Meld's own bounds, and a row that does not overlap the live bound is refused rather than reconciled. It is also the fallback allow-list if the catalog is unreachable, where it does behave like the old hard gate; left empty, that window fails closed. A destination may appear more than once (a card buyer pays USD, a SEPA buyer EUR), but a repeated pair is refused rather than silently resolved. |
 | `allowed_products[]` | Product ids permitted to spend the key. Empty means closed, not open. |
 | `cors.allowed_origins[]` | Browser origins permitted to call, **and** the allowlist a caller's `redirectUrl` must match. Never a wildcard. Empty disables browser access and refuses every redirect. Accepts `polkadot://...` and the literal `null` for the app running inside the Polkadot host; see the warning below before putting `null` in a production list. |
@@ -84,6 +95,9 @@ fixing one error per restart stops reading the errors:
 - an `auth.personhood.jwt_key` shorter than 32 bytes, an empty `collections` list, a collection
   `identifier` that is not 32 bytes of hex, a duplicate identifier, or a `ring_exponent` outside
   `9 | 10 | 14`;
+- `meld.headless.enabled: true` without `meld.webhook` or `customer`, or without a
+  `network_codes` entry for every catalog destination; an unknown destination in `network_codes`;
+  a `meld.webhook.url` that is not https; a `customer.token_key` shorter than 32 bytes;
 - `auth.personhood.people_rpc_url` that is not `wss` outside `development`: over plaintext an
   on-path attacker serves a ring commitment they generated themselves, and the personhood gate
   verifies against it;
@@ -95,7 +109,7 @@ fixing one error per restart stops reading the errors:
 - an unknown destination code in `limits`, duplicate limits for one `(destination, currency)`
   pair, an inverted `min`/`max`, or a non-uppercase currency;
 - `store.ssl: false` outside development when `store.host` is not loopback;
-- any of the three credentials sourced from the environment outside development;
+- any of the five credentials sourced from the environment outside development;
 - a `store.schema` that is not a bare Postgres identifier;
 - a funding schema version that is not exactly the one this build expects, in either direction;
 - a missing or empty secret file, and any unknown key at any nesting level.
@@ -120,9 +134,10 @@ party presenting it, so the overlap window an inbound credential needs does not 
 
 In process the key lives in a type whose `toString`, `toJSON` and `inspect` hooks all return
 `[redacted]`, and reading it requires calling `expose()`, which is greppable, so *"where is the
-key used"* has an exact answer. There are three secrets (the Meld key, the JWT signing key and the
-CloudSQL password) and four `expose()` call sites: one in the Meld client, two in `startup`'s HKDF
-derivation, and one where the store builds its pool.
+key used"* has an exact answer. There are five secrets (the Meld key, the JWT signing key, the
+CloudSQL password, and with headless enabled the Meld webhook secret and the customer token key)
+and six `expose()` call sites: one in the Meld client, four in `startup`'s HKDF derivations, and
+one where the store builds its pool.
 
 > [!NOTE]
 > Node cannot erase a string. `Buffer` contents can be overwritten, but the value must become a

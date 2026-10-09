@@ -26,7 +26,7 @@ import { PersonhoodService, type PersonhoodDeps } from './personhood.js';
 import { chainReader } from './personhood/chain.js';
 import { commitmentsFrom } from './personhood/source.js';
 import { validateWithCommitment } from './personhood/verifiablejs.js';
-import { resolveSecret } from './secret.js';
+import { resolveSecret, type Secret } from './secret.js';
 import { buildServer } from './server.js';
 
 // The cryptos the supported-corridors refresh enumerates; DOT only in v1, the table is crypto-keyed so more are additive.
@@ -121,6 +121,9 @@ export async function start(
   // built and nothing is resolved.
   const personhood =
     cfg.auth.mode === 'personhood' ? await buildPersonhood(cfg) : undefined;
+
+  // Resolved here so a missing or short headless secret stops boot before any Meld call.
+  await buildHeadlessKeys(cfg);
 
   // The durable funding store: the status surface answers from it and the worker advances it,
   // so a restart resumes from the persisted requests rather than losing in-flight work.
@@ -383,4 +386,37 @@ export async function buildPersonhood(cfg: Config): Promise<PersonhoodService> {
     allowedProducts: cfg.allowed_products,
   };
   return new PersonhoodService(deps);
+}
+
+/** The secrets Meld Headless needs, resolved and derived once at boot. */
+interface HeadlessKeys {
+  customerChallengeKey: Uint8Array;
+  customerTokenKey: Uint8Array;
+  webhookSecret: Secret;
+}
+
+/**
+ * Resolve the headless secrets, or nothing when headless is off.
+ *
+ * `customer.token_key` follows the JWT key's rules: the same 32-byte floor, and two keys
+ * HKDF-derived under separate labels so a customer challenge can never verify as a customer token.
+ * The webhook secret is Meld's to size, like the API key, so it has no floor here.
+ */
+export async function buildHeadlessKeys(cfg: Config): Promise<HeadlessKeys | undefined> {
+  if (cfg.meld.headless?.enabled !== true) return undefined;
+  // The superRefine requires both blocks whenever headless is enabled.
+  const { webhook } = cfg.meld;
+  const { customer } = cfg;
+  if (webhook === undefined || customer === undefined) {
+    throw new Error('meld.webhook and customer are required when meld.headless.enabled is true.');
+  }
+  const tokenSecret = await resolveSecret(customer.token_key, {
+    minBytes: JWT_KEY_MIN_BYTES,
+    name: 'customer.token_key',
+  });
+  return {
+    customerChallengeKey: new Uint8Array(hkdfSync('sha256', tokenSecret.expose(), Buffer.alloc(0), Buffer.from('onramp:customer-challenge'), 32)),
+    customerTokenKey: new Uint8Array(hkdfSync('sha256', tokenSecret.expose(), Buffer.alloc(0), Buffer.from('onramp:customer-token'), 32)),
+    webhookSecret: await resolveSecret(webhook.secret),
+  };
 }

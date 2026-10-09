@@ -104,6 +104,28 @@ export const personhoodConfig = (overrides: Record<string, unknown> = {}) =>
     ...overrides,
   });
 
+type SecretSourceFixture = { mode: 'file'; path: string } | { mode: 'env'; var: string };
+
+/** A development config with Meld Headless enabled; both new secrets default to file mounts. */
+export const headlessConfig = (
+  secrets: { webhook?: SecretSourceFixture; customer?: SecretSourceFixture } = {},
+): Record<string, unknown> =>
+  rawConfig({
+    meld: {
+      ...(rawConfig().meld as Record<string, unknown>),
+      headless: {
+        enabled: true,
+        api_version: '2026-05-01',
+        network_codes: { DOT_ASSETHUB: 'polkadot', USDC_ASSETHUB: 'polkadot', USDT_ASSETHUB: 'polkadot' },
+      },
+      webhook: {
+        url: 'https://adapter.example/webhooks/meld',
+        secret: secrets.webhook ?? { mode: 'file', path: '/run/secrets/meld-webhook-secret' },
+      },
+    },
+    customer: { token_key: secrets.customer ?? { mode: 'file', path: '/run/secrets/customer-token-key' } },
+  });
+
 export const config = (overrides: Record<string, unknown> = {}): Config =>
   parseConfig(rawConfig(overrides));
 

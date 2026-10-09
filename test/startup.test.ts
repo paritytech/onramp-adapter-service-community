@@ -15,10 +15,19 @@ import type { FundingRecord } from '../src/funding/types.js';
 import { MeldHttpError } from '../src/meld/client.js';
 import { mintChallenge } from '../src/personhood/challenge.js';
 import { mintToken } from '../src/personhood/token.js';
-import { buildPersonhood, start, verifyKey } from '../src/startup.js';
+import { buildHeadlessKeys, buildPersonhood, start, verifyKey } from '../src/startup.js';
 import { upstreamUnavailable } from '../src/contract.js';
 import type { Config } from '../src/config.js';
-import { config, createRequest, fakeSocket, fundingRecord, personhoodConfig, rawConfig, withSocket } from './fixtures.js';
+import {
+  config,
+  createRequest,
+  fakeSocket,
+  fundingRecord,
+  headlessConfig,
+  personhoodConfig,
+  rawConfig,
+  withSocket,
+} from './fixtures.js';
 
 /** Just the two levels `verifyKey` uses, so a plain object substitutes for pino. */
 const recorder = () => {
@@ -699,6 +708,20 @@ afterEach(async () => {
     expect(meldRequests).toBe(0);
   });
 
+  it('stops boot on a missing headless secret before any Meld call', async () => {
+    const baseUrl = await fakeMeld({ quotes: [] });
+    const path = await writeConfig('headless-nokey', baseUrl);
+    const raw = JSON.parse(await readFile(path, 'utf8')) as { meld: Record<string, unknown>; customer?: unknown };
+    const headless = headlessConfig({ customer: { mode: 'file', path: join(dir, 'definitely-absent') } });
+    const { headless: block, webhook } = headless.meld as Record<string, unknown>;
+    Object.assign(raw.meld, { headless: block, webhook });
+    raw.customer = headless.customer;
+    await writeFile(path, JSON.stringify(raw));
+
+    await expect(start(path)).rejects.toThrow(/Cannot read secret file .*definitely-absent/);
+    expect(meldRequests).toBe(0);
+  });
+
   it('boots in personhood mode and serves the handshake', async () => {
     // The personhood RPC is read lazily on `/redeem`, so boot never opens a socket. The probe
     // still runs, proving the Meld leg; then the handshake routes exist because personhood was
@@ -844,6 +867,57 @@ afterEach(async () => {
     await expect(buildPersonhood(forged)).rejects.toThrow(
       /auth\.personhood is required in personhood mode/,
     );
+  });
+});
+
+describe('buildHeadlessKeys', () => {
+  const TOKEN_KEY = 'a-thirty-two-byte-or-longer-customer-token-key';
+  const env = { webhook: { mode: 'env', var: 'TEST_HOOK' }, customer: { mode: 'env', var: 'TEST_CUSTOMER' } } as const;
+  const derive = (label: string) =>
+    new Uint8Array(hkdfSync('sha256', TOKEN_KEY, Buffer.alloc(0), Buffer.from(label), 32));
+
+  afterEach(() => {
+    delete process.env.TEST_HOOK;
+    delete process.env.TEST_CUSTOMER;
+  });
+
+  it('reads no secret when headless is disabled', async () => {
+    const raw = headlessConfig(env);
+    const meld = raw.meld as { headless: Record<string, unknown> };
+    meld.headless = { ...meld.headless, enabled: false };
+    await expect(buildHeadlessKeys(config(raw))).resolves.toBeUndefined();
+  });
+
+  it('resolves the webhook secret and derives the two customer keys under separate labels', async () => {
+    process.env.TEST_HOOK = 'meld-webhook-secret';
+    process.env.TEST_CUSTOMER = TOKEN_KEY;
+
+    const keys = await buildHeadlessKeys(config(headlessConfig(env)));
+
+    expect(keys?.webhookSecret.expose()).toBe('meld-webhook-secret');
+    expect(keys?.customerChallengeKey).toEqual(derive('onramp:customer-challenge'));
+    expect(keys?.customerTokenKey).toEqual(derive('onramp:customer-token'));
+    expect(keys?.customerChallengeKey).not.toEqual(keys?.customerTokenKey);
+  });
+
+  it('refuses a customer token key shorter than 32 bytes without printing it', async () => {
+    process.env.TEST_HOOK = 'meld-webhook-secret';
+    process.env.TEST_CUSTOMER = 'too-short';
+
+    const failure = buildHeadlessKeys(config(headlessConfig(env)));
+
+    await expect(failure).rejects.toThrow(/customer\.token_key .* 32 bytes/);
+    await expect(failure).rejects.not.toThrow(/too-short/);
+  });
+
+  it('refuses a missing webhook secret', async () => {
+    process.env.TEST_CUSTOMER = TOKEN_KEY;
+    await expect(buildHeadlessKeys(config(headlessConfig(env)))).rejects.toThrow(/Secret is missing or empty: environment variable TEST_HOOK/);
+  });
+
+  it('refuses to run without the blocks headless requires', async () => {
+    const forged = { ...config(headlessConfig()), customer: undefined } as unknown as Config;
+    await expect(buildHeadlessKeys(forged)).rejects.toThrow(/required when meld\.headless\.enabled/);
   });
 });
 

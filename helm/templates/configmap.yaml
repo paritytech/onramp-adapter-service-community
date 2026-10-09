@@ -5,8 +5,9 @@
   No `| default` on booleans. Helm's `default` treats `false` as empty and substitutes, so
   `session_creation_enabled: false` rendered `true`. The emergency stop for a service spending a
   payment credential could not be switched off. Every key here has a schema default in
-  values.yaml, so the pipe bought nothing and cost that. The two secret sources (meld.api_key and
-  auth.personhood.jwt_key) are emitted as file references
+  values.yaml, so the pipe bought nothing and cost that. The secret sources (meld.api_key,
+  auth.personhood.jwt_key and, with headless enabled, meld.webhook.secret and customer.token_key)
+  are emitted as file references
   {"mode":"file","path":"/run/secrets/<key>"} because the real bytes live in
   mounted Secret files (mounted below in the Deployment at secretMountPath).
   A Secret that is missing makes the process fail at boot on the file read,
@@ -48,7 +49,20 @@ data:
         "countries_cache_ttl_ms": {{ int (.Values.meld.countries_cache_ttl_ms | default 21600000) }},
         "defaults_cache_ttl_ms": {{ int (.Values.meld.defaults_cache_ttl_ms | default 21600000) }},
         "routes_cache_ttl_ms": {{ int (.Values.meld.routes_cache_ttl_ms | default 900000) }},
-        "boot_probe": {{ toJson .Values.meld.boot_probe }}
+        "boot_probe": {{ toJson .Values.meld.boot_probe }},
+        "headless": {
+          "enabled": {{ .Values.meld.headless.enabled }},
+          "api_version": {{ .Values.meld.headless.api_version | quote }},
+          "kyc_share_providers": {{ toJson .Values.meld.headless.kyc_share_providers }},
+          "network_codes": {{ toJson .Values.meld.headless.network_codes }}
+        }
+        {{- if .Values.meld.headless.enabled }},
+        "webhook": {
+          "url": {{ .Values.meld.webhook.url | quote }},
+          "secret": { "mode": "file", "path": {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.meldWebhookSecret.key | quote }} },
+          "tolerance_ms": {{ int .Values.meld.webhook.tolerance_ms }}
+        }
+        {{- end }}
       },
       "auth": {
         "mode": {{ .Values.auth.mode | quote }},
@@ -66,6 +80,13 @@ data:
           "token_ttl_s": {{ int (.Values.auth.personhood.token_ttl_s | default 300) }}
         }
       },
+      {{- if .Values.meld.headless.enabled }}
+      "customer": {
+        "token_key": { "mode": "file", "path": {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.customerTokenKey.key | quote }} },
+        "token_ttl_s": {{ int .Values.customer.token_ttl_s }},
+        "challenge_ttl_s": {{ int .Values.customer.challenge_ttl_s }}
+      },
+      {{- end }}
       "limits": {{ toJson .Values.limits }},
       "allowed_products": {{ toJson .Values.allowed_products }},
       "cors": {{ toJson (dict "allowed_origins" ((index (.Values.cors | default (dict)) "allowed_origins") | default list)) }},

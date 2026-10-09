@@ -279,6 +279,53 @@ const configSchema = z
           .max(7 * 86_400_000)
           .default(6 * 3_600_000),
         routes_cache_ttl_ms: z.number().int().min(60_000).max(86_400_000).default(900_000),
+        /**
+         * Meld Headless: card and bank orders served without the widget. Absent means off. The
+         * version has no default for the same reason `api_version` has none.
+         */
+        headless: z
+          .object({
+            enabled: z.boolean().default(false),
+            api_version: z.string().min(1),
+            /** Providers Meld may share the customer's Unified KYC with; empty shares with none. */
+            kyc_share_providers: z.array(z.string().min(1)).default([]),
+            /** The Meld network code an order's `destinationNetworkCode` must equal, per destination. */
+            network_codes: z.record(z.string(), z.string().min(1)).default({}),
+          })
+          .strict()
+          .superRefine((headless, ctx) => {
+            for (const code of Object.keys(headless.network_codes)) {
+              if (!DESTINATIONS.some((d) => d.code === code)) {
+                ctx.addIssue({
+                  code: 'custom',
+                  path: ['network_codes', code],
+                  message: `Unknown destination code "${code}". Adding a destination is a code change.`,
+                });
+              }
+            }
+            if (!headless.enabled) return;
+            for (const { code } of DESTINATIONS) {
+              if (headless.network_codes[code] === undefined) {
+                ctx.addIssue({
+                  code: 'custom',
+                  path: ['network_codes', code],
+                  message: `meld.headless.network_codes has no entry for "${code}": an order for it could not be checked against its chain.`,
+                });
+              }
+            }
+          })
+          .optional(),
+        /** Meld's webhook delivery. Required when headless is enabled; see the superRefine. */
+        webhook: z
+          .object({
+            /** Exactly the URL configured at Meld: it is part of the signed string. */
+            url: z.url({ protocol: /^https$/, error: 'meld.webhook.url must be an https URL.' }),
+            secret: secretSource,
+            /** How far a signature timestamp may sit from now; the window a replay must land in. */
+            tolerance_ms: z.number().int().min(1_000).max(900_000).default(300_000),
+          })
+          .strict()
+          .optional(),
       })
       .strict(),
     auth: z
@@ -336,6 +383,18 @@ const configSchema = z
           .optional(),
       })
       .strict(),
+    /**
+     * Proof that a caller controls a headless customer key. Required when headless is enabled.
+     * `token_key` is HKDF-expanded into the challenge MAC key and the customer token key.
+     */
+    customer: z
+      .object({
+        token_key: secretSource,
+        token_ttl_s: z.number().int().min(30).max(3_600).default(600),
+        challenge_ttl_s: z.number().int().min(10).max(300).default(120),
+      })
+      .strict()
+      .optional(),
     /**
      * Per-(code, currency) amount bounds. Not the gate that decides what is buyable.
      *
@@ -418,7 +477,7 @@ const configSchema = z
      * Required with no default: a funding history that silently never persists is worse than a
      * server that refuses to boot without saying where history lives. The password is a
      * `secretSource` like the Meld key and the JWT key, so it is a mounted file outside
-     * development and is refused from the environment there. One rule for all three credentials
+     * development and is refused from the environment there. One rule for every credential
      * rather than an exception for the newest.
      *
      * `pool_max` is per replica and deliberately small. This process serves HTTP and runs the
@@ -687,6 +746,8 @@ const configSchema = z
       // redaction hooks do nothing for `process.env`, which is the whole reason this loop exists.
       ['store.password', cfg.store.password],
       ...(cfg.auth.personhood === undefined ? [] : [['auth.personhood.jwt_key', cfg.auth.personhood.jwt_key] as const]),
+      ...(cfg.meld.webhook === undefined ? [] : [['meld.webhook.secret', cfg.meld.webhook.secret] as const]),
+      ...(cfg.customer === undefined ? [] : [['customer.token_key', cfg.customer.token_key] as const]),
     ] as const) {
       if (source.mode === 'env' && cfg.environment !== 'development') {
         ctx.addIssue({
@@ -805,6 +866,23 @@ const configSchema = z
             `"${entry}" is a preview-series pattern, which is refused when environment is "${cfg.environment}": ` +
             'this list also gates redirectUrl, so a pattern widens where a buyer may be sent after payment. ' +
             'Name the origin literally outside development.',
+        });
+      }
+    }
+
+    if (cfg.meld.headless?.enabled === true) {
+      if (cfg.meld.webhook === undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['meld', 'webhook'],
+          message: 'meld.webhook is required when meld.headless.enabled is true: headless orders learn their outcome from it.',
+        });
+      }
+      if (cfg.customer === undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['customer'],
+          message: 'customer is required when meld.headless.enabled is true: the headless customer and order routes are gated by its token.',
         });
       }
     }

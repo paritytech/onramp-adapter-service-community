@@ -22,6 +22,17 @@ server:
 
 meld:
   base_url: https://api-sb.meld.io
+  # Enabled so the headless blocks and their secret mounts are rendered and parsed too.
+  headless:
+    enabled: true
+    kyc_share_providers:
+      - BANXA
+    network_codes:
+      DOT_ASSETHUB: ci-network
+      USDC_ASSETHUB: ci-network
+      USDT_ASSETHUB: ci-network
+  webhook:
+    url: https://onramp-adapter-service.staging.example.invalid/webhooks/meld
 
 auth:
   mode: personhood
@@ -52,3 +63,9 @@ secrets:
   jwtKey:
     existingSecret: onramp-jwt-key
     key: jwt-key
+  meldWebhookSecret:
+    existingSecret: onramp-meld-webhook-secret
+    key: meld-webhook-secret
+  customerTokenKey:
+    existingSecret: onramp-customer-token-key
+    key: customer-token-key

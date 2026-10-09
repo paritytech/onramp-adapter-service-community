@@ -74,6 +74,23 @@ meld:
     source_currency: USD
     country_code: US
     payment_method_type: CREDIT_DEBIT_CARD
+  # Meld Headless (card and bank orders without the widget). Enabling it requires a network code
+  # for every catalog destination, `meld.webhook.url`, and the `meldWebhookSecret` and
+  # `customerTokenKey` secrets below; the `webhook` and `customer` blocks render only when enabled.
+  headless:
+    enabled: false
+    api_version: "2026-05-01"
+    kyc_share_providers: []
+    network_codes: {}
+  webhook:
+    # The URL registered at Meld, verbatim: it is part of the signed string.
+    url: ""
+    tolerance_ms: 300000
+
+# The headless customer key proof. Rendered only when `meld.headless.enabled` is true.
+customer:
+  token_ttl_s: 600
+  challenge_ttl_s: 120
 
 # The caller gate. personhood is the production posture.
 auth:
@@ -256,7 +273,8 @@ serviceAccount:
 # Where secret files are mounted (config.json references these paths).
 secretMountPath: /run/secrets
 
-# The two runtime secrets, mounted as files so they never appear in `env` or the image.
+# The runtime secrets besides the store password, mounted as files so they never appear in `env`
+# or the image. The last two are mounted only when `meld.headless.enabled` is true.
 #
 # Declared here with empty `existingSecret` rather than omitted: the templates reference these
 # paths, and leaving the key absent made `helm template` with default values fail on a nil
@@ -270,6 +288,12 @@ secrets:
   jwtKey:
     existingSecret: ""
     key: jwt-key
+  meldWebhookSecret:
+    existingSecret: ""
+    key: meld-webhook-secret
+  customerTokenKey:
+    existingSecret: ""
+    key: customer-token-key
 
 # `ephemeral-storage` is still bounded, and its justification has changed twice. It used to be the
 # ceiling on the unbounded refusal write path, back when those rows lived on an `emptyDir`. They

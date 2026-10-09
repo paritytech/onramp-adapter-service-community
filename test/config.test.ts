@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { loadConfig, originAllowed, parseConfig, toOriginMatcher } from '../src/config.js';
-import { personhoodConfig, rawConfig } from './fixtures.js';
+import { headlessConfig, personhoodConfig, rawConfig } from './fixtures.js';
 
 /** The personhood auth block, merged into a single-mode config for the tests. */
 const personhoodBlock = (): Record<string, unknown> => ({
@@ -57,6 +57,9 @@ describe('parseConfig', () => {
     ['supported.routes_interval_ms', ['supported', 'routes_interval_ms'], 59_999, 86_400_001],
     ['auth.personhood.challenge_ttl_ms', ['auth', 'personhood', 'challenge_ttl_ms'], 999, 300_001],
     ['auth.personhood.token_ttl_s', ['auth', 'personhood', 'token_ttl_s'], 29, 3_601],
+    ['meld.webhook.tolerance_ms', ['meld', 'webhook', 'tolerance_ms'], 999, 900_001],
+    ['customer.token_ttl_s', ['customer', 'token_ttl_s'], 29, 3_601],
+    ['customer.challenge_ttl_s', ['customer', 'challenge_ttl_s'], 9, 301],
   ])('bounds %s at both ends', (_label, path, tooLow, tooHigh) => {
     for (const value of [tooLow, tooHigh]) {
       if (value === undefined) continue;
@@ -1309,5 +1312,75 @@ describe('preview pattern is a development-only affordance', () => {
     expect(() =>
       parseConfig({ ...productionConfig(), cors: { allowed_origins: ['https://app.dot'] } }),
     ).not.toThrow();
+  });
+});
+
+describe('meld headless', () => {
+  const withMeld = (raw: Record<string, unknown>, meld: Record<string, unknown>) => ({
+    ...raw,
+    meld: { ...(raw.meld as Record<string, unknown>), ...meld },
+  });
+  const headlessBlock = () => (headlessConfig().meld as { headless: Record<string, unknown> }).headless;
+
+  it('accepts an enabled config and applies the documented defaults', () => {
+    const cfg = parseConfig(headlessConfig());
+    expect(cfg.meld.headless).toMatchObject({ enabled: true, kyc_share_providers: [] });
+    expect(cfg.meld.webhook?.tolerance_ms).toBe(300_000);
+    expect(cfg.customer).toMatchObject({ token_ttl_s: 600, challenge_ttl_s: 120 });
+  });
+
+  it('is off when the block is absent, and requires nothing else when disabled', () => {
+    expect(parseConfig(rawConfig()).meld.headless).toBeUndefined();
+    const cfg = parseConfig(withMeld(rawConfig(), { headless: { api_version: '2026-05-01' } }));
+    expect(cfg.meld.headless).toEqual({ enabled: false, api_version: '2026-05-01', kyc_share_providers: [], network_codes: {} });
+  });
+
+  it('has no default for the headless api_version', () => {
+    const headless = headlessBlock();
+    delete headless.api_version;
+    expect(() => parseConfig(withMeld(headlessConfig(), { headless }))).toThrow(/meld\.headless\.api_version/);
+  });
+
+  it.each([
+    ['meld.webhook', withMeld(headlessConfig(), { webhook: undefined }), /meld\.webhook: .*required/],
+    ['customer', { ...headlessConfig(), customer: undefined }, /customer: .*required/],
+  ])('requires %s when headless is enabled', (_label, raw, expected) => {
+    expect(() => parseConfig(raw)).toThrow(expected);
+  });
+
+  it('requires a network code for every catalog destination when enabled', () => {
+    const headless = { ...headlessBlock(), network_codes: { DOT_ASSETHUB: 'polkadot' } };
+    expect(() => parseConfig(withMeld(headlessConfig(), { headless }))).toThrow(
+      /network_codes\.USDC_ASSETHUB: .*no entry[\s\S]*network_codes\.USDT_ASSETHUB: .*no entry/,
+    );
+  });
+
+  it('refuses a network code for a destination the catalog does not have, even when disabled', () => {
+    const headless = { api_version: '2026-05-01', network_codes: { BTC: 'bitcoin' } };
+    expect(() => parseConfig(withMeld(rawConfig(), { headless }))).toThrow(/network_codes\.BTC: Unknown destination code/);
+  });
+
+  it('refuses an empty network code', () => {
+    const headless = { ...headlessBlock(), network_codes: { DOT_ASSETHUB: '', USDC_ASSETHUB: 'p', USDT_ASSETHUB: 'p' } };
+    expect(() => parseConfig(withMeld(headlessConfig(), { headless }))).toThrow(/network_codes\.DOT_ASSETHUB/);
+  });
+
+  it.each(['http://adapter.example/webhooks/meld', 'not a url'])('refuses webhook url %s', (url) => {
+    const raw = headlessConfig();
+    const webhook = { ...((raw.meld as Record<string, unknown>).webhook as Record<string, unknown>), url };
+    expect(() => parseConfig(withMeld(raw, { webhook }))).toThrow(/meld\.webhook\.url: meld\.webhook\.url must be an https URL/);
+  });
+
+  it.each([
+    ['meld.webhook.secret', { webhook: { mode: 'env', var: 'HOOK' } } as const, /meld\.webhook\.secret: .*mounted as a file/],
+    ['customer.token_key', { customer: { mode: 'env', var: 'CUSTOMER' } } as const, /customer\.token_key: .*mounted as a file/],
+  ])('refuses an environment-variable %s outside development', (_label, secrets, expected) => {
+    expect(() => parseConfig({ ...headlessConfig(secrets), environment: 'sandbox' })).toThrow(expected);
+  });
+
+  it('refuses an unknown key in each new block', () => {
+    const raw = headlessConfig();
+    expect(() => parseConfig(withMeld(raw, { headless: { ...headlessBlock(), mode: 'card' } }))).toThrow(/meld\.headless: Unrecognized key/);
+    expect(() => parseConfig({ ...raw, customer: { ...(raw.customer as Record<string, unknown>), ttl: 1 } })).toThrow(/customer: Unrecognized key/);
   });
 });
