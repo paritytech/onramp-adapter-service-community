@@ -12,6 +12,7 @@
 
 import { z } from 'zod';
 import type { KycState } from './funding/customer.js';
+import type { BankInstructions } from './meld/bank-instructions.js';
 import { MINOR_UNIT_DECIMAL } from './money.js';
 
 import { DEFAULT_DIRECTION, DIRECTIONS, RAIL_NAMES } from './rail.js';
@@ -218,6 +219,50 @@ export const verificationExpired = (detail: string) =>
   new Refusal(
     400,
     { tag: 'Other', value: { code: 'VERIFICATION_EXPIRED', message: 'This code has expired. Ask for a new one.' } },
+    detail,
+  );
+
+/** `400`: a headless quote on a deployment that has Meld Headless switched off. */
+export const headlessDisabled = (detail: string) =>
+  new Refusal(
+    400,
+    { tag: 'Other', value: { code: 'HEADLESS_DISABLED', message: 'Native checkout is not available here.' } },
+    detail,
+  );
+
+/**
+ * `400`: the provider's terms were accepted too long ago, in the future, or at a time that does
+ * not parse. The remedy is to accept them again.
+ */
+export const termsStale = (detail: string) =>
+  new Refusal(
+    400,
+    { tag: 'Other', value: { code: 'TERMS_STALE', message: 'Accept the provider terms again to continue.' } },
+    detail,
+  );
+
+/**
+ * `403`: the provider will not take an order from this customer yet (Meld `KYC_NOT_COMPLETED` or
+ * `VERIFICATION_REQUIRED`). The remedy is `GET /customer` and `GET /requirements`, then a new order.
+ */
+export const customerNotReady = (detail: string) =>
+  new Refusal(
+    403,
+    {
+      tag: 'Other',
+      value: { code: 'CUSTOMER_NOT_READY', message: 'The provider needs more from this customer before it takes an order.' },
+    },
+    detail,
+  );
+
+/**
+ * `502`: Meld created a bank order whose transfer details this service cannot read. Nothing is
+ * shown, because a payer sent to a guessed account loses the money.
+ */
+export const bankDetailsUnreadable = (detail: string) =>
+  new Refusal(
+    502,
+    { tag: 'Other', value: { code: 'BANK_DETAILS_UNREADABLE', message: 'The bank transfer details could not be read.' } },
     detail,
   );
 
@@ -577,10 +622,15 @@ export const quoteRequest = z
     /** Which funding rail to quote. Absent defaults to `RAIL_NAMES[0]` (meld today). See `src/rail.ts`. */
     rail: z.enum(RAIL_NAMES).optional(),
     direction,
+    /** Offers for a `POST /order` rather than a widget session. Buy only. */
+    integrationMode: z.literal('headless').optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
     directionalFields(value, ctx, false);
+    if (value.integrationMode !== undefined && (value.direction ?? DEFAULT_DIRECTION) !== 'buy') {
+      ctx.addIssue({ code: 'custom', path: ['integrationMode'], message: 'A headless quote is a buy.' });
+    }
   });
 
 /** The body behind `POST /session`: everything needed to open one chargeable settlement surface. */
@@ -633,10 +683,35 @@ export const createSessionRequest = z
     directionalFields(value, ctx, true);
   });
 
+/**
+ * The body behind `POST /order`: one Meld Headless buy for the customer behind the caller's
+ * customer token. The terms of a buy session, plus the chain the quote named and when the buyer
+ * accepted the provider's terms. No `redirectUrl`: Meld refuses one on this endpoint.
+ */
+export const createOrderRequest = z
+  .object({
+    idempotencyKey,
+    country,
+    fiat,
+    destinationCurrencyCode,
+    sourceAmount,
+    /** The SS58 address the provider delivers to. Normalised and validated before use. */
+    walletAddress: z.string().min(1).max(128),
+    paymentMethodType,
+    serviceProvider: serviceProviderCode,
+    /** Must equal `meld.headless.network_codes` for the destination. */
+    destinationNetworkCode: z.string().min(1).max(64),
+    /** ISO 8601 with an offset. Its age is checked in `Onramp`, so a bad value is `TERMS_STALE`. */
+    termsAcceptedAt: z.string().min(1).max(64),
+  })
+  .strict();
+
 /** A validated `POST /quote` body. */
 export type QuoteRequest = z.infer<typeof quoteRequest>;
 /** A validated `POST /session` body. */
 export type CreateSessionRequest = z.infer<typeof createSessionRequest>;
+/** A validated `POST /order` body. */
+export type CreateOrderRequest = z.infer<typeof createOrderRequest>;
 
 /**
  * The live-capability query behind `GET /supported`: the methods + fiat min/max one corridor
@@ -745,6 +820,15 @@ export interface CreateSessionResponse {
     country?: string;
   };
 }
+
+/**
+ * What `POST /order` answers. A card order is Meld's body verbatim, for the Meld SDK to mount; it
+ * may hold credentials scoped to the order, so it is never stored or logged and a replay cannot
+ * return it. A bank order is the transfer details, which are stored and replayed.
+ */
+export type CreateOrderResponse =
+  | { fundingRequestId: string; kind: 'card'; order: unknown }
+  | { fundingRequestId: string; kind: 'bank'; instructions: BankInstructions };
 
 /**
  * Meld's transaction, projected onto the five fields this service declares. `status` is Meld's

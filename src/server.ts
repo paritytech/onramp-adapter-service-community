@@ -1,8 +1,8 @@
 /**
  * The HTTP surface: the authenticated routes (every one wrapped in `asCaller`, so a grep answers
  * which and how many), the two public handshake routes, the widget's return landing, and a
- * liveness probe. With Meld Headless enabled, the customer key, customer and requirements routes
- * join the authenticated set.
+ * liveness probe. With Meld Headless enabled, the customer key, customer, requirements and order
+ * routes join the authenticated set.
  *
  * Two invariants live here rather than in the docs, because both are easy to break locally:
  * every failure becomes a response in one of exactly three places (the error handler, the
@@ -30,6 +30,7 @@ import { customerAuth, customerGate, type CustomerKeys } from './customer-auth.j
 import type { CustomerLog, CustomerService } from './customer.js';
 import type { PersonhoodService } from './personhood.js';
 import {
+  createOrderRequest,
   createSessionRequest,
   customerRegistration,
   customerTokenRequest,
@@ -60,6 +61,7 @@ import type { Onramp } from './onramp.js';
 type OnrampPort = Pick<
   Onramp,
   | 'createSession'
+  | 'createOrder'
   | 'quote'
   | 'supported'
   | 'supportedCountries'
@@ -111,10 +113,20 @@ export async function buildServer(
     genReqId: () => crypto.randomUUID(),
     logger: {
       level: cfg.server.log_level,
-      // No `redact` list, because it was dead configuration: Fastify's own `req` serializer
-      // emits only {method,url,host,remoteAddress}, so request headers never reach a log line
-      // for redaction to act on. A caller's bearer token stays out because it is never
-      // serialised; the API key stays out because `Secret` redacts itself.
+      // No `redact` list, because it was dead configuration: the `req` serializer below emits
+      // only {method,url,host}, so request headers never reach a log line for redaction to act
+      // on. A caller's bearer token stays out because it is never serialised; the API key stays
+      // out because `Secret` redacts itself.
+      //
+      // Fastify's default also emits `remoteAddress`, which behind a trusted proxy is the buyer's
+      // own IP: personal data, passed to Meld on an order and kept out of the log.
+      serializers: {
+        req: (req) => ({
+          method: req.method,
+          url: req.url,
+          ...(req.headers.host === undefined ? {} : { host: req.headers.host }),
+        }),
+      },
       ...(logDestination === undefined ? {} : { stream: logDestination }),
     },
     // Trust by peer address, handed to Fastify as the list `proxy-addr` compiles.
@@ -436,6 +448,18 @@ export async function buildServer(
     });
 
     /**
+     * The headless counterpart of `/session`: a Meld order for the caller's customer. A card
+     * order's body is in the response and nowhere else. `request.ip` is the buyer's address, read
+     * through `trustProxy`, and is passed to Meld only.
+     */
+    app.post('/order', asCustomer, async (request, reply) => {
+      const subject = gate.subjectOf(request);
+      const body = parse(createOrderRequest, request.body);
+      const order = await onramp.createOrder(subject, customerKeyHashOf(request), body, request.id, request.ip);
+      return reply.code(201).send(order);
+    });
+
+    /**
      * A provider's requirements for an order. The customer token is optional: without one only the
      * agreements are meaningful, but a token that is sent must be valid.
      */
@@ -636,7 +660,7 @@ export async function buildServer(
     // Rate limited. Distinct from the generic 4xx below because the remedy is different: wait
     // and retry, rather than change the request. The plugin has already set `retry-after`.
     if (status === 429) {
-      request.log.warn({ ip: request.ip }, 'rate limited');
+      request.log.warn('rate limited');
       return send(429, {
         tag: 'Other',
         value: { code: 'RATE_LIMITED', message: 'Too many requests. Retry shortly.' },

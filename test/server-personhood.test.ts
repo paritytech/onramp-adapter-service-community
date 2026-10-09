@@ -144,6 +144,9 @@ const stubOnramp = () => ({
       destinationCurrencyCode: 'USDC_ASSETHUB',
     },
   }),
+  createOrder: async () => {
+    throw new Error('not under test');
+  },
   quote: async () => ({
     quotes: [],
     requested: { destinationCurrencyCode: 'USDC_ASSETHUB', sourceAmount: '20', fiat: 'USD' },

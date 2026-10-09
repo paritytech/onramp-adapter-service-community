@@ -149,6 +149,22 @@ export const createRequest = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
+/** The `POST /order` body the app sends, field for field, for a card buy. */
+export const orderRequest = (overrides: Record<string, unknown> = {}) => ({
+  idempotencyKey: 'idem-order-0001',
+  country: 'US',
+  fiat: 'USD',
+  destinationCurrencyCode: 'USDC_ASSETHUB',
+  sourceAmount: '25.00',
+  walletAddress: ALICE,
+  paymentMethodType: 'CREDIT_DEBIT_CARD',
+  serviceProvider: 'BANXA',
+  // `headlessConfig`'s network code for every destination.
+  destinationNetworkCode: 'polkadot',
+  termsAcceptedAt: new Date().toISOString(),
+  ...overrides,
+});
+
 /**
  * The sell counterpart of `createRequest`: the terms a sell actually commits.
  *

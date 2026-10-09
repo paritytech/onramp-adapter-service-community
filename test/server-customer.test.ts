@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { u8aToHex, u8aWrapBytes } from '@polkadot/util';
 import { sr25519PairFromSeed, sr25519Sign } from '@polkadot/util-crypto';
@@ -14,7 +14,17 @@ import { mintToken } from '../src/personhood/token.js';
 import { MeldHttpError } from '../src/meld/client.js';
 import { buildServer } from '../src/server.js';
 import { CustomerService } from '../src/customer.js';
-import { config, fakeCustomerMeld, fakeStore, headlessConfig, personhoodConfig } from './fixtures.js';
+import type { HeadlessOrderResult } from '../src/meld/client.js';
+import { Onramp, type HeadlessOrderPort } from '../src/onramp.js';
+import {
+  config,
+  customerRow,
+  fakeCustomerMeld,
+  fakeStore,
+  headlessConfig,
+  orderRequest,
+  personhoodConfig,
+} from './fixtures.js';
 
 const KEYS: CustomerKeys = {
   customerChallengeKey: new Uint8Array(32).fill(3),
@@ -33,6 +43,9 @@ const proofFor = (challenge: string, message: Uint8Array = fromWire(challenge)) 
 
 const stubOnramp = () => ({
   createSession: async () => {
+    throw new Error('not under test');
+  },
+  createOrder: async () => {
     throw new Error('not under test');
   },
   quote: async () => {
@@ -62,11 +75,12 @@ const serve = async (
     sink?: { write: (line: string) => void };
     meld?: ReturnType<typeof fakeCustomerMeld>;
     store?: ReturnType<typeof fakeStore>;
+    onramp?: Parameters<typeof buildServer>[1];
   } = {},
 ) => {
   const meld = options.meld ?? fakeCustomerMeld();
   const store = options.store ?? fakeStore();
-  const instance = await buildServer(cfg, stubOnramp, options.personhood, options.sink, KEYS, (audit, log) =>
+  const instance = await buildServer(cfg, options.onramp ?? stubOnramp, options.personhood, options.sink, KEYS, (audit, log) =>
     new CustomerService(cfg, meld, store, audit, log),
   );
   app = instance;
@@ -114,6 +128,7 @@ describe('customer key routes', () => {
       ['POST', '/customer/verifications'],
       ['POST', '/customer/verifications/confirm'],
       ['GET', '/requirements'],
+      ['POST', '/order'],
     ] as const;
     for (const [method, url] of routes) {
       const response = await instance.inject({ method, url, headers: DEV, ...(method === 'POST' ? { payload: {} } : {}) });
@@ -657,6 +672,199 @@ describe('customer routes', () => {
     expect(logged).toContain('request refused');
     for (const pii of ['Ada', 'Lovelace', 'ada@example.com', 'not-an-email', '1990-03-15', '1 Main St', 'Apt 2', 'Berlin', '10115', phone, '4155550123', code]) {
       expect(logged).not.toContain(pii);
+    }
+  });
+});
+
+describe('the order route', () => {
+  /** Meld's card order, with a fee as a JSON number and a credential scoped to the order. */
+  const CARD_RAW = {
+    id: 'order-1',
+    paymentMethodType: 'CREDIT_DEBIT_CARD',
+    paymentMethodResponseDetails: { renderMode: 'SDK_NATIVE', sessionToken: 'tok_order_scoped_secret' },
+    payload: { sourceAmount: 25.5, fees: { total: 1.25 } },
+  };
+  const BUYER_IP = '203.0.113.24';
+  const IBAN = 'DE89370400440532013000';
+
+  const card = async (): Promise<HeadlessOrderResult> => ({
+    outcome: 'created',
+    order: {
+      id: 'order-1',
+      paymentMethodType: 'CREDIT_DEBIT_CARD',
+      paymentMethodResponseDetails: CARD_RAW.paymentMethodResponseDetails,
+      raw: structuredClone(CARD_RAW),
+    },
+  });
+  const bank = (details: unknown) => async (): Promise<HeadlessOrderResult> => ({
+    outcome: 'created',
+    order: { id: 'order-2', paymentMethodType: 'SEPA', paymentMethodResponseDetails: details, raw: { id: 'order-2' } },
+  });
+  const SEPA = {
+    amount: '25.00',
+    currency: 'USD',
+    expiresAt: '2999-01-01T00:00:00Z',
+    receivingBankInformation: { iban: IBAN, bic: 'COBADEFFXXX', accountHolderName: 'Meld Virtual Account' },
+    serviceProviderDetails: { memo: 'MELD-REF-1' },
+  };
+
+  /** A real `Onramp` behind the route, with the order call faked and the caller's customer stored. */
+  const ordering = async (
+    place: () => Promise<HeadlessOrderResult> = card,
+    overrides: Record<string, unknown> = {},
+    sink?: { write: (line: string) => void },
+  ) => {
+    const cfg = headless({
+      // The injected request arrives from 127.0.0.1, standing in for the ingress.
+      server: {
+        port: 8080,
+        host: '127.0.0.1',
+        log_level: sink === undefined ? 'silent' : 'debug',
+        trusted_proxy_cidrs: ['127.0.0.1/32'],
+      },
+      ...overrides,
+    });
+    const store = fakeStore();
+    store.customers.set(`app.dot|${customerKeyHash(pair.publicKey)}`, customerRow({ customer_key_hash: customerKeyHash(pair.publicKey) }));
+    const orders = { createHeadlessOrder: vi.fn<HeadlessOrderPort['createHeadlessOrder']>(place) };
+    const rail = {
+      provider: 'meld' as const,
+      quote: async () => [],
+      createSession: () => Promise.reject(new Error('not under test')),
+      transaction: async (id: string) => ({ id }),
+    };
+    const instance = await serve(cfg, {
+      store,
+      ...(sink === undefined ? {} : { sink }),
+      onramp: (audit) => new Onramp(cfg, { meld: rail }, audit, store, rail, Date.now, () => crypto.randomUUID(), undefined, orders),
+    });
+    const { token } = (await tokenOf(instance)).json<{ token: string }>();
+    const headers = { ...DEV, 'x-customer-token': token, 'x-forwarded-for': BUYER_IP };
+    const post = (payload: Record<string, unknown> = orderRequest()) =>
+      instance.inject({ method: 'POST', url: '/order', headers, payload });
+    return { instance, store, orders, headers, post };
+  };
+
+  it('answers a card order with Meld body verbatim, numbers as numbers', async () => {
+    const { orders, post } = await ordering();
+
+    const response = await post();
+
+    expect(response.statusCode).toBe(201);
+    const body = response.json<{ fundingRequestId: string; kind: string; order: typeof CARD_RAW }>();
+    expect(body.kind).toBe('card');
+    expect(body.order).toEqual(CARD_RAW);
+    expect(response.body).toContain('"sourceAmount":25.5');
+    expect(response.body).toContain('"total":1.25');
+    expect(orders.createHeadlessOrder.mock.calls[0]?.[0]).toMatchObject({
+      customerId: 'meld-customer-1',
+      externalOrderId: body.fundingRequestId,
+      clientIpAddress: BUYER_IP,
+    });
+  });
+
+  it('answers a bank order with its details, serves them from the funding read, and replays them', async () => {
+    const { instance, orders, headers, post } = await ordering(bank(SEPA));
+
+    const created = await post(orderRequest({ paymentMethodType: 'SEPA' }));
+    const { fundingRequestId, instructions } = created.json<{ fundingRequestId: string; instructions: unknown }>();
+    const read = await instance.inject({ method: 'GET', url: `/funding/${fundingRequestId}`, headers });
+    const replayed = await post(orderRequest({ paymentMethodType: 'SEPA' }));
+
+    expect(created.statusCode).toBe(201);
+    expect(instructions).toEqual({
+      rail: 'SEPA',
+      amount: '25.00',
+      currency: 'USD',
+      accountHolderName: 'Meld Virtual Account',
+      iban: IBAN,
+      bic: 'COBADEFFXXX',
+      reference: 'MELD-REF-1',
+      expiresAt: Date.parse('2999-01-01T00:00:00Z'),
+    });
+    expect(read.json().funding).toMatchObject({ integrationMode: 'headless', status: 'session_opened', paymentInstructions: instructions });
+    expect(replayed.statusCode).toBe(201);
+    expect(replayed.json()).toEqual(created.json());
+    expect(orders.createHeadlessOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers a card replay with REQUEST_SURFACE_EXPIRED', async () => {
+    const { post } = await ordering();
+    const first = await post();
+
+    const again = await post();
+
+    expect(again.statusCode).toBe(409);
+    expect(again.json().error.value).toMatchObject({
+      code: 'REQUEST_SURFACE_EXPIRED',
+      fundingRequestId: first.json<{ fundingRequestId: string }>().fundingRequestId,
+    });
+  });
+
+  it('maps a customer the provider will not take yet to 403 CUSTOMER_NOT_READY', async () => {
+    const { post } = await ordering(async () => ({ outcome: 'customer_not_ready', code: 'KYC_NOT_COMPLETED' }));
+
+    const response = await post();
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error.value.code).toBe('CUSTOMER_NOT_READY');
+  });
+
+  it('answers a Meld refusal that created no order with 422 PROVIDER_REJECTED', async () => {
+    const { post } = await ordering(() => Promise.reject(new MeldHttpError(403, 'WHITELABEL_NOT_ENABLED', 'no')));
+
+    const response = await post();
+
+    expect(response.statusCode).toBe(422);
+    expect(response.json().error).toEqual({
+      tag: 'Other',
+      value: { code: 'PROVIDER_REJECTED', message: 'The provider declined this request.' },
+    });
+  });
+
+  it.each([
+    ['a redirect URL', { redirectUrl: 'https://app.example/done' }],
+    ['a direction', { direction: 'buy' }],
+    ['no terms time', { termsAcceptedAt: undefined }],
+    ['a lower-case provider code', { serviceProvider: 'banxa' }],
+  ])('refuses a body with %s', async (_name, override) => {
+    const { orders, post } = await ordering();
+
+    const response = await post(orderRequest(override));
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.value.code).toBe('MALFORMED_REQUEST');
+    expect(orders.createHeadlessOrder).not.toHaveBeenCalled();
+  });
+
+  it('requires a customer token', async () => {
+    const { instance } = await ordering();
+
+    const response = await instance.inject({ method: 'POST', url: '/order', headers: DEV, payload: orderRequest() });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().error.value.code).toBe('CUSTOMER_TOKEN_INVALID');
+  });
+
+  it('writes neither the order body nor the buyer IP to the log, and names only the keys of unreadable details', async () => {
+    const lines: string[] = [];
+    const sink = { write: (line: string) => lines.push(line) };
+    const { post } = await ordering(card, {}, sink);
+    expect((await post()).statusCode).toBe(201);
+    const unreadable = await ordering(bank({ receivingBankInformation: { iban: IBAN }, total: '25.00' }), {}, sink);
+
+    const refused = await unreadable.post(orderRequest({ paymentMethodType: 'SEPA' }));
+
+    expect(refused.statusCode).toBe(502);
+    expect(refused.json().error).toEqual({
+      tag: 'Other',
+      value: { code: 'BANK_DETAILS_UNREADABLE', message: 'The bank transfer details could not be read.' },
+    });
+    const logged = lines.join('\n');
+    expect(logged).toContain('order created');
+    expect(logged).toContain('receivingBankInformation.iban');
+    for (const secret of ['tok_order_scoped_secret', 'SDK_NATIVE', IBAN, BUYER_IP]) {
+      expect(logged).not.toContain(secret);
     }
   });
 });

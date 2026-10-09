@@ -533,6 +533,7 @@ describe('Onramp.create', () => {
       cancel: async () => undefined,
       list: async () => [],
       readCorridors: async () => [],
+      customerByKey: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), new FakeAudit(), funding, meld, () => NOW, () => 'funding-1');
 
@@ -566,6 +567,7 @@ describe('Onramp.create', () => {
       cancel: async () => undefined,
       list: async () => [],
       readCorridors: async () => [],
+      customerByKey: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), audit, funding, meld, () => NOW, () => 'funding-1');
 
@@ -1173,6 +1175,7 @@ describe('Onramp.create', () => {
         cancel: (alias, product, id, now) => funding.cancel(alias, product, id, now),
         list: (alias, product, limit) => funding.list(alias, product, limit),
         readCorridors: (code, direction) => funding.readCorridors(code, direction),
+        customerByKey: (product, hash) => funding.customerByKey(product, hash),
         // Rejects, not throws: a synchronous throw is caught whether or not the call is
         // awaited, so it would go green against a missing `await`.
         update: () => Promise.reject(new Error('database is locked')),
@@ -2602,6 +2605,7 @@ describe('recording a refusal is best-effort', () => {
       cancel: async () => undefined,
       list: async () => [],
       readCorridors: async () => [],
+      customerByKey: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), audit, broken, meld, () => NOW);
 

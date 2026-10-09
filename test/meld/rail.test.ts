@@ -195,17 +195,46 @@ describe('MeldRail', () => {
       paymentMethodType: 'CREDIT_DEBIT_CARD',
     });
 
-    expect(quote).toHaveBeenCalledWith({
-      direction: 'buy',
-      countryCode: 'US',
-      sourceCurrencyCode: 'USD',
-      destinationCurrencyCode: 'USDC_ASSETHUB',
-      sourceAmount: '20',
-      paymentMethodType: 'CREDIT_DEBIT_CARD',
-    });
+    expect(quote).toHaveBeenCalledWith(
+      {
+        direction: 'buy',
+        countryCode: 'US',
+        sourceCurrencyCode: 'USD',
+        destinationCurrencyCode: 'USDC_ASSETHUB',
+        sourceAmount: '20',
+        paymentMethodType: 'CREDIT_DEBIT_CARD',
+      },
+      {},
+    );
     // The rail returns Meld's offers and nothing else: the request echo is the caller's to
     // build, since it already holds every value in it.
     expect(offers).toEqual(OFFERS);
+  });
+
+  it('asks Meld for headless offers when the quote is for an order', async () => {
+    const { stub, quote } = client();
+
+    await new MeldRail(stub).quote({
+      direction: 'buy',
+      countryCode: 'DE',
+      sourceCurrencyCode: 'EUR',
+      destinationCurrencyCode: 'USDC_ASSETHUB',
+      sourceAmount: '20',
+      paymentMethodType: 'SEPA',
+      integrationMode: 'headless',
+    });
+
+    expect(quote).toHaveBeenCalledWith(
+      {
+        direction: 'buy',
+        countryCode: 'DE',
+        sourceCurrencyCode: 'EUR',
+        destinationCurrencyCode: 'USDC_ASSETHUB',
+        sourceAmount: '20',
+        paymentMethodType: 'SEPA',
+      },
+      { integrationMode: 'headless' },
+    );
   });
 
   it('maps a session onto Meld, forwarding the client reference as the join key', async () => {

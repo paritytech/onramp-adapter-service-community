@@ -76,6 +76,8 @@ interface RailLegs {
 export interface RailBuyQuote extends RailLegs {
   direction: 'buy';
   sourceAmount: string;
+  /** Offers for a Meld Headless order. A rail without one ignores it. */
+  integrationMode?: 'headless';
 }
 
 /**

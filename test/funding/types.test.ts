@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { fundingRecord, sellRecord } from '../fixtures.js';
+import { bankInstructions, fundingRecord, headlessRecord, sellRecord } from '../fixtures.js';
 import { toFundingRequestDto, type FundingRecord } from '../../src/funding/types.js';
 
 // Every droppable field is populated. Left `undefined`, both `toEqual` and
@@ -96,6 +96,7 @@ describe('toFundingRequestDto', () => {
       // Always present, never inferred from an absence: a caller reading a row must not have to
       // read "no direction" as "buy".
       direction: 'buy',
+      integrationMode: 'widget',
       status: 'transaction_seen',
       providerStatus: 'SUCCEEDED',
       destinationCurrencyCode: 'USDC_ASSETHUB',
@@ -252,5 +253,46 @@ describe('toFundingRequestDto: the deposit disclosure', () => {
     const dto = toFundingRequestDto(record, BEFORE);
     expect(dto).not.toHaveProperty('deposit');
   });
+});
 
+describe('toFundingRequestDto on a headless row', () => {
+  // The fixture's transfer details lapse at 1_700_000_900_000.
+  const LAPSED = 1_700_000_900_000;
+
+  it('names the integration mode and carries the transfer details while they can be paid', () => {
+    const dto = toFundingRequestDto(headlessRecord(), BEFORE);
+
+    expect(dto.integrationMode).toBe('headless');
+    expect(dto.paymentInstructions).toEqual(bankInstructions());
+    // The order id and the customer key hash are join keys, like the provider session id.
+    expect(JSON.stringify(dto)).not.toContain('order-1');
+    expect(JSON.stringify(dto)).not.toContain('0b0b');
+  });
+
+  it.each([
+    ['the details have lapsed', headlessRecord(), LAPSED],
+    ['the request has concluded', headlessRecord({ status: 'settled' }), BEFORE],
+    ['the caller cancelled', headlessRecord({ cancelled_at: BEFORE }), BEFORE],
+    ['the rail expiry has passed', headlessRecord({ expires_at: BEFORE }), BEFORE],
+  ])('withholds the transfer details once %s', (_why, row, now) => {
+    const dto = toFundingRequestDto(row, now);
+
+    expect(dto.integrationMode).toBe('headless');
+    expect(dto).not.toHaveProperty('paymentInstructions');
+  });
+
+  it('keeps details with no stated expiry while the request is live', () => {
+    const row = headlessRecord({
+      payment_instructions: { rail: 'SEPA', amount: '101.20', currency: 'EUR', iban: 'DE89370400440532013000' },
+    });
+
+    expect(toFundingRequestDto(row, LAPSED).paymentInstructions?.iban).toBe('DE89370400440532013000');
+  });
+
+  it('carries no transfer details on a card order, which stores none', () => {
+    const card = headlessRecord({ payment_method_type: 'CREDIT_DEBIT_CARD', payment_instructions: undefined });
+    const dto = toFundingRequestDto(card, BEFORE);
+
+    expect(dto).not.toHaveProperty('paymentInstructions');
+  });
 });

@@ -113,7 +113,34 @@ export interface CustomerAuditEvent {
   reason?: 'address_failed' | 'insert_failed' | 'concurrent_registration';
 }
 
-export type AuditEvent = SessionAuditEvent | CustomerAuditEvent;
+/**
+ * A Meld Headless order, with the terms a session line carries. Never the order body, which may
+ * hold credentials scoped to the order, and never the buyer's IP address.
+ */
+export interface OrderAuditEvent
+  extends Pick<
+    SessionAuditEvent,
+    | 'alias'
+    | 'productId'
+    | 'requestId'
+    | 'rail'
+    | 'destinationCurrencyCode'
+    | 'walletAddress'
+    | 'sourceAmount'
+    | 'fiat'
+    | 'country'
+    | 'reason'
+  > {
+  /** The order counterparts of the `session.*` events of the same name. */
+  event: 'order.created' | 'order.refused' | 'order.rail_refused' | 'order.orphaned';
+  integrationMode: 'headless';
+  /** On `order.created`: how the buyer pays. */
+  kind?: 'card' | 'bank';
+  /** Meld's order id, once Meld has created one. */
+  meldOrderId?: string;
+}
+
+export type AuditEvent = SessionAuditEvent | CustomerAuditEvent | OrderAuditEvent;
 
 /** Just enough of a logger to write one, so any pino-shaped log satisfies it. */
 export interface AuditLog {

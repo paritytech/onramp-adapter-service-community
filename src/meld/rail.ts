@@ -102,7 +102,8 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
         paymentMethodType: input.paymentMethodType,
       });
     }
-    return this.client.quote(input);
+    const { integrationMode, ...params } = input;
+    return this.client.quote(params, integrationMode === undefined ? {} : { integrationMode });
   }
 
   async createSession(input: RailSessionInput): Promise<RailSession> {

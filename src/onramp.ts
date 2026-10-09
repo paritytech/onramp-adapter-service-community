@@ -13,12 +13,19 @@
 
 import { normalizeAddress } from './address.js';
 import { railRefusal } from './meld/refusal.js';
-import type { AuditLog, SessionAuditEvent } from './audit.js';
+import type { AuditLog, OrderAuditEvent, SessionAuditEvent } from './audit.js';
 import type { Subject } from './auth.js';
 import { originAllowed, type Config } from './config.js';
 import {
   Refusal,
+  bankDetailsUnreadable,
+  customerNotFound,
+  customerNotReady,
+  headlessDisabled,
   reject,
+  termsStale,
+  type CreateOrderRequest,
+  type CreateOrderResponse,
   type CreateSessionRequest,
   type CreateSessionResponse,
   type QuoteRequest,
@@ -27,8 +34,10 @@ import {
   type FundingFailure,
 } from './contract.js';
 import { TERMINAL_STATES } from './funding/state.js';
-import type { FundingRecord } from './funding/types.js';
+import { payableInstructions, type FundingRecord, type IntegrationMode } from './funding/types.js';
 import type { FundingStore, StoredMethod } from './funding/store.js';
+import { parseBankInstructions, UnreadableBankDetails, type BankInstructions } from './meld/bank-instructions.js';
+import { MeldHttpError, type MeldClient } from './meld/client.js';
 import type {
   Direction,
   FundingRail,
@@ -44,8 +53,66 @@ import type { Corridor, CountryRow, Discovery, MethodLimit } from './meld/discov
 /** Just the store surface onramp touches, injectable in a test. */
 export type FundingPort = Pick<
   FundingStore,
-  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel' | 'readCorridors'
+  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel' | 'readCorridors' | 'customerByKey'
 >;
+
+/** The Meld call `createOrder` makes, injectable in a test. */
+export type HeadlessOrderPort = Pick<MeldClient, 'createHeadlessOrder'>;
+
+/** Methods whose order Meld's SDK mounts. Every other method is a bank transfer the payer makes. */
+const CARD_METHODS: ReadonlySet<string> = new Set(['CREDIT_DEBIT_CARD', 'APPLE_PAY']);
+
+/** How old an acceptance of the provider's terms may be when its order is placed. */
+const TERMS_MAX_AGE_MS = 3_600_000;
+/** How far ahead of this clock a caller's acceptance time may sit, for an unsynchronised device. */
+const TERMS_CLOCK_SKEW_MS = 300_000;
+/** ISO 8601 with an explicit offset: without one `Date.parse` reads the host's zone. */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Meld's order refusals that state no order was created, by HTTP status and Meld code. The
+ * shared mapping reads a non-400 as indefinite, which would keep a key no order holds.
+ */
+const ORDER_NOT_CREATED: ReadonlyMap<number, ReadonlySet<string>> = new Map([
+  [403, new Set(['WHITELABEL_NOT_ENABLED', 'SERVICE_PROVIDER_NOT_ENABLED'])],
+  [422, new Set(['COINBASE_ORDER_REJECTED'])],
+]);
+
+/** A definitive refusal for one of `ORDER_NOT_CREATED`, else `undefined`. Never reads Meld's text. */
+function orderNotCreated(cause: unknown): Refusal | undefined {
+  if (!(cause instanceof MeldHttpError) || cause.code === undefined) return undefined;
+  if (ORDER_NOT_CREATED.get(cause.status)?.has(cause.code) !== true) return undefined;
+  return reject(
+    { tag: 'Other', value: { code: 'PROVIDER_REJECTED', message: 'The provider declined this request.' } },
+    `Meld answered HTTP ${String(cause.status)} ${cause.code}`,
+    422,
+  );
+}
+
+/** What a headless row carries beside the terms every row has. */
+interface HeadlessTerms {
+  customerKeyHash: string;
+  termsAcceptedAt?: number;
+}
+
+/**
+ * The live row's payment surface has closed, but the row is not concluded. Shared by the widget
+ * and order replays; see `replay` for why this gets its own code.
+ */
+const surfaceExpired = (record: FundingRecord, detail: string) =>
+  reject(
+    {
+      tag: 'Other',
+      value: {
+        code: 'REQUEST_SURFACE_EXPIRED',
+        message:
+          'The payment page for that request has closed. We are still confirming whether it was paid. Check its status rather than starting another.',
+        fundingRequestId: record.id,
+      },
+    },
+    detail,
+    409,
+  );
 
 /** One corridor as the bulk endpoint serves it: the stored row without the internal keys. */
 export interface SupportedCorridorDto {
@@ -166,6 +233,8 @@ export class Onramp {
     // meaning unchanged. Absent, the limit gate falls back to `config.limits`, which is also the
     // degraded path when discovery is present but Meld's public catalog is briefly unreachable.
     private readonly discovery?: Discovery,
+    /** Present when Meld Headless is enabled; `createOrder` has nothing to call without it. */
+    private readonly orders?: HeadlessOrderPort,
   ) {}
 
   /** The methods + fiat min/max a corridor offers, for the buyer's (or seller's) amount screen.
@@ -243,6 +312,9 @@ export class Onramp {
    */
   async quote(request: QuoteRequest): Promise<QuoteResponse> {
     const destination = resolveDestination(request.destinationCurrencyCode);
+    if (request.integrationMode !== undefined && this.cfg.meld.headless?.enabled !== true) {
+      throw headlessDisabled('a headless quote was asked of a deployment without meld.headless.enabled');
+    }
     // Refuse an unservable pair here rather than at the moment of charge. Amount bounds are
     // deliberately not applied at quote time (a quote is exploratory and the buyer is still
     // choosing the number), but whether this deployment serves this currency at all cannot change
@@ -285,7 +357,12 @@ export class Onramp {
     const priced =
       direction === 'sell'
         ? ({ ...legs, direction, cryptoAmount: committedTerm(request.cryptoAmount, 'cryptoAmount', direction) } as const)
-        : ({ ...legs, direction, sourceAmount: committedTerm(request.sourceAmount, 'sourceAmount', direction) } as const);
+        : ({
+            ...legs,
+            direction,
+            sourceAmount: committedTerm(request.sourceAmount, 'sourceAmount', direction),
+            ...(request.integrationMode === undefined ? {} : { integrationMode: request.integrationMode }),
+          } as const);
     const quotes = await rail.quote(priced);
 
     // The echo is built here rather than round-tripped through the rail: every value in it is
@@ -413,72 +490,15 @@ export class Onramp {
       // The reservation lost, so this key already belongs to a request. Replaying that one is
       // the whole contract of an idempotency key.
       const already = reservation.record;
-
-      // A row still in `created` is not an answer; it is another request holding this key while
-      // it waits for the rail, with no session id and no settlement surface yet. Replaying it
-      // would return 201 with both fields empty and audit a `session.created` for a session that
-      // does not exist. The caller is told to come back instead.
-      if (already.status === 'created') {
-        throw reject(
-          {
-            tag: 'Other',
-            value: {
-              code: 'REQUEST_IN_FLIGHT',
-              message: 'That request is still being opened. Retry shortly.',
-              fundingRequestId: already.id,
-            },
-          },
-          `idempotency key ${request.idempotencyKey} is held by an in-flight reservation`,
-          409,
-        );
-      }
-      // Is this request already over? Answered first, and before any comparison of terms (see
-      // `refuseIfOver`). A conclusion outranks a term that drifted.
-      this.refuseIfOver(already);
-      // An idempotency key answers "is this the same request?", not only "have I seen this
-      // key?". Replaying without comparing means a caller who reuses a key with a different wallet
-      // or amount is handed the first request's session and terms: a live settlement surface
-      // for an intent they are no longer expressing, reported as a `201`. The money is safe (the
-      // widget is locked to the pinned terms, and the response echoes them honestly), but a client
-      // rendering its own request state shows the buyer one thing over a widget committed to
-      // another, and a corrupted client looks successful.
-      //
-      // Compared against the stored row rather than a stored digest: the row already holds every
-      // committed term, so this needs no column and no migration.
-      const differs =
-        already.destination_currency_code !== pinned.destinationCurrencyCode ||
-        already.wallet_address !== pinned.walletAddress ||
-        already.source_amount !== pinned.sourceAmount ||
-        // Both new terms are in from the first day they exist, rather than added after someone
-        // notices. The v1 -> v2 `country` migration is here because a committed term was left out
-        // of this comparison once, and a key reused across directions is the starkest version of
-        // that mistake: a seller would be handed a buyer's capture page under their own key.
-        already.direction !== direction ||
-        already.crypto_amount !== pinned.cryptoAmount ||
-        already.fiat !== pinned.fiat ||
-        already.payment_method_type !== request.paymentMethodType ||
-        // Country was validated, sent to the rail, and then left out of this comparison. So the
-        // same key with a different country replayed the first session silently. It is not a
-        // cosmetic field: it selects the provider set, the fee schedule and the KYC path, so a
-        // caller who has changed it is expressing a different intent and must be told so.
-        already.country !== request.country ||
-        already.service_provider !== request.serviceProvider ||
-        already.rail !== name;
-      if (differs) {
-        throw reject(
-          {
-            tag: 'Other',
-            value: {
-              code: 'IDEMPOTENCY_KEY_REUSED',
-              message: 'That idempotency key belongs to a different request. Use a new key.',
-              fundingRequestId: already.id,
-            },
-          },
-          `idempotency key ${request.idempotencyKey} was first used for funding request ${already.id} with different terms`,
-          409,
-        );
-      }
-
+      this.checkReplayable(already, request.idempotencyKey, {
+        direction,
+        pinned,
+        paymentMethodType: request.paymentMethodType,
+        serviceProvider: request.serviceProvider,
+        rail: name,
+        integrationMode: 'widget',
+        customerKeyHash: undefined,
+      });
       return this.replay(subject, requestId, already);
     }
 
@@ -507,36 +527,9 @@ export class Onramp {
             },
       );
     } catch (cause) {
-      // What the failure proves decides what the row says and whether the key is freed. Both the
-      // recorded outcome and the caller's answer derive from this one `Refusal`, so the tag on the
-      // row is the tag the caller was answered with.
-      //
-      // Definitive means the rail read the request and rejected it: a `4xx`, so no settlement
-      // surface exists. The row is `refused` and the key released, because a retry under it (which
-      // the contract requires to be stable across a page reload) must open a fresh request rather
-      // than replay a dead row for ever.
-      //
-      // Indefinite is exactly `ProviderTimeout`: a timeout, a socket reset, an unreadable body, a
-      // 5xx. Every one is consistent with the rail having created the session and the answer never
-      // arriving, so releasing the key would hand the retry a second settlement surface for one
-      // buyer intent, the failure `worker.ts`'s `created` branch and threat-model T14 both exist
-      // to prevent. Such a failure concludes `unobserved` and keeps the key, the caller meets
-      // `REQUEST_OUTCOME_UNKNOWN`, and nobody is charged twice on this service's word.
       const refusal = railRefusal(cause);
-      const definitive = refusal.failure.tag !== 'ProviderTimeout';
       const reason = refusal.failure.tag;
-      // Guarded, because an unguarded compensating write replaces the error it is compensating
-      // for. A lost connection, a statement timeout, or a row moved underneath would
-      // have thrown here and propagated instead of `cause`, turning Meld's `400 BelowMinimum`,
-      // with its threshold, into a bare `500`, and leaving the row in `created` still holding
-      // the key. `refuse()` already swallows exactly this class for exactly this reason.
-      try {
-        await (definitive
-          ? this.funding.update(fundingId, 'refused', this.clock(), { releaseReference: true, reason })
-          // No reason on the indefinite branch, deliberately: `unobserved` means it could not be told
-          // what happened, so there is no refusal to explain and a tag here would assert one.
-          : this.funding.update(fundingId, 'unobserved', this.clock()));
-      } catch {
+      if (!(await this.closeReservation(fundingId, refusal))) {
         this.audit.info(
           {
             event: 'session.orphaned',
@@ -638,6 +631,401 @@ export class Onramp {
       ...(session.hostedWidgetUrl === undefined ? {} : { widgetUrl: session.hostedWidgetUrl }),
       ...(session.expiresAt === undefined ? {} : { expiresAt: session.expiresAt }),
       pinned,
+    };
+  }
+
+  /**
+   * Place a Meld Headless order for the customer behind `keyHash`, through the same local checks
+   * and the same reservation as `createSession`.
+   *
+   * A card order answers with Meld's body verbatim, for the Meld SDK. It may hold credentials
+   * scoped to the order, so it is neither stored nor audited, and a replay cannot return it. A bank
+   * order answers with its transfer details, which are stored, replayed and served by the funding
+   * read. `clientIp` reaches Meld, which requires the buyer's own address, and nothing else.
+   */
+  async createOrder(
+    subject: Subject,
+    keyHash: string,
+    request: CreateOrderRequest,
+    requestId: string,
+    clientIp: string,
+  ): Promise<CreateOrderResponse> {
+    const headless = this.cfg.meld.headless;
+    const orders = this.orders;
+    if (headless?.enabled !== true || orders === undefined) {
+      throw new Error('createOrder() called without Meld Headless enabled and wired.');
+    }
+    const rail = this.rail('meld');
+    const direction = 'buy';
+    // The terms a buy session would carry, so `validate` and `refuse` read an order as one.
+    const asSession: CreateSessionRequest = {
+      idempotencyKey: request.idempotencyKey,
+      country: request.country,
+      fiat: request.fiat,
+      destinationCurrencyCode: request.destinationCurrencyCode,
+      sourceAmount: request.sourceAmount,
+      walletAddress: request.walletAddress,
+      paymentMethodType: request.paymentMethodType,
+      serviceProvider: request.serviceProvider,
+    };
+    const refused = (refusal: Refusal) =>
+      this.refuse(subject, requestId, asSession, refusal, rail.provider, direction, { customerKeyHash: keyHash });
+
+    if (!this.cfg.session_creation_enabled) {
+      throw await refused(reject({ tag: 'RouteWithdrawn' }, 'Session creation is disabled by the operator.'));
+    }
+
+    let pinned: CreateSessionResponse['pinned'];
+    let networkCode: string;
+    let acceptedAt: number;
+    try {
+      ({ pinned } = await this.validate(asSession, rail, direction));
+      const configured = headless.network_codes[pinned.destinationCurrencyCode];
+      if (configured === undefined || configured !== request.destinationNetworkCode) {
+        throw reject(
+          { tag: 'WrongAssetOrChain' },
+          `destinationNetworkCode ${request.destinationNetworkCode} is not the network configured for ${pinned.destinationCurrencyCode}`,
+        );
+      }
+      networkCode = configured;
+      acceptedAt = this.termsAcceptedAt(request.termsAcceptedAt);
+    } catch (cause) {
+      if (cause instanceof Refusal) await refused(cause);
+      throw cause;
+    }
+    const walletAddress = committedTerm(pinned.walletAddress, 'walletAddress', direction);
+    const sourceAmount = committedTerm(pinned.sourceAmount, 'sourceAmount', direction);
+
+    const customer = await this.funding.customerByKey(subject.productId, keyHash);
+    if (customer === undefined) throw customerNotFound('no Meld customer is recorded for this customer key');
+
+    const fundingId = this.newId();
+    const reservation = await this.funding.reserve(
+      this.newRecord({
+        id: fundingId,
+        subject,
+        direction,
+        destinationCurrencyCode: pinned.destinationCurrencyCode,
+        walletAddress,
+        sourceAmount,
+        cryptoAmount: undefined,
+        fiat: pinned.fiat,
+        country: pinned.country,
+        paymentMethodType: request.paymentMethodType,
+        serviceProvider: request.serviceProvider,
+        clientReference: request.idempotencyKey,
+        rail: rail.provider,
+        status: 'created',
+        now: this.clock(),
+        headless: { customerKeyHash: keyHash, termsAcceptedAt: acceptedAt },
+      }),
+    );
+    if (reservation.outcome === 'existing') {
+      const already = reservation.record;
+      this.checkReplayable(already, request.idempotencyKey, {
+        direction,
+        pinned,
+        paymentMethodType: request.paymentMethodType,
+        serviceProvider: request.serviceProvider,
+        rail: rail.provider,
+        integrationMode: 'headless',
+        customerKeyHash: keyHash,
+      });
+      return this.replayOrder(subject, requestId, already);
+    }
+
+    let placed;
+    try {
+      placed = await orders.createHeadlessOrder(
+        {
+          customerId: customer.meld_customer_id,
+          // This record's id, for the reason `RailSessionInput.clientReference` gives.
+          externalOrderId: fundingId,
+          serviceProvider: request.serviceProvider,
+          paymentMethodType: request.paymentMethodType,
+          countryCode: request.country,
+          sourceAmount,
+          sourceCurrencyCode: pinned.fiat,
+          destinationCurrencyCode: pinned.destinationCurrencyCode,
+          destinationWalletAddress: walletAddress,
+          destinationNetworkCode: networkCode,
+          clientIpAddress: clientIp,
+          verification: { agreementAcceptedAt: new Date(acceptedAt).toISOString() },
+        },
+        fundingId,
+      );
+    } catch (cause) {
+      const declined = orderNotCreated(cause);
+      await this.orderFailed(subject, requestId, pinned, fundingId, declined ?? railRefusal(cause));
+      throw declined ?? cause;
+    }
+    if (placed.outcome === 'customer_not_ready') {
+      throw await this.orderFailed(
+        subject,
+        requestId,
+        pinned,
+        fundingId,
+        customerNotReady(`Meld refused the order with ${placed.code}`),
+      );
+    }
+
+    const { order } = placed;
+    let instructions: BankInstructions | undefined;
+    if (!CARD_METHODS.has(order.paymentMethodType)) {
+      try {
+        instructions = parseBankInstructions(order.paymentMethodType, order.paymentMethodResponseDetails);
+      } catch (cause) {
+        // The parser's message names the keys Meld sent and never their values, so it is the one
+        // description of the order body that may reach the log.
+        const detail = cause instanceof UnreadableBankDetails ? cause.message : 'Meld bank details are unreadable.';
+        throw await this.orderFailed(subject, requestId, pinned, fundingId, bankDetailsUnreadable(detail), order.id);
+      }
+    }
+
+    try {
+      await this.funding.update(fundingId, 'session_opened', this.clock(), {
+        meldOrderId: order.id,
+        ...(instructions === undefined ? {} : { paymentInstructions: instructions }),
+      });
+    } catch (cause) {
+      this.audit.info(
+        this.orderEvent('order.orphaned', subject, requestId, pinned, { meldOrderId: order.id }),
+        'order placed upstream but the funding record could not be advanced',
+      );
+      throw cause;
+    }
+
+    const kind = instructions === undefined ? 'card' : 'bank';
+    this.audit.info(
+      this.orderEvent('order.created', subject, requestId, pinned, { kind, meldOrderId: order.id }),
+      'order created',
+    );
+    return instructions === undefined
+      ? { fundingRequestId: fundingId, kind: 'card', order: order.raw }
+      : { fundingRequestId: fundingId, kind: 'bank', instructions };
+  }
+
+  /**
+   * When the buyer accepted the provider's terms, as epoch ms, or `TERMS_STALE`. Meld holds no
+   * receipt of the acceptance, so this record is the only one. A time a little ahead of this
+   * clock is read as now, so Meld is never sent a future acceptance.
+   */
+  private termsAcceptedAt(value: string): number {
+    const at = ISO_INSTANT.test(value) ? Date.parse(value) : Number.NaN;
+    const now = this.clock();
+    if (!Number.isFinite(at)) throw termsStale('termsAcceptedAt is not an ISO 8601 time with an offset');
+    if (at > now + TERMS_CLOCK_SKEW_MS) throw termsStale('termsAcceptedAt is in the future');
+    if (at < now - TERMS_MAX_AGE_MS) throw termsStale('termsAcceptedAt is more than an hour old');
+    return Math.min(at, now);
+  }
+
+  /**
+   * Whether an existing row may answer for this request: refused when it is still opening, already
+   * over, or committed to other terms. Shared by `createSession` and `createOrder`, so a key used
+   * for a session and then an order (or the reverse) is `IDEMPOTENCY_KEY_REUSED`.
+   */
+  private checkReplayable(
+    already: FundingRecord,
+    idempotencyKey: string,
+    terms: {
+      direction: Direction;
+      pinned: CreateSessionResponse['pinned'];
+      paymentMethodType: string;
+      serviceProvider: string;
+      rail: RailName;
+      integrationMode: IntegrationMode;
+      customerKeyHash: string | undefined;
+    },
+  ): void {
+    // A row still in `created` is not an answer; it is another request holding this key while
+    // it waits for the rail, with no session id and no settlement surface yet. Replaying it
+    // would return 201 with both fields empty and audit a `session.created` for a session that
+    // does not exist. The caller is told to come back instead.
+    if (already.status === 'created') {
+      throw reject(
+        {
+          tag: 'Other',
+          value: {
+            code: 'REQUEST_IN_FLIGHT',
+            message: 'That request is still being opened. Retry shortly.',
+            fundingRequestId: already.id,
+          },
+        },
+        `idempotency key ${idempotencyKey} is held by an in-flight reservation`,
+        409,
+      );
+    }
+    // Is this request already over? Answered first, and before any comparison of terms (see
+    // `refuseIfOver`). A conclusion outranks a term that drifted.
+    this.refuseIfOver(already);
+    // An idempotency key answers "is this the same request?", not only "have I seen this
+    // key?". Replaying without comparing means a caller who reuses a key with a different wallet
+    // or amount is handed the first request's session and terms: a live settlement surface
+    // for an intent they are no longer expressing, reported as a `201`. The money is safe (the
+    // widget is locked to the pinned terms, and the response echoes them honestly), but a client
+    // rendering its own request state shows the buyer one thing over a widget committed to
+    // another, and a corrupted client looks successful.
+    //
+    // Compared against the stored row rather than a stored digest: the row already holds every
+    // committed term, so this needs no column and no migration.
+    const { pinned } = terms;
+    const differs =
+      already.destination_currency_code !== pinned.destinationCurrencyCode ||
+      already.wallet_address !== pinned.walletAddress ||
+      already.source_amount !== pinned.sourceAmount ||
+      // Both new terms are in from the first day they exist, rather than added after someone
+      // notices. The v1 -> v2 `country` migration is here because a committed term was left out
+      // of this comparison once, and a key reused across directions is the starkest version of
+      // that mistake: a seller would be handed a buyer's capture page under their own key.
+      already.direction !== terms.direction ||
+      already.crypto_amount !== pinned.cryptoAmount ||
+      already.fiat !== pinned.fiat ||
+      already.payment_method_type !== terms.paymentMethodType ||
+      // Country was validated, sent to the rail, and then left out of this comparison. So the
+      // same key with a different country replayed the first session silently. It is not a
+      // cosmetic field: it selects the provider set, the fee schedule and the KYC path, so a
+      // caller who has changed it is expressing a different intent and must be told so.
+      already.country !== pinned.country ||
+      already.service_provider !== terms.serviceProvider ||
+      already.rail !== terms.rail ||
+      // A widget session and a headless order are different surfaces, and an order belongs to
+      // one customer key.
+      already.integration_mode !== terms.integrationMode ||
+      already.customer_key_hash !== terms.customerKeyHash;
+    if (differs) {
+      throw reject(
+        {
+          tag: 'Other',
+          value: {
+            code: 'IDEMPOTENCY_KEY_REUSED',
+            message: 'That idempotency key belongs to a different request. Use a new key.',
+            fundingRequestId: already.id,
+          },
+        },
+        `idempotency key ${idempotencyKey} was first used for funding request ${already.id} with different terms`,
+        409,
+      );
+    }
+  }
+
+  /**
+   * Close a reservation the rail did not open, from the one `Refusal` the caller is answered
+   * with, so the tag on the row is the tag the caller was answered with. `false` when the write
+   * failed, which the caller audits as an orphan.
+   *
+   * Definitive means the rail read the request and rejected it: a `4xx`, so no settlement
+   * surface exists. The row is `refused` and the key released, because a retry under it (which
+   * the contract requires to be stable across a page reload) must open a fresh request rather
+   * than replay a dead row for ever.
+   *
+   * Indefinite is exactly `ProviderTimeout`: a timeout, a socket reset, an unreadable body, a
+   * 5xx. Every one is consistent with the rail having created the session and the answer never
+   * arriving, so releasing the key would hand the retry a second settlement surface for one
+   * buyer intent, the failure `worker.ts`'s `created` branch and threat-model T14 both exist
+   * to prevent. Such a failure concludes `unobserved` and keeps the key, the caller meets
+   * `REQUEST_OUTCOME_UNKNOWN`, and nobody is charged twice on this service's word.
+   *
+   * Guarded, because an unguarded compensating write replaces the error it is compensating
+   * for. A lost connection, a statement timeout, or a row moved underneath would have thrown
+   * instead of the cause, turning Meld's `400 BelowMinimum`, with its threshold, into a bare
+   * `500`, and leaving the row in `created` still holding the key. `refuse()` already swallows
+   * exactly this class for exactly this reason.
+   */
+  private async closeReservation(fundingId: string, refusal: Refusal, meldOrderId?: string): Promise<boolean> {
+    const definitive = refusal.failure.tag !== 'ProviderTimeout';
+    const order = meldOrderId === undefined ? {} : { meldOrderId };
+    try {
+      await (definitive
+        ? this.funding.update(fundingId, 'refused', this.clock(), {
+            releaseReference: true,
+            reason: refusal.failure.tag,
+            ...order,
+          })
+        : // No reason on the indefinite branch, deliberately: `unobserved` means it could not be
+          // told what happened, so there is no refusal to explain and a tag here would assert one.
+          this.funding.update(fundingId, 'unobserved', this.clock(), order));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Close an order's reservation after Meld refused it or answered something unusable, audit
+   * it, and return the refusal for the caller to throw. `meldOrderId` is set when Meld created an
+   * order this service cannot use, so the row still names it.
+   */
+  private async orderFailed(
+    subject: Subject,
+    requestId: string,
+    pinned: CreateSessionResponse['pinned'],
+    fundingId: string,
+    refusal: Refusal,
+    meldOrderId?: string,
+  ): Promise<Refusal> {
+    const order = meldOrderId === undefined ? {} : { meldOrderId };
+    if (!(await this.closeReservation(fundingId, refusal, meldOrderId))) {
+      this.audit.info(
+        this.orderEvent('order.orphaned', subject, requestId, pinned, { reason: 'reservation_close_failed', ...order }),
+        'reservation left open after the order failed',
+      );
+    }
+    this.audit.info(
+      this.orderEvent('order.rail_refused', subject, requestId, pinned, { reason: refusal.failure.tag, ...order }),
+      'order refused',
+    );
+    return refusal;
+  }
+
+  /**
+   * The answer for an order that already exists: a bank order's transfer details while they can
+   * still be paid. A card order's body was never stored, so its replay is
+   * `REQUEST_SURFACE_EXPIRED`, as is a bank order whose details have lapsed.
+   */
+  private replayOrder(subject: Subject, requestId: string, record: FundingRecord): CreateOrderResponse {
+    // `checkReplayable` has answered every `created` and concluded row, so a live headless row
+    // without an order id is corruption, exactly as a widget row without a session is in `replay`.
+    if (record.meld_order_id === undefined) {
+      throw new Error(`funding request ${record.id} holds an idempotency key but placed no order`);
+    }
+    const instructions = payableInstructions(record, this.clock());
+    if (instructions === undefined) {
+      throw surfaceExpired(
+        record,
+        `idempotency key replays headless funding request ${record.id}, which has no payable transfer details`,
+      );
+    }
+    this.audit.info(
+      this.orderEvent('order.created', subject, requestId, pinnedOf(record), {
+        kind: 'bank',
+        meldOrderId: record.meld_order_id,
+      }),
+      'order replayed from the caller idempotency key',
+    );
+    return { fundingRequestId: record.id, kind: 'bank', instructions };
+  }
+
+  /** One order audit line: the committed terms, never the order body or the buyer's address. */
+  private orderEvent(
+    event: OrderAuditEvent['event'],
+    subject: Subject,
+    requestId: string,
+    pinned: CreateSessionResponse['pinned'],
+    extra: Pick<OrderAuditEvent, 'kind' | 'meldOrderId' | 'reason'>,
+  ): OrderAuditEvent {
+    return {
+      event,
+      alias: subject.alias,
+      productId: subject.productId,
+      requestId,
+      rail: 'meld',
+      integrationMode: 'headless',
+      destinationCurrencyCode: pinned.destinationCurrencyCode,
+      ...(pinned.walletAddress === undefined ? {} : { walletAddress: pinned.walletAddress }),
+      ...(pinned.sourceAmount === undefined ? {} : { sourceAmount: pinned.sourceAmount }),
+      fiat: pinned.fiat,
+      ...(pinned.country === undefined ? {} : { country: pinned.country }),
+      ...extra,
     };
   }
 
@@ -766,21 +1154,11 @@ export class Onramp {
     // corruption and must keep surfacing as a `500` rather than being buried as an ordinary
     // refusal.
     if ((record.expires_at ?? Infinity) <= this.clock()) {
-      throw reject(
-        {
-          tag: 'Other',
-          value: {
-            code: 'REQUEST_SURFACE_EXPIRED',
-            message:
-              'The payment page for that request has closed. We are still confirming whether it was paid. Check its status rather than starting another.',
-            fundingRequestId: record.id,
-          },
-        },
+      throw surfaceExpired(
+        record,
         `idempotency key replays funding request ${record.id}, whose rail expiry passed at ${String(record.expires_at)}`,
-        409,
       );
     }
-
 
     this.audit.info(
       {
@@ -1251,6 +1629,8 @@ export class Onramp {
     /** Set on a refusal, absent on `created`: there is nothing yet to explain. */
     reason?: FundingFailure['tag'];
     now: number;
+    /** Present on a headless order, which is a widget session otherwise. */
+    headless?: HeadlessTerms;
   }): FundingRecord {
     return {
       id: terms.id,
@@ -1281,7 +1661,9 @@ export class Onramp {
       deposit_currency: undefined,
       deposit_memo: undefined,
       deposit_observed_at: undefined,
-      integration_mode: 'widget',
+      integration_mode: terms.headless === undefined ? 'widget' : 'headless',
+      customer_key_hash: terms.headless?.customerKeyHash,
+      terms_accepted_at: terms.headless?.termsAcceptedAt,
       status: terms.status,
       reason: terms.reason,
       status_history: [{ status: terms.status, at: terms.now }],
@@ -1347,27 +1729,45 @@ export class Onramp {
     refusal: Refusal,
     rail: RailName,
     direction: Direction,
+    /** Set when the refused request is a headless order rather than a session. */
+    headless?: HeadlessTerms,
   ): Promise<Refusal> {
-    this.audit.info(
-      {
-        event: 'session.refused',
-        alias: subject.alias,
-        productId: subject.productId,
-        requestId,
-        rail,
-        ...auditDirection(direction),
-        destinationCurrencyCode: request.destinationCurrencyCode,
-        // Submitted, not pinned, and only where the caller sent one. A sell sends no address and
-        // no fiat amount; emitting a key with `undefined` would put a field on the stream that
-        // says nothing, and a `''` would say something false.
-        ...(request.walletAddress === undefined ? {} : { walletAddress: request.walletAddress }),
-        ...(request.sourceAmount === undefined ? {} : { sourceAmount: request.sourceAmount }),
-        ...(request.cryptoAmount === undefined ? {} : { cryptoAmount: request.cryptoAmount }),
-        fiat: request.fiat,
-        reason: refusal.failure.tag,
-      },
-      'session refused',
-    );
+    // Submitted, not pinned, and only where the caller sent one. A sell sends no address and no
+    // fiat amount; emitting a key with `undefined` would put a field on the stream that says
+    // nothing, and a `''` would say something false.
+    const submitted = {
+      ...(request.walletAddress === undefined ? {} : { walletAddress: request.walletAddress }),
+      ...(request.sourceAmount === undefined ? {} : { sourceAmount: request.sourceAmount }),
+    };
+    const who = { alias: subject.alias, productId: subject.productId, requestId, rail };
+    if (headless === undefined) {
+      this.audit.info(
+        {
+          event: 'session.refused',
+          ...who,
+          ...auditDirection(direction),
+          destinationCurrencyCode: request.destinationCurrencyCode,
+          ...submitted,
+          ...(request.cryptoAmount === undefined ? {} : { cryptoAmount: request.cryptoAmount }),
+          fiat: request.fiat,
+          reason: refusal.failure.tag,
+        },
+        'session refused',
+      );
+    } else {
+      this.audit.info(
+        {
+          event: 'order.refused',
+          ...who,
+          integrationMode: 'headless',
+          destinationCurrencyCode: request.destinationCurrencyCode,
+          ...submitted,
+          fiat: request.fiat,
+          reason: refusal.failure.tag,
+        },
+        'order refused',
+      );
+    }
 
     const now = this.clock();
     try {
@@ -1395,6 +1795,7 @@ export class Onramp {
           // The tag the caller was answered with, so the row says why and not only that.
           reason: refusal.failure.tag,
           now,
+          ...(headless === undefined ? {} : { headless }),
         }),
       );
     } catch {

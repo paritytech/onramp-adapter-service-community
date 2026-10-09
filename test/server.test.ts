@@ -62,6 +62,9 @@ const serve = async (
 ) => {
   app = await buildServer(cfg, () => ({
     createSession: create,
+    createOrder: async () => {
+      throw new Error('not under test');
+    },
     get: async () => undefined,
     cancel: async () => undefined,
     list: async () => [],
@@ -147,6 +150,9 @@ describe('logging', () => {
         audit = given;
         return {
           createSession: async () => RESPONSE,
+          createOrder: async () => {
+            throw new Error('not under test');
+          },
           get: async () => undefined,
           list: async () => [],
           cancel: async () => undefined,
@@ -391,6 +397,44 @@ describe('declared string bounds', () => {
     expect(response.statusCode).toBe(400);
     expect(response.json().error.value.code).toBe('MALFORMED_REQUEST');
     expect(reached, 'the request reached the service instead of being refused at the boundary').toBe(0);
+  });
+});
+
+describe('the headless quote', () => {
+  const quoted = async (payload: Record<string, unknown>, url: '/quote' | '/session' = '/quote') => {
+    const seen: unknown[] = [];
+    const built = await serve(
+      async () => RESPONSE,
+      config(),
+      {
+        quote: async (...args: unknown[]) => {
+          seen.push(args[0]);
+          return { quotes: [], requested: { destinationCurrencyCode: 'USDC_ASSETHUB', sourceAmount: '20', fiat: 'USD' } };
+        },
+      },
+    );
+    const response = await built.inject({ method: 'POST', url, headers: DEV_HEADERS, payload });
+    return { status: response.statusCode, code: response.json<{ error?: { value?: { code?: string } } }>().error?.value?.code, seen };
+  };
+
+  it('hands integrationMode to the service, and a widget quote without one', async () => {
+    const headless = await quoted(quoteRequestBody({ integrationMode: 'headless' }));
+    const widget = await quoted(quoteRequestBody());
+
+    expect(headless.status).toBe(200);
+    expect(headless.seen[0]).toMatchObject({ integrationMode: 'headless' });
+    expect(widget.seen[0]).not.toHaveProperty('integrationMode');
+  });
+
+  it.each([
+    ['a sell', '/quote' as const, sellQuoteBody({ integrationMode: 'headless' })],
+    ['a mode other than headless', '/quote' as const, quoteRequestBody({ integrationMode: 'widget' })],
+    ['a session, which is always the widget', '/session' as const, createRequest({ integrationMode: 'headless' })],
+  ])('refuses integrationMode on %s', async (_name, url, payload) => {
+    const { status, code, seen } = await quoted(payload, url);
+
+    expect({ status, code }).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
+    expect(seen).toHaveLength(0);
   });
 });
 
@@ -1528,6 +1572,7 @@ describe('the funding surface', () => {
         id: 'funding-1',
         rail: 'meld',
         direction: 'buy',
+        integrationMode: 'widget',
         status: 'transaction_seen',
         providerStatus: 'SUCCEEDED',
         destinationCurrencyCode: 'USDC_ASSETHUB',

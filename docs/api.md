@@ -6,10 +6,10 @@ See [README.md](../README.md) for what the service is and how to run it.
 Nine routes are authenticated by the short-lived JWT the handshake mints: `POST /quote`,
 `POST /session`, `GET /supported`, `GET /supported/countries`, `GET /supported/corridors`,
 `GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel` and `GET /transaction/:id`. With
-Meld Headless enabled (`meld.headless.enabled`), nine more make eighteen: `POST /customer/challenge`,
+Meld Headless enabled (`meld.headless.enabled`), ten more make nineteen: `POST /customer/challenge`,
 `POST /customer/token` and `GET /requirements` take caller auth, and `GET /customer`,
-`POST /customer`, `POST /customer/kyc`, `POST /customer/details`, `POST /customer/verifications`
-and `POST /customer/verifications/confirm` also take a customer token. The unauthenticated
+`POST /customer`, `POST /customer/kyc`, `POST /customer/details`, `POST /customer/verifications`,
+`POST /customer/verifications/confirm` and `POST /order` also take a customer token. The unauthenticated
 remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
 
 | Endpoint | Proxies | Purpose |
@@ -25,10 +25,11 @@ remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
 | `POST /customer/verifications` | `POST .../verifications` | Headless only. Sends an email or SMS code. Customer token. |
 | `POST /customer/verifications/confirm` | `POST .../verifications/{id}/confirm` | Headless only. Checks a code. Customer token. |
 | `GET /requirements` | `GET /crypto/onramp/{provider}/requirements` | Headless only. What a provider needs before an order: agreements, verifications, fields. Caller auth, customer token optional. |
+| `POST /order` | `POST /crypto/order/headless/onramp` | Headless only. Places a card or bank order for the caller's customer and persists a durable funding request. Customer token. |
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
-| `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
+| `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown; headless offers with `integrationMode: "headless"`. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
 | `GET /transaction/:id` | `GET /payments/transactions/{id}` | Status, projected onto the five fields this service declares. |
 | `GET /funding` | `?includeRefused=true` | The caller's open and past funding requests, newest first, capped at 100. **Locally refused requests are excluded by default**: `GET /supported` publishes Meld's live bound but not the tightening a `limits` row applies, so being refused is still how a caller learns the *effective* minimum, and a hundred of them would push the request the buyer is waiting on out of the window. |
@@ -341,6 +342,13 @@ Amount bounds are not applied here. A quote is price discovery, and a buyer sett
 may legitimately ask about one they then adjust; `POST /session` enforces them where the charge is
 committed.
 
+`integrationMode` is optional and takes only `"headless"`, on a buy: it asks Meld for the offers a
+`POST /order` can take (`?integrationMode=HEADLESS`, under `meld.headless.api_version`), and the
+offers pass through as above, including `destinationNetworkCode`, `kycMode` and `isNativeAvailable`
+where Meld sends them. Absent, the quote is a widget quote exactly as before. On a sell it is
+`MALFORMED_REQUEST`; on a deployment without `meld.headless.enabled` it is
+`400 Other{ HEADLESS_DISABLED }`, before any Meld call.
+
 ## `POST /session`
 
 The destination, address and amount are sent **locked**. Meld locks through a `lockFields` array
@@ -626,6 +634,105 @@ cooldown runs, the answer is `429 Other{ VERIFICATION_COOLDOWN }` with `resendAv
 answer, not an error, and `attemptsRemaining` is absent when Meld does not state it. A verification
 that expired or is no longer pending is `400 Other{ VERIFICATION_EXPIRED }`: ask for a new code.
 
+## `POST /order`
+
+The headless counterpart of `POST /session`, present only when `meld.headless.enabled` is true.
+Caller auth and `x-customer-token`. It places a Meld Headless onramp order for the customer behind
+the token's key, delivering to `walletAddress`, and persists a durable funding request whose
+`integrationMode` is `headless`.
+
+```json
+{
+  "idempotencyKey": "<caller-prefix>-<uuid-v4>",
+  "country": "DE",
+  "fiat": "EUR",
+  "destinationCurrencyCode": "USDC_ASSETHUB",
+  "sourceAmount": "101.20",
+  "walletAddress": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
+  "paymentMethodType": "SEPA",
+  "serviceProvider": "BANXA",
+  "destinationNetworkCode": "<meld.headless.network_codes[destinationCurrencyCode]>",
+  "termsAcceptedAt": "2026-10-08T10:00:00Z"
+}
+```
+
+Every field is required and nothing else is accepted: there is no `redirectUrl` (Meld refuses one
+on this endpoint), `direction` (an order is a buy) or `rail` (an order is Meld's). The checks are
+the ones `POST /session` runs, in the same order and with the same refusals, plus three:
+
+- `destinationNetworkCode` must equal `meld.headless.network_codes` for the destination, else
+  `400 WrongAssetOrChain`. Carry it from the headless quote.
+- `termsAcceptedAt` is when the buyer accepted the provider's terms: ISO 8601 with `Z` or an
+  offset, not more than five minutes ahead of this service's clock, and at most an hour old, else
+  `400 Other{ TERMS_STALE }`. Meld keeps no receipt, so the row records it; a time ahead of this
+  clock is recorded and sent to Meld as now.
+- The key must have registered with `POST /customer`, else `404 Other{ CUSTOMER_NOT_FOUND }`.
+
+A refusal of the request's terms (all of the above except `CUSTOMER_NOT_FOUND`) is recorded and
+audited as `order.refused`, like a session's. The row is then
+reserved under the idempotency key before Meld is called, exactly as `POST /session` reserves it.
+Meld is sent the stored customer, the funding id as both `externalOrderId` and
+`X-Idempotency-Key`, the buyer's IP as `clientIpAddress`, and `termsAcceptedAt` as
+`verification.agreementAcceptedAt`. The IP is the request's address, read through
+`server.trusted_proxy_cidrs` like the rate limiter's, and goes to Meld only: request log lines
+carry no client address.
+
+`201 Created`, one of two shapes:
+
+```json
+{ "fundingRequestId": "3f1a9c04-...", "kind": "card", "order": { "id": "...", "paymentMethodResponseDetails": { } } }
+```
+
+```json
+{
+  "fundingRequestId": "3f1a9c04-...",
+  "kind": "bank",
+  "instructions": {
+    "rail": "SEPA",
+    "amount": "101.20",
+    "currency": "EUR",
+    "accountHolderName": "Meld Virtual Account",
+    "iban": "DE89370400440532013000",
+    "bic": "COBADEFFXXX",
+    "reference": "MELD-REF-1",
+    "expiresAt": 1791454500000
+  }
+}
+```
+
+**A card order (`CREDIT_DEBIT_CARD`, `APPLE_PAY`) is Meld's body verbatim**, numbers as Meld sent
+them, for the Meld SDK to mount. It may hold credentials scoped to the order, so it is not stored,
+logged or audited, and a replay cannot return it. **A bank order is its transfer details**, read
+from Meld's `paymentMethodResponseDetails` (the virtual-account shape, `receivingBankInformation`
+and `serviceProviderDetails.memo`, or the same names flat): `amount` is exact decimal text, at
+least one of `iban`, `accountNumber` and `pixKey` is present, `reference` is mandatory on the
+transfer when present, and `expiresAt` is epoch ms. They are stored with the row and served by
+`GET /funding/:id` as `paymentInstructions`.
+
+A replay under the same key answers a bank order with its stored details while they can still be
+paid, and `409 Other{ REQUEST_SURFACE_EXPIRED }` otherwise, as it does for every card order. A row
+still opening, concluded or cancelled answers the same `409`s as `POST /session`, and a key first
+used for a session, for another customer key, or for other terms is `IDEMPOTENCY_KEY_REUSED`.
+
+What Meld answers decides the row, as on `POST /session`:
+
+- Meld `403 KYC_NOT_COMPLETED` or `VERIFICATION_REQUIRED`: `403 Other{ CUSTOMER_NOT_READY }`. The
+  row is `refused` and the key released; read `GET /customer` and `GET /requirements`, then order
+  again.
+- Bank details this service cannot read: `502 Other{ BANK_DETAILS_UNREADABLE }`. Nothing is shown,
+  because a payer sent to a guessed account loses the money. The row is `refused` with Meld's order
+  id and the key released; the log names the keys Meld sent and none of their values.
+- Meld `403 WHITELABEL_NOT_ENABLED`, `403 SERVICE_PROVIDER_NOT_ENABLED` or
+  `422 COINBASE_ORDER_REJECTED`, which Meld documents as creating no order:
+  `422 Other{ PROVIDER_REJECTED }`, row `refused`, key released. Decided by status and Meld code
+  only, never by Meld's message.
+- A Meld `400`: the refusals of `POST /session`, row `refused`, key released. Anything else,
+  including any other `403` or `422` code, is `503 ProviderTimeout` with the row `unobserved` and
+  the key kept, because the order may exist.
+
+Each outcome is audited as `order.created`, `order.rail_refused` or `order.orphaned`, with the
+committed terms, the order kind and Meld's order id, never the order body or the IP.
+
 ## `POST /funding/:id/cancel`
 
 **Cancelling withdraws the payment surface without concluding the request.** `cancelled_at` is a
@@ -668,6 +775,7 @@ for another caller's alike.
   "id": "3f1a9c04-8e2b-4d77-9a10-1c5b7e0d2f43",
   "rail": "meld",
   "direction": "buy",
+  "integrationMode": "widget",
   "status": "transaction_seen",
   "providerStatus": "PENDING",
   "destinationCurrencyCode": "USDC_ASSETHUB",
@@ -683,7 +791,11 @@ for another caller's alike.
 }
 ```
 
-`direction` is always present. On a sell row, `walletAddress` and `sourceAmount` are absent and
+`direction` and `integrationMode` (`widget` for `POST /session`, `headless` for `POST /order`) are
+always present. On a headless bank order, `paymentInstructions` carries the transfer details
+`POST /order` answered with, gated like the settlement surface below and, in addition, on their own
+`expiresAt`; once withheld, the details are no longer payable. A card order never carries them.
+On a sell row, `walletAddress` and `sourceAmount` are absent and
 `cryptoAmount` carries the committed crypto at full precision; see `direction` above for why that
 echo is load-bearing rather than informational. A sell moves through the **same** eight states a
 buy does: the direction is a term of the request, not a stage of its life.
@@ -743,7 +855,7 @@ Meld session or transaction id is carried: those are internal join keys.
 
 ## Durable funding
 
-`POST /session` writes a row to Postgres (CloudSQL; the schema is versioned and migrated under an
+`POST /session` and `POST /order` write a row to Postgres (CloudSQL; the schema is versioned and migrated under an
 advisory lock, so two booting replicas cannot race it) and the funding reads read it back. The row
 is reserved **before** the rail is called, so the unique index arbitrates the idempotency key
 rather than a check-then-act race. An in-process worker advances the lifecycle.
@@ -780,7 +892,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 400 | `WrongAssetOrChain` | Destination code is not one this service delivers. |
 | 400 | `Other{ REDIRECT_NOT_ALLOWED }` | The redirect target's origin is not in `cors.allowed_origins`. |
 | 409 | `Other{ IDEMPOTENCY_KEY_REUSED }` | The idempotency key was first used for a different request. Mint a new key. |
-| 409 | `Other{ REQUEST_SURFACE_EXPIRED }` | The rail's payment page for that request has closed, but the request has **not** concluded: a transfer may still be in flight, and the worker is still watching. Do **not** start another: poll `GET /funding/:id` and act on the conclusion when it arrives. Cleared by the worker concluding the row, so a stopped worker leaves a caller on this code indefinitely. |
+| 409 | `Other{ REQUEST_SURFACE_EXPIRED }` | A `POST /order` replay of a card order, whose body is never stored, or of a bank order whose details have lapsed; otherwise the rail's payment page for that request has closed, but the request has **not** concluded: a transfer may still be in flight, and the worker is still watching. Do **not** start another: poll `GET /funding/:id` and act on the conclusion when it arrives. Cleared by the worker concluding the row, so a stopped worker leaves a caller on this code indefinitely. |
 | 409 | `Other{ REQUEST_CANCELLED }` | The key belongs to a request the caller withdrew. Nothing was paid and starting again is safe, with a new key. A transfer already in flight when it was cancelled can still settle against the old request, so this is not a promise that nothing will arrive. |
 | 409 | `Other{ REQUEST_NOT_CANCELLABLE }` | `POST /funding/:id/cancel` on a request that cannot be withdrawn: a deposit address has already been disclosed to the seller, a payment is already on its way for it, or it has already concluded. |
 | 409 | `Other{ REQUEST_CONCLUDED }` | The key belongs to a request that ended as `expired` or `failed`. On a buy the rail answered and nothing was paid; start a new one with a new key. On a sell, `failed` can follow a deposit the seller already sent (the provider failed or refunded the payout), so this is not a promise that nothing left the seller: read the request before opening another sale for the same funds. (`refused` shares this code but never reaches the path: a refused row holds no key.) |
@@ -797,12 +909,16 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 401 | `Other{ CUSTOMER_PROOF_INVALID }` | `POST /customer/token`: the challenge is stale, inauthentic or malformed, or the signature does not verify over its raw bytes. Fetch a new challenge. |
 | 401 | `Other{ CUSTOMER_TOKEN_INVALID }` | `x-customer-token` is missing, expired, or bound to another product or alias. Get a new token from `POST /customer/token`. |
 | 409 | `Other{ CUSTOMER_EXISTS }` | `POST /customer` for a key that already has a customer. Read it with `GET /customer`. |
-| 404 | `Other{ CUSTOMER_NOT_FOUND }` | A customer route other than `GET /customer` and `POST /customer`, for a key that has not registered. Register with `POST /customer`. |
+| 404 | `Other{ CUSTOMER_NOT_FOUND }` | A customer route other than `GET /customer` and `POST /customer`, or `POST /order`, for a key that has not registered. Register with `POST /customer`. |
+| 400 | `Other{ TERMS_STALE }` | `POST /order`: `termsAcceptedAt` does not parse, is ahead of this service's clock, or is more than an hour old. Accept the terms again. |
+| 403 | `Other{ CUSTOMER_NOT_READY }` | `POST /order`: the provider will not take an order from this customer yet (Meld `KYC_NOT_COMPLETED` or `VERIFICATION_REQUIRED`). Nothing was placed and the key is free. |
+| 502 | `Other{ BANK_DETAILS_UNREADABLE }` | `POST /order`: Meld created a bank order whose transfer details this service cannot read. Nothing is payable; do not guess an account. |
+| 400 | `Other{ HEADLESS_DISABLED }` | `POST /quote` with `integrationMode: "headless"` on a deployment without `meld.headless.enabled`. |
 | 429 | `Other{ VERIFICATION_COOLDOWN }` | `POST /customer/verifications` during Meld's resend cooldown. `resendAvailableAt` in the value says when another code may be sent; `null` is the daily cap. |
 | 400 | `Other{ VERIFICATION_EXPIRED }` | `POST /customer/verifications/confirm` for a verification that expired or is no longer pending. Ask for a new code. |
 | 400 | `RouteWithdrawn` | The operator has disabled session creation. |
 | 400 | `Other{ UNKNOWN_RAIL }` | A rail this build knows but this deployment has not wired. |
-| 400 | `Other{ PROVIDER_REJECTED }` | Meld understood the request and declined it, for a reason not enumerated above. Not retryable. |
+| 400 | `Other{ PROVIDER_REJECTED }` | Meld understood the request and declined it, for a reason not enumerated above. Not retryable. On `POST /order` it is `422` for a Meld refusal that created no order (`WHITELABEL_NOT_ENABLED`, `SERVICE_PROVIDER_NOT_ENABLED`, `COINBASE_ORDER_REJECTED`); the key is free, but the same order will be refused again. |
 | 400 | `Other{ DIRECTION_UNSUPPORTED }` | The named rail does not serve that direction. `chainflip` refuses `direction: "sell"` permanently, having no fiat leg to pay a seller from; `meld` serves both. Not retryable; the remedy is a different rail or a different direction, never the same request again. |
 | 400 | `Other{ RAIL_REFUSED }` | The Chainflip rail refuses **session creation**: it swaps on-chain assets and has no fiat leg. Not retryable. (Its quote leg answers `422 NoQuotesAvailable`.) |
 | 409 | `Other{ REQUEST_IN_FLIGHT }` | Another request is already opening a session under this idempotency key. Well-formed; retry shortly. |

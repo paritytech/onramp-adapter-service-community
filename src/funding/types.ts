@@ -203,6 +203,8 @@ export interface FundingRequestDto {
   rail: RailName;
   /** Which way this request moves value. Always present; absent on the wire never meant `buy`. */
   direction: Direction;
+  /** How the buyer pays: the provider's widget, or a Meld Headless order. Always present. */
+  integrationMode: IntegrationMode;
   status: FundingState;
   /** Provider's status as of the last state change, not its current one (e.g. Meld `REFUNDED`). */
   providerStatus?: string;
@@ -277,6 +279,8 @@ export interface FundingRequestDto {
    * has should treat the sale as changed after it paid. Present only while the request is live.
    */
   depositConflictAt?: number;
+  /** A headless bank order's transfer details, gated like the settlement surface and on their own expiry. */
+  paymentInstructions?: BankInstructions;
   createdAt: number;
   updatedAt: number;
   history: TimelineEntry[];
@@ -302,18 +306,13 @@ export function toFundingRequestDto(record: FundingRecord, now: number): Funding
   // `now` is required rather than defaulted. A defaulted clock is one nothing ever passes, and the
   // branch that matters here (an expiry in the past) is only reachable by controlling it.
   //
-  // Can this still be paid? `TERMINAL_STATES` owns half the answer, so it cannot drift from the
-  // machine the worker advances rows through; the rail's expiry owns the other half.
-  // Three conditions now. A cancelled request has no surface to offer even while its status is
-  // live; that is the whole of what cancelling does, and leaving the URL out is where it happens.
-  const live =
-    !TERMINAL_STATES.includes(record.status) &&
-    (record.expires_at ?? Infinity) > now &&
-    record.cancelled_at === undefined;
+  const live = isLive(record, now);
+  const instructions = payableInstructions(record, now);
   return {
     id: record.id,
     rail: record.rail,
     direction: record.direction,
+    integrationMode: record.integration_mode,
     status: record.status,
     ...(record.provider_status === undefined ? {} : { providerStatus: record.provider_status }),
     destinationCurrencyCode: record.destination_currency_code,
@@ -329,10 +328,36 @@ export function toFundingRequestDto(record: FundingRecord, now: number): Funding
     ...(live && record.expires_at !== undefined ? { expiresAt: record.expires_at } : {}),
     ...(record.cancelled_at === undefined ? {} : { cancelledAt: record.cancelled_at }),
     ...(live ? depositDisclosure(record) : {}),
+    ...(instructions === undefined ? {} : { paymentInstructions: instructions }),
     createdAt: record.created_at,
     updatedAt: record.updated_at,
     history: record.status_history,
   };
+}
+
+/**
+ * Can this still be paid? `TERMINAL_STATES` owns half the answer, so it cannot drift from the
+ * machine the worker advances rows through; the rail's expiry owns the other half. A cancelled
+ * request has no surface to offer even while its status is live; that is the whole of what
+ * cancelling does, and leaving the surface out is where it happens.
+ */
+function isLive(record: FundingRecord, now: number): boolean {
+  return (
+    !TERMINAL_STATES.includes(record.status) &&
+    (record.expires_at ?? Infinity) > now &&
+    record.cancelled_at === undefined
+  );
+}
+
+/**
+ * A bank order's transfer details while the request is live and the details have not lapsed, so
+ * nobody is sent to pay an account the provider no longer watches for this order. Shared by the
+ * funding read and the `POST /order` replay, so the two cannot disagree.
+ */
+export function payableInstructions(record: FundingRecord, now: number): BankInstructions | undefined {
+  const instructions = record.payment_instructions;
+  if (instructions === undefined || !isLive(record, now)) return undefined;
+  return (instructions.expiresAt ?? Infinity) > now ? instructions : undefined;
 }
 
 /**
