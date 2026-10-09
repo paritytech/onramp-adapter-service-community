@@ -75,7 +75,7 @@ function addressBucket(ip: string): string {
   return `${prefix.join(':')}::/64`;
 }
 
-interface CallerGate {
+export interface CallerGate {
   /** `onRequest`: decide who is calling and remember it. Never throws a refusal; `enforce` does. */
   identify: (request: FastifyRequest) => Promise<void>;
   /** `preHandler`, after the limiter: raise whatever refusal `identify` recorded. */

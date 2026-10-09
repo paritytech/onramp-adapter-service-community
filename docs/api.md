@@ -5,13 +5,17 @@ See [README.md](../README.md) for what the service is and how to run it.
 
 Nine routes are authenticated by the short-lived JWT the handshake mints: `POST /quote`,
 `POST /session`, `GET /supported`, `GET /supported/countries`, `GET /supported/corridors`,
-`GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel` and `GET /transaction/:id`. The
-unauthenticated remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
+`GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel` and `GET /transaction/:id`. With
+Meld Headless enabled (`meld.headless.enabled`), `POST /customer/challenge` and
+`POST /customer/token` make eleven. The unauthenticated remainder is `GET /health`,
+`GET /meld/return` and the two handshake routes.
 
 | Endpoint | Proxies | Purpose |
 | --- | --- | --- |
 | `POST /api/v1/auth/challenge` | none | Mints a fresh 56-byte blind challenge. No auth, rate-limited. |
 | `POST /api/v1/auth/redeem` | none | Exchanges a challenge + ring-VRF proof for a short-lived JWT. Verifies against the People-chain commitment. |
+| `POST /customer/challenge` | none | Headless only. Mints a fresh 56-byte challenge for a customer key proof. Caller auth. |
+| `POST /customer/token` | none | Headless only. Exchanges an sr25519 signature over that challenge for a short-lived customer token. Caller auth. |
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
@@ -44,7 +48,8 @@ endpoint for `CRYPTO_OFFRAMP` (it answers `404` for every country); the substitu
   `server.request_timeout_ms`.
 - CORS allows **`GET` and `POST` only**, against an allowlist. Never a wildcard: any page could
   otherwise spend the operator's Meld quota from a visitor's browser. An empty allowlist disables
-  browser access entirely.
+  browser access entirely. The request headers allowed are exactly `content-type`,
+  `authorization`, `x-dev-product-id` and `x-customer-token`; `retry-after` is exposed.
 - `GET /funding` returns at most **100 rows**, newest first, and does not page.
 - Rate limited per proven person where one exists (`per_person_max`, default 120) and per calling
   address otherwise (`per_address_max`, default 30), with a `429` carrying `retry-after`.
@@ -54,6 +59,9 @@ endpoint for `CRYPTO_OFFRAMP` (it answers `404` for every country); the substitu
   threat model R13.
 - Every authenticated call carries `Authorization: Bearer <JWT>`. `Meld-Version` is added
   server-side, and the Meld key never reaches a client.
+- A route that acts for a headless customer also carries `x-customer-token: <token>` from
+  `POST /customer/token`. Caller auth is checked first, so a request failing both answers
+  `UNAUTHORIZED`.
 
 Field names are the caller's, which are mostly Meld's: `country`, `fiat`,
 `destinationCurrencyCode`, `sourceAmount`, `paymentMethodType`. Operator configuration stays
@@ -468,6 +476,40 @@ client's word. A valid proof recovers the caller's contextual **alias**, which t
 { "token": "eyJ...", "expiresAtMs": 1800000000000 }
 ```
 
+## `POST /customer/challenge` and `POST /customer/token`
+
+Proof that the caller controls a headless customer key, present only when
+`meld.headless.enabled` is true; otherwise both answer 404 like any unknown path. Both take caller
+auth and share the caller's rate-limit bucket.
+
+The app holds one sr25519 customer key per identity. `challenge` takes no body and mints a fresh
+**56-byte challenge** in the same format as the personhood handshake, under its own key, valid for
+`customer.challenge_ttl_s`:
+
+```json
+{ "challenge": "<base64url, 56 bytes>" }
+```
+
+`token` takes the public key and an sr25519 signature over the **raw challenge bytes**, decoded
+from base64url. A signature over the `<Bytes>`-wrapped bytes is refused.
+
+```json
+{ "publicKey": "0x<64 hex>", "challenge": "<base64url, from /customer/challenge>", "signature": "0x<128 hex>" }
+```
+
+A stale, foreign or tampered challenge, or a signature that does not verify, is
+`401 CUSTOMER_PROOF_INVALID`. Otherwise it answers an HS256 token valid for `customer.token_ttl_s`:
+
+```json
+{ "token": "eyJ...", "expiresAtMs": 1800000000000 }
+```
+
+The token names the customer by `blake2b-256("onramp:meld-customer-key:" || publicKey)` (`sub`), and
+is bound to the caller's product (`aud`) and alias (`sa`). The public key is used for the signature
+check and then discarded: it is not stored, logged or returned. Sent as `x-customer-token`, a token
+that is missing, expired, or bound to another product or alias is `401 CUSTOMER_TOKEN_INVALID`; the
+remedy is a new token, never new caller credentials.
+
 ## `POST /funding/:id/cancel`
 
 **Cancelling withdraws the payment surface without concluding the request.** `cancelled_at` is a
@@ -636,6 +678,8 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 400 | `Other{ PAYMENT_METHOD_UNSUPPORTED }` | The live corridor for this `(country, fiat, destination, direction)` does not offer the requested `paymentMethodType`. Ask `GET /supported` for the ones it does. Not retryable as sent. |
 | 400 | `Other{ MALFORMED_REQUEST }` | Body did not parse, named an unexpected field, or a field failed its bounds. **Which field is in the log against this `request_id`, never in the body**, so an integrator debugging a 400 needs the server's log line and not just the response. |
 | 401 | `Other{ UNAUTHORIZED }` | Caller not verified. |
+| 401 | `Other{ CUSTOMER_PROOF_INVALID }` | `POST /customer/token`: the challenge is stale, inauthentic or malformed, or the signature does not verify over its raw bytes. Fetch a new challenge. |
+| 401 | `Other{ CUSTOMER_TOKEN_INVALID }` | `x-customer-token` is missing, expired, or bound to another product or alias. Get a new token from `POST /customer/token`. |
 | 400 | `RouteWithdrawn` | The operator has disabled session creation. |
 | 400 | `Other{ UNKNOWN_RAIL }` | A rail this build knows but this deployment has not wired. |
 | 400 | `Other{ PROVIDER_REJECTED }` | Meld understood the request and declined it, for a reason not enumerated above. Not retryable. |

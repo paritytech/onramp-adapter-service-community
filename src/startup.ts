@@ -13,6 +13,7 @@ import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 import { hkdfSync } from 'node:crypto';
 
 import { loadConfig, type Config } from './config.js';
+import type { CustomerKeys } from './customer-auth.js';
 import { ChainflipRail } from './chainflip/rail.js';
 import { FundingStore } from './funding/store.js';
 import { startWorker, type RailObservation } from './funding/worker.js';
@@ -129,7 +130,7 @@ export async function start(
     cfg.auth.mode === 'personhood' ? await buildPersonhood(cfg) : undefined;
 
   // Resolved here so a missing or short headless secret stops boot before any Meld call.
-  await buildHeadlessKeys(cfg);
+  const headless = await buildHeadlessKeys(cfg);
 
   // The durable funding store: the status surface answers from it and the worker advances it,
   // so a restart resumes from the persisted requests rather than losing in-flight work.
@@ -167,6 +168,7 @@ export async function start(
         new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery),
       personhood,
       logDestination,
+      headless,
     );
     // A non-optional handle for the callbacks below: `app` has to be declared outside this block
     // so the `catch` can close it, and TypeScript cannot narrow a mutable binding inside a closure.
@@ -395,9 +397,7 @@ export async function buildPersonhood(cfg: Config): Promise<PersonhoodService> {
 }
 
 /** The secrets Meld Headless needs, resolved and derived once at boot. */
-interface HeadlessKeys {
-  customerChallengeKey: Uint8Array;
-  customerTokenKey: Uint8Array;
+interface HeadlessKeys extends CustomerKeys {
   webhookSecret: Secret;
 }
 

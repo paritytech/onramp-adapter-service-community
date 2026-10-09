@@ -1,7 +1,7 @@
 /**
  * The HTTP surface: the authenticated routes (every one wrapped in `asCaller`, so a grep answers
  * which and how many), the two public handshake routes, the widget's return landing, and a
- * liveness probe.
+ * liveness probe. With Meld Headless enabled, the customer key routes join the authenticated set.
  *
  * Two invariants live here rather than in the docs, because both are easy to break locally:
  * every failure becomes a response in one of exactly three places (the error handler, the
@@ -25,9 +25,11 @@ import type { AuditLog } from './audit.js';
 import { callerAuth } from './auth.js';
 import { callerGate } from './caller.js';
 import { toOriginMatcher, type Config } from './config.js';
+import { customerAuth, type CustomerKeys } from './customer-auth.js';
 import type { PersonhoodService } from './personhood.js';
 import {
   createSessionRequest,
+  customerTokenRequest,
   quoteRequest,
   supportedQuery,
   supportedCountriesQuery,
@@ -84,6 +86,7 @@ export async function buildServer(
   makeOnramp: OnrampFactory,
   personhood?: PersonhoodService,
   logDestination?: LogDestination,
+  customerKeys?: CustomerKeys,
 ): Promise<FastifyInstance> {
   const app = Fastify({
     // A request id on every log line and every error body, so a support conversation can
@@ -149,6 +152,8 @@ export async function buildServer(
   // ordering that actually matters is per request rather than here, and it is spelled out on
   // `hook` below. See src/caller.ts for why authentication is split in two at all.
   const gate = callerGate(callerAuth(cfg, { personhood }));
+  // Present exactly when Meld Headless is enabled; enabled without its keys refuses here, at boot.
+  const customer = customerAuth(cfg, customerKeys);
 
   // Keyed on the proven person when there is one, and on the address otherwise: a failed
   // authentication, an `insecure_dev` caller, or one of the two public handshake routes. Threat
@@ -232,6 +237,8 @@ export async function buildServer(
     // "CORS unconfigured" rather than "origin rejected".
     origin: cfg.cors.allowed_origins.length > 0 ? cfg.cors.allowed_origins.map(toOriginMatcher) : false,
     methods: ['GET', 'POST'],
+    // Listed rather than reflected: the default echoes whatever a preflight asks for.
+    allowedHeaders: ['content-type', 'authorization', 'x-dev-product-id', 'x-customer-token'],
     // The browser hides `retry-after` from a cross-origin page unless it is exposed; without it
     // the app cannot tell how long a 429 lasts.
     exposedHeaders: ['retry-after'],
@@ -352,6 +359,22 @@ export async function buildServer(
     app.post('/api/v1/auth/redeem', async (request, reply) => {
       const body = parse(redeemRequest, request.body);
       return reply.send(await personhood.redeem(body));
+    });
+  }
+
+  /**
+   * Proof of control of a headless customer key, for an authenticated caller.
+   *
+   * `challenge` mints a fresh 56-byte challenge; `token` exchanges a signature over its raw bytes
+   * for a customer token bound to this caller. Absent unless Meld Headless is enabled, so a
+   * deployment without it answers 404 like any unknown path.
+   */
+  if (customer) {
+    app.post('/customer/challenge', asCaller, async (_request, reply) => reply.send(customer.challenge()));
+    app.post('/customer/token', asCaller, async (request, reply) => {
+      const subject = gate.subjectOf(request);
+      const body = parse(customerTokenRequest, request.body);
+      return reply.send(await customer.issueToken(subject, body));
     });
   }
 

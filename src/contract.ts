@@ -153,6 +153,29 @@ export const directionUnsupported = (detail: string) =>
     detail,
   );
 
+/**
+ * `401` for a customer key proof that does not hold: a stale, inauthentic or malformed challenge,
+ * or a signature that does not verify. Separate from `UNAUTHORIZED` because the caller is
+ * authenticated; only the key proof failed, and the remedy is a fresh challenge.
+ */
+export const customerProofInvalid = (detail: string) =>
+  new Refusal(
+    401,
+    { tag: 'Other', value: { code: 'CUSTOMER_PROOF_INVALID', message: 'The customer key proof was not accepted.' } },
+    detail,
+  );
+
+/**
+ * `401` for a customer token that is missing, expired, forged, or bound to another caller. The
+ * remedy is a new token from `POST /customer/token`, never new caller credentials.
+ */
+export const customerTokenInvalid = (detail: string) =>
+  new Refusal(
+    401,
+    { tag: 'Other', value: { code: 'CUSTOMER_TOKEN_INVALID', message: 'The customer token was not accepted.' } },
+    detail,
+  );
+
 // --- requests ---------------------------------------------------------------
 
 /**
@@ -329,6 +352,21 @@ export const redeemRequest = z
     productId: z.string().min(1).max(128),
   })
   .strict();
+
+/**
+ * Proof of control of a customer key: an sr25519 signature over the raw bytes of a challenge from
+ * `POST /customer/challenge`, with no `<Bytes>` wrapper. Lengths are exact, so a key or signature
+ * of the wrong size is refused here rather than by the verifier.
+ */
+export const customerTokenRequest = z
+  .object({
+    publicKey: z.string().regex(/^0x[0-9a-fA-F]{64}$/, 'Expected a 32-byte hex public key.'),
+    challenge: z.string().max(128).regex(/^[A-Za-z0-9_-]+$/, 'Expected a base64url challenge token.'),
+    signature: z.string().regex(/^0x[0-9a-fA-F]{128}$/, 'Expected a 64-byte hex signature.'),
+  })
+  .strict();
+
+export type CustomerTokenRequest = z.infer<typeof customerTokenRequest>;
 
 /**
  * Which way the request moves value. Absent defaults to `DIRECTIONS[0]` (`buy`). See `src/rail.ts`.

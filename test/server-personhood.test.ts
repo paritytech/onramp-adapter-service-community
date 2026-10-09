@@ -269,6 +269,27 @@ describe('the CORS preflight answer', () => {
     expect(preflight.headers).not.toHaveProperty('access-control-allow-credentials');
   });
 
+  it('allows exactly the request headers a caller sends, including the customer token', async () => {
+    // Listed, not reflected: the plugin's default echoes whatever header a preflight names.
+    const instance = await serveCors();
+    app = instance;
+
+    const preflight = await instance.inject({
+      method: 'OPTIONS',
+      url: '/quote',
+      headers: {
+        origin: 'https://app.example',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'x-customer-token, x-anything-else',
+      },
+    });
+
+    expect(preflight.statusCode).toBe(204);
+    expect(preflight.headers['access-control-allow-headers']).toBe(
+      'content-type, authorization, x-dev-product-id, x-customer-token',
+    );
+  });
+
   it.each(['PUT', 'DELETE', 'PATCH'])('does not advertise %s', async (method) => {
     const instance = await serveCors();
     app = instance;
