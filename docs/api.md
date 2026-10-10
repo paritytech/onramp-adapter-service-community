@@ -921,7 +921,9 @@ order's among its Meld customer's transactions (read under `meld.headless.api_ve
 webhook already moved is left as it is. An unpaid order is not expired while it can still be paid:
 a bank order is watched until its transfer details lapse, if that is later than
 `worker.session_max_age_ms` after the request, and Meld is asked once more before `expired`. An
-order whose stored customer is gone cannot be asked, and concludes `unobserved` at its deadline.
+order whose stored customer is gone cannot be asked, and concludes `unobserved` at its deadline; so
+does an unmatched order while its customer has a transaction without an `orderId`, which cannot be
+ruled out as the order's.
 
 Two bounds keep that loop from becoming a standing cost:
 

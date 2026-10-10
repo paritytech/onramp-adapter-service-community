@@ -423,6 +423,21 @@ describe('MeldRail.observation', () => {
       ).resolves.toEqual({ id: 'tx-1', status: 'SETTLED' });
     });
 
+    it('reads an unmatched transaction without an order id as unanswered, not as no transaction', async () => {
+      const { finder } = finderOver([other(0), { id: 'tx-1', orderId: null }, { id: 'tx-2' }]);
+      await expect(finder(headlessRecord())).rejects.toThrow(
+        'Meld returned 2 transactions without an order id for customer meld-customer-1, so headless request funding-1 (order order-1) cannot be ruled unpaid.',
+      );
+      await expect(finderOver([{ id: 'tx-2' }, { id: 'tx-1', orderId: 'order-1' }]).finder(headlessRecord())).resolves.toEqual({
+        id: 'tx-1',
+        status: null,
+      });
+    });
+
+    it('rules out transactions that carry another order id', async () => {
+      await expect(finderOver([other(0), other(1)]).finder(headlessRecord())).resolves.toBeUndefined();
+    });
+
     it.each([
       ['no order', { meld_order_id: undefined }],
       ['no customer key', { customer_key_hash: undefined }],

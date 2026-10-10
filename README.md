@@ -181,9 +181,9 @@ an operator can tie a running pod to a commit in this repository.
 - **The settlement join is unverified against a live Meld.** The worker finds a transaction by the
   reference the session was filed under, and a headless order's by its Meld customer and order id.
   Neither contract is re-verified here against a live sandbox. A session whose transaction cannot
-  be found concludes `unobserved` rather than claiming the buyer did not pay; a headless order whose
-  transaction does not carry its order id concludes `expired`, which does make that claim. See the
-  threat model, R10.
+  be found concludes `unobserved` rather than claiming the buyer did not pay, and so does a headless
+  order while its customer has a transaction that does not carry an order id. See the threat model,
+  R10.
 - **Meld Headless bank details are read from an undocumented shape.** Meld documents no transfer
   details for a headless onramp bank order, so they are read from its virtual-account shape and
   any other shape refuses the order rather than showing a guessed account.

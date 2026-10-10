@@ -204,6 +204,11 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
    * A headless order's transaction: the stored customer's transactions, matched on `orderId`.
    * Meld files no reference of ours on a headless transaction, so the order is the join. Two
    * transactions for one order are ambiguous and throw rather than picking one.
+   *
+   * Meld does not document `orderId` on a headless transaction, so one without it cannot be ruled
+   * out as this order's. While the order is unmatched, such a transaction throws rather than
+   * answering nothing: the row then concludes `unobserved`, never `expired`, which would claim the
+   * buyer did not pay.
    */
   private async headlessTransaction(
     record: FundingRecord,
@@ -226,10 +231,18 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
       throw new Error(`Meld returned ${String(mine.length)} transactions for order ${orderId}.`);
     }
     const txn = mine[0];
-    if (txn === undefined && rows.length >= CUSTOMER_TRANSACTIONS_PAGE) {
+    if (txn !== undefined) return { id: txn.id, status: txn.status ?? null };
+    if (rows.length >= CUSTOMER_TRANSACTIONS_PAGE) {
       throw new Error(`Meld returned a full page of transactions for customer ${customer.meld_customer_id} without order ${orderId}.`);
     }
-    return txn === undefined ? undefined : { id: txn.id, status: txn.status ?? null };
+    const unordered = rows.filter((row) => (row.orderId ?? undefined) === undefined).length;
+    if (unordered > 0) {
+      throw new Error(
+        `Meld returned ${String(unordered)} transactions without an order id for customer ` +
+          `${customer.meld_customer_id}, so headless request ${record.id} (order ${orderId}) cannot be ruled unpaid.`,
+      );
+    }
+    return undefined;
   }
 }
 

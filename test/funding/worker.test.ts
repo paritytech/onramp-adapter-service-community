@@ -2404,6 +2404,25 @@ describe('headless rows', () => {
     await store.close();
   });
 
+  it('concludes unobserved, never expired, when a transaction without an order id may be the order', async () => {
+    const store = withCustomer([card()]);
+    const { rail } = meld(async () => [{ id: 'tx-unordered', status: 'SETTLED', customer: { id: 'meld-customer-1' } }]);
+    const wired = { meld: rail.observation(store) };
+    const { lines, log } = notes();
+
+    await tick(store, NOW, wired, MAX_AGE, log, lease());
+    expect((await store.byId('funding-1'))?.status).toBe('session_opened');
+
+    await tick(store, NOW + MAX_AGE + 1, wired, MAX_AGE, log, lease());
+    expect((await store.byId('funding-1'))?.status).toBe('unobserved');
+    expect(lines).toContain(
+      'funding worker concluded funding-1 as unobserved: its observation window closed while the rail could not be ' +
+        'asked: Meld returned 1 transactions without an order id for customer meld-customer-1, so headless request ' +
+        'funding-1 (order order-1) cannot be ruled unpaid.',
+    );
+    await store.close();
+  });
+
   it('leaves a row with no stored customer to its deadline, logging ids only', async () => {
     const orphans = ['o1', 'o2', 'o3'].map((id, at) =>
       card({ id, meld_order_id: `order-${id}`, customer_key_hash: 'ff'.repeat(32), created_at: NOW - 10 + at }),
