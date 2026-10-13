@@ -869,6 +869,7 @@ describe('parseConfig', () => {
       const value = [
         { code: 'DOT_ASSETHUB', chain: 'assethub' },
         { code: 'DOT_STATEMINT', chain: 'assethub' },
+        { code: 'USDT_STATEMINT', chain: 'assethub' },
         { code: 'USDC_ARBITRUM', chain: 'arbitrum' },
         { code: 'USDT_SOLANA', chain: 'solana' },
       ];

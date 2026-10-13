@@ -78,8 +78,8 @@ export function normalizeAddress(input: string): string {
 export function canonicalizeDisclosedAddress(input: string, code?: string): string | undefined {
   // A sell-only code sold on another chain takes that chain's format. Solana: base58, 32 bytes, no
   // checksum and no prefix, returned exactly as given. EVM: `0x` plus 40 hex, lowercased so two
-  // spellings of one account compare equal. `DOT_STATEMINT` is Asset Hub under its older name, so
-  // it falls through to the SS58 rules below.
+  // spellings of one account compare equal. The `*_STATEMINT` codes are Asset Hub under its older
+  // name, so they fall through to the SS58 rules below.
   if (code !== undefined && isOfframpOnly(code)) {
     if (code.endsWith('_ARBITRUM')) return evmAddress(input);
     if (code.endsWith('_SOLANA')) return solanaAddress(input);

@@ -78,17 +78,20 @@ describe('canonicalizeDisclosedAddress for a sell-only code', () => {
   });
 });
 
-describe('canonicalizeDisclosedAddress for DOT_STATEMINT', () => {
-  // Meld's older code for DOT on Asset Hub: sell-only, but an Asset Hub account all the same.
+describe('canonicalizeDisclosedAddress for the Statemint codes', () => {
+  // Meld's older codes for Asset Hub: sell-only, but Asset Hub accounts all the same.
   it('normalises an SS58 address to the Polkadot prefix, as for DOT_ASSETHUB', () => {
-    expect(canonicalizeDisclosedAddress(ALICE_PREFIX_42, 'DOT_STATEMINT')).toBe(ALICE_PREFIX_0);
-    expect(canonicalizeDisclosedAddress(ALICE_PREFIX_0, 'DOT_STATEMINT')).toBe(ALICE_PREFIX_0);
+    for (const code of ['DOT_STATEMINT', 'USDT_STATEMINT']) {
+      expect(canonicalizeDisclosedAddress(ALICE_PREFIX_42, code)).toBe(ALICE_PREFIX_0);
+      expect(canonicalizeDisclosedAddress(ALICE_PREFIX_0, code)).toBe(ALICE_PREFIX_0);
+    }
   });
 
   it('refuses Solana and EVM values', () => {
     expect(canonicalizeDisclosedAddress('So11111111111111111111111111111111111111112', 'DOT_STATEMINT')).toBeUndefined();
     expect(canonicalizeDisclosedAddress('0xAbCdEf0123456789aBcDeF0123456789AbCdEf01', 'DOT_STATEMINT')).toBeUndefined();
     expect(canonicalizeDisclosedAddress('', 'DOT_STATEMINT')).toBeUndefined();
+    expect(canonicalizeDisclosedAddress('So11111111111111111111111111111111111111112', 'USDT_STATEMINT')).toBeUndefined();
   });
 });
 
