@@ -24,14 +24,18 @@ export const DESTINATIONS: readonly Destination[] = Object.freeze([
 /**
  * Codes a seller may sell, and a buyer may never receive.
  *
- * These are sold on Solana after a Chainflip swap; this service never delivers them, so they are
- * not in `DESTINATIONS` and every buy path keeps refusing them. Code, not configuration, for the
- * same reason `DESTINATIONS` is: Meld resolves an unknown code to Bitcoin (threat model T4).
+ * The Solana and Arbitrum codes are sold after a Chainflip swap. `DOT_STATEMINT` is Meld's older
+ * code for DOT on Polkadot Asset Hub (Statemint was Asset Hub's name): the same DOT the direct sale
+ * sells as `DOT_ASSETHUB`, which some providers still buy only under this code. This service never
+ * delivers any of them, so they are not in `DESTINATIONS` and every buy path keeps refusing them.
+ * Code, not configuration, for the same reason `DESTINATIONS` is: Meld resolves an unknown code to
+ * Bitcoin (threat model T4).
  */
 export const OFFRAMP_ONLY: readonly Destination[] = Object.freeze([
   Object.freeze({ code: 'USDT_SOLANA' }),
   Object.freeze({ code: 'USDC_SOLANA' }),
   Object.freeze({ code: 'USDC_ARBITRUM' }),
+  Object.freeze({ code: 'DOT_STATEMINT' }),
 ]);
 
 /** Is this a code that is sellable but never deliverable? */

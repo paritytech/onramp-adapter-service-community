@@ -868,6 +868,7 @@ describe('parseConfig', () => {
     it('accepts an ordered list of delivered and sell-only codes', () => {
       const value = [
         { code: 'DOT_ASSETHUB', chain: 'assethub' },
+        { code: 'DOT_STATEMINT', chain: 'assethub' },
         { code: 'USDC_ARBITRUM', chain: 'arbitrum' },
         { code: 'USDT_SOLANA', chain: 'solana' },
       ];
