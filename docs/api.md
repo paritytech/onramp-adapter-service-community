@@ -254,8 +254,8 @@ these assets is onboarded, the same code starts returning it, without a deploy.
 
 ### Offramp lanes
 
-A sell can settle through more than one crypto lane (an Asset Hub asset, or a Solana stablecoin
-sold after a Chainflip swap). `supported.offramp_lanes` lists the lanes in preference order, and the two
+A sell can settle through more than one crypto lane (USDT or DOT on Asset Hub, DOT under either of
+Meld's codes for it, or a stablecoin sold after a Chainflip swap). `supported.offramp_lanes` lists the lanes in preference order, and the two
 `/supported/offramp*` routes answer "what can a seller in this country use" without the caller
 picking a lane first.
 
@@ -285,11 +285,14 @@ picks a lane from `lanes` and checks the amount against that lane's limits.
 rule as `GET /supported/corridors` except that sell rows age out after three *sell* routes passes (`supported.sell_routes_interval_ms`, 12h by default) rather than three buy passes; `GET /supported/offramp` asks Meld live, one `corridorForCountry`
 per lane in sell direction.
 
-The sell-only codes `USDT_SOLANA`, `USDC_SOLANA` and `USDC_ARBITRUM` are accepted wherever `direction=sell` is, and
-refused with `WrongAssetOrChain` on every buy path. The disclosed deposit address is validated per code: a
+The sell-only codes `USDT_SOLANA`, `USDC_SOLANA`, `USDC_ARBITRUM`, `DOT_STATEMINT` and `USDT_STATEMINT` are
+accepted wherever `direction=sell` is, and refused with `WrongAssetOrChain` on every buy path. `DOT_STATEMINT`
+and `USDT_STATEMINT` are Meld's older codes for DOT and USDT on Polkadot Asset Hub (Statemint was Asset Hub's
+name), which some providers, Onramp Money among them, buy only under those codes. The disclosed deposit address is validated per code: a
 `*_SOLANA` sell discloses a base58 32-byte address, stored and compared exactly as given (case-sensitive), not
 SS58-normalised; `USDC_ARBITRUM` discloses an EVM address (`0x` plus 40 hex), stored lowercased so comparisons are
-case-insensitive. Anything else for that code is recorded as malformed and never disclosed.
+case-insensitive; the `*_STATEMINT` codes disclose an Asset Hub address, SS58-normalised like `DOT_ASSETHUB`. Anything
+else for that code is recorded as malformed and never disclosed.
 
 ## `POST /quote`
 
