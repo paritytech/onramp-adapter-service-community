@@ -168,5 +168,8 @@ jobs:
 
           tar -xzf "$archive" -C /usr/local/bin gitleaks
           gitleaks version
+      # The checkout fetches every branch, and gitleaks scans all of them unless told otherwise,
+      # so one branch's finding failed every other branch's run. HEAD is the history this run
+      # would actually bring in.
       - name: Scan history for secrets
-        run: gitleaks git --no-banner --redact --exit-code 1 .
+        run: gitleaks git --no-banner --redact --exit-code 1 --log-opts="HEAD" .
