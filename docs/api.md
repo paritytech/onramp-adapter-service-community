@@ -254,7 +254,7 @@ these assets is onboarded, the same code starts returning it, without a deploy.
 
 ### Offramp lanes
 
-A sell can settle through more than one crypto lane (USDT or DOT on Asset Hub, DOT under either of
+A sell can settle through more than one crypto lane (USDT or DOT on Asset Hub, each under either of
 Meld's codes for it, or a stablecoin sold after a Chainflip swap). `supported.offramp_lanes` lists the lanes in preference order, and the two
 `/supported/offramp*` routes answer "what can a seller in this country use" without the caller
 picking a lane first.

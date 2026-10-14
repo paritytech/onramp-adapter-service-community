@@ -92,6 +92,8 @@ data:
       "supported": {
         "enabled": {{ .Values.supported.enabled }},
         "catalog_interval_ms": {{ int .Values.supported.catalog_interval_ms }},
-        "routes_interval_ms": {{ int .Values.supported.routes_interval_ms }}
+        "routes_interval_ms": {{ int .Values.supported.routes_interval_ms }},
+        "sell_routes_interval_ms": {{ int .Values.supported.sell_routes_interval_ms }},
+        "offramp_lanes": {{ .Values.supported.offramp_lanes | toJson }}
       }
     }
