@@ -42,7 +42,7 @@ import { isKnownCrypto } from './catalog.js';
  * not a `400` for someone to act on, and it is the same judgement `onramp.ts`'s `committedTerm`
  * makes about a term the schema was supposed to have guaranteed.
  *
- * The test is "a crypto this deployment delivers", not "a crypto"; see `isKnownCrypto`.
+ * The test is "a crypto this service knows", not "a crypto"; see `isKnownCrypto`.
  */
 function assertLegs(direction: Direction, sourceCurrencyCode: string, destinationCurrencyCode: string): void {
   const sourceIsCrypto = isKnownCrypto(sourceCurrencyCode);

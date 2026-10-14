@@ -197,10 +197,7 @@ supported:
   routes_interval_ms: 7200000
   # Sell corridors, every offramp lane's included, change slower than buy ones: twice a day.
   sell_routes_interval_ms: 43200000
-  # The sell lanes behind `GET /supported/offramp*`, each refreshed from startup, in getcash's
-  # preference order: USDT on Asset Hub, under both of Meld's codes for it, then DOT the same way,
-  # then the Chainflip lanes. The `*_STATEMINT` codes are Meld's older names for Asset Hub, which
-  # some providers (Onramp Money) buy under only.
+  # Sell lanes behind `GET /supported/offramp*`, in preference order; `*_STATEMINT` are Meld's older Asset Hub codes.
   offramp_lanes:
     - { code: USDT_ASSETHUB, chain: assethub }
     - { code: USDT_STATEMINT, chain: assethub }

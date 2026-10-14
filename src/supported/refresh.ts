@@ -38,7 +38,7 @@ export interface RefreshIntervals {
   catalogMs: number;
   /** Routes, which carry the limits, for buy jobs. */
   routesMs: number;
-  /** Routes for sell jobs; absent means the same cadence as `routesMs`. */
+  /** Routes for sell jobs. */
   sellRoutesMs?: number;
 }
 
@@ -177,8 +177,7 @@ export function startSupportedRefresh(
     }
   };
 
-  // `only` narrows a pass to one direction so buy and sell can run on their own cadences; the boot
-  // pass and tests call it bare and walk every job.
+  // `only` narrows a pass to one direction so buy and sell can run on their own cadences.
   const routesPass = async (only?: Direction): Promise<void> => {
     for (const job of jobs) {
       if (signal.aborted) break;

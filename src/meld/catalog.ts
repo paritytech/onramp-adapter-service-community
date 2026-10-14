@@ -24,7 +24,7 @@ export const DESTINATIONS: readonly Destination[] = Object.freeze([
 
 /**
  * Codes a seller may sell and a buyer may never receive: Chainflip-swapped Solana/Arbitrum codes,
- * and Meld's older `*_STATEMINT` names for Asset Hub. Code, not configuration, for the T4 reason above.
+ * and Meld's older `*_STATEMINT` names for Asset Hub. Code, not configuration (T4).
  */
 export const OFFRAMP_ONLY: readonly Destination[] = Object.freeze([
   Object.freeze({ code: 'USDT_SOLANA' }),

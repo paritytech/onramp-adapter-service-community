@@ -61,8 +61,8 @@ function compareDecimal(a: string, b: string): number {
 }
 
 /**
- * Merge one country's per-lane views, given in lane order. Every lane offering a method is kept;
- * method order is first-seen, and the method's `currency` is the country fiat when given. Empty when no lane has a method.
+ * Merge one country's per-lane views (in lane order). Every lane offering a method is kept; method
+ * order is first-seen; `currency` is the country fiat when given.
  */
 export function mergeMethods(views: readonly LaneCorridor[], fiat?: string): OfframpMethod[] {
   const merged = new Map<string, OfframpMethod>();

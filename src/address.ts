@@ -76,7 +76,7 @@ export function normalizeAddress(input: string): string {
  * equal rather than looking like a changed address.
  */
 export function canonicalizeDisclosedAddress(input: string, code: string): string | undefined {
-  // Sell-only codes on other chains take that chain's format; `*_STATEMINT` is Asset Hub, so SS58 below.
+  // Sell-only codes on other chains take that chain's format; `*_STATEMINT` falls through to SS58.
   if (isOfframpOnly(code)) {
     if (code.endsWith('_ARBITRUM')) return evmAddress(input);
     if (code.endsWith('_SOLANA')) return solanaAddress(input);

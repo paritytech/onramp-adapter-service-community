@@ -547,14 +547,17 @@ const configSchema = z
           .min(60_000)
           .max(86_400_000)
           .default(2 * 3_600_000),
-        /** Routes pass for sell jobs; slower than buy, and their staleness window is three of these. */
+        /** Routes pass for sell jobs; slower than buy. Staleness window: three of these. */
         sell_routes_interval_ms: z
           .number()
           .int()
           .min(60_000)
           .max(7 * 86_400_000)
           .default(12 * 3_600_000),
-        /** Sell lanes behind `GET /supported/offramp*`, in preference order. Codes must be sellable (a typo would resolve to Bitcoin at Meld) and `chain` must match the code. */
+        /**
+         * Sell lanes behind `GET /supported/offramp*`, in preference order. Codes must be sellable
+         * (Meld resolves a typo to Bitcoin) and `chain` must match the code.
+         */
         offramp_lanes: z
           .array(z.object({ code: z.string().min(1), chain: z.string().min(1) }).strict())
           .min(1)
