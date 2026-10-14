@@ -3,7 +3,7 @@ import { encodeAddress } from '@polkadot/util-crypto';
 import { parseConfig, type Config } from '../src/config.js';
 import { TERMINAL_STATES, type FundingState } from '../src/funding/state.js';
 import { mergeAdvance } from '../src/funding/merge.js';
-import type { FundingStore, SupportedCorridorRow } from '../src/funding/store.js';
+import type { FundingStore, SupportedCorridorRow, VaultSaleRow } from '../src/funding/store.js';
 import { directionTermsViolation, type FundingRecord } from '../src/funding/types.js';
 import type { Direction, RailBuySession, RailSellSession } from '../src/rail.js';
 
@@ -283,6 +283,7 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
   // In-memory supported-corridors cache, keyed `${code}|${direction}|${country}`, mirroring the
   // real table's v7 -> v8 primary key.
   const corridors = new Map<string, SupportedCorridorRow>();
+  const vaultSales = new Map<string, VaultSaleRow>();
 
   /** The row already holding this record's (alias, product, reference), if any. */
   const held = (record: FundingRecord): FundingRecord | undefined =>
@@ -439,6 +440,18 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       [...corridors.values()]
         .filter((r) => r.destination_currency_code === code && r.direction === direction && r.updated_at >= freshAfter)
         .map((r) => structuredClone(r)),
+    upsertVaultSale: async (row: Omit<VaultSaleRow, 'created_at' | 'updated_at'>) => {
+      const previous = vaultSales.get(row.funding_request_id);
+      vaultSales.set(row.funding_request_id, {
+        ...structuredClone(row),
+        created_at: previous?.created_at ?? 1_000,
+        updated_at: 2_000,
+      });
+    },
+    readVaultSale: async (fundingRequestId: string) => {
+      const row = vaultSales.get(fundingRequestId);
+      return row === undefined ? undefined : structuredClone(row);
+    },
     close: async () => undefined,
   };
 }

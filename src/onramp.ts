@@ -28,7 +28,7 @@ import {
 } from './contract.js';
 import { TERMINAL_STATES } from './funding/state.js';
 import type { FundingRecord } from './funding/types.js';
-import type { FundingStore, StoredMethod } from './funding/store.js';
+import type { FundingStore, StoredMethod, VaultReturnStatus } from './funding/store.js';
 import type {
   Direction,
   FundingRail,
@@ -47,11 +47,22 @@ import {
 } from './offramp.js';
 import { toMinorUnits } from './money.js';
 import type { Corridor, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
+import { saleRef } from './salevault/abi.js';
+import type { SaleVaultClient } from './salevault/chain.js';
 
 /** Just the store surface onramp touches, injectable in a test. */
 export type FundingPort = Pick<
   FundingStore,
-  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel' | 'readCorridors'
+  | 'reserve'
+  | 'create'
+  | 'update'
+  | 'byAlias'
+  | 'byReference'
+  | 'list'
+  | 'cancel'
+  | 'readCorridors'
+  | 'readVaultSale'
+  | 'upsertVaultSale'
 >;
 
 /** One corridor as the bulk endpoint serves it: the stored row without the internal keys. */
@@ -60,6 +71,24 @@ export interface SupportedCorridorDto {
   name: string;
   fiat: string;
   methods: StoredMethod[];
+}
+
+/** The on-chain `Sale.Status` ordinals, as labels, indexed by the ordinal the contract returns. */
+const SALE_STATUS_LABELS = ['none', 'paid', 'held', 'returned'] as const;
+
+/** One off-ramp sale as the sale routes serve it: the on-chain state plus our own return record. */
+export interface OfframpSaleDto {
+  fundingRequestId: string;
+  chain: string;
+  contract: string;
+  ref: string;
+  status: (typeof SALE_STATUS_LABELS)[number];
+  recipient: string;
+  amount: string;
+  home: string;
+  held: string;
+  returnStatus: VaultReturnStatus;
+  returnTx: string | null;
 }
 
 /**
@@ -173,6 +202,8 @@ export class Onramp {
     // meaning unchanged. Absent, the limit gate falls back to `config.limits`, which is also the
     // degraded path when discovery is present but Meld's public catalog is briefly unreachable.
     private readonly discovery?: Discovery,
+    // The off-ramp SaleVault client, present only when `sale_vault` is configured. Absent, the sale routes 503.
+    private readonly saleVault?: SaleVaultClient,
   ) {}
 
   /** The methods + fiat min/max a corridor offers, for the buyer's (or seller's) amount screen.
@@ -234,8 +265,11 @@ export class Onramp {
     return mergeOfframpCorridors(rows);
   }
 
-  /** One country's sell methods across the configured lanes, live from discovery. */
-  async offramp(country: string): Promise<{ country: string; fiat: string; methods: OfframpMethod[] }> {
+  /** One country's sell methods across the configured lanes, live from discovery. Carries the sale
+   *  vault destination when the off-ramp lane is configured, so the app knows where its CCM delivers. */
+  async offramp(
+    country: string,
+  ): Promise<{ country: string; fiat: string; methods: OfframpMethod[]; vault?: { chain: string; chainId: number; contract: string } }> {
     if (this.discovery === undefined) {
       throw reject(
         { tag: 'Other', value: { code: 'DISCOVERY_UNAVAILABLE', message: 'Capability discovery is not configured.' } },
@@ -252,7 +286,112 @@ export class Onramp {
     );
     const fiat = views.find((v) => v.methods.length > 0)?.fiat ?? views.find((v) => v.fiat !== '')?.fiat ?? '';
     const methods = mergeMethods(views, fiat);
-    return { country, fiat, methods };
+    const vault = this.saleVaultInfo();
+    return vault === undefined ? { country, fiat, methods } : { country, fiat, methods, vault };
+  }
+
+  // The SaleVault destination the app's CCM channel must target, present only when the lane is configured.
+  private saleVaultInfo(): { chain: string; chainId: number; contract: string } | undefined {
+    const sv = this.cfg.sale_vault;
+    return sv === undefined ? undefined : { chain: sv.chain, chainId: sv.chain_id, contract: sv.contract };
+  }
+
+  // On-chain SaleVault state for one of the caller's requests, scoped by alias, read live and persisted.
+  async offrampSale(subject: Subject, id: string): Promise<OfframpSaleDto | undefined> {
+    const record = await this.funding.byAlias(id, subject.alias, subject.productId);
+    if (record === undefined) return undefined;
+    const vault = this.requireSaleVault('offrampSale');
+    const ref = saleRef(id);
+    const sale = await vault.sale(ref);
+    const prev = await this.funding.readVaultSale(id);
+    // The vault flips to Returned inside the return transaction, so a read that sees it settles our own record.
+    const returnStatus: VaultReturnStatus =
+      sale.status === 3 ? 'returned' : (prev?.return_status ?? 'none');
+    await this.funding.upsertVaultSale({
+      funding_request_id: id,
+      chain: this.cfg.sale_vault?.chain ?? '',
+      contract: vault.contractAddress,
+      ref,
+      contract_status: sale.status,
+      held: sale.held.toString(),
+      return_status: returnStatus,
+      return_tx: prev?.return_tx ?? null,
+    });
+    return this.saleDto(id, ref, sale, returnStatus, prev?.return_tx ?? null, vault.contractAddress);
+  }
+
+  // Return a held sale to its own on-chain home, funds cannot be redirected. 404 unknown, 409 if not Held.
+  async offrampReturn(subject: Subject, id: string): Promise<OfframpSaleDto | undefined> {
+    const record = await this.funding.byAlias(id, subject.alias, subject.productId);
+    if (record === undefined) return undefined;
+    const vault = this.requireSaleVault('offrampReturn');
+    const ref = saleRef(id);
+    const prev = await this.funding.readVaultSale(id);
+    // A return already in flight is not broadcast again, so a retried tap cannot sign a second one.
+    if (prev !== undefined && prev.return_status !== 'none') {
+      const current = await vault.sale(ref);
+      return this.saleDto(id, ref, current, prev.return_status, prev.return_tx, vault.contractAddress);
+    }
+    const sale = await vault.sale(ref);
+    if (sale.status !== 2) {
+      throw reject(
+        {
+          tag: 'Other',
+          value: { code: 'SALE_NOT_RETURNABLE', message: 'That sale has nothing held to return.', fundingRequestId: id },
+        },
+        `offrampReturn on sale ${id} with on-chain status ${String(sale.status)}, not Held`,
+        409,
+      );
+    }
+    // cfParameters empty: a plain xSwapToken back to Asset Hub, no CCM or broker leg.
+    const returnTx = await vault.returnHeld(ref, '0x');
+    await this.funding.upsertVaultSale({
+      funding_request_id: id,
+      chain: this.cfg.sale_vault?.chain ?? '',
+      contract: vault.contractAddress,
+      ref,
+      contract_status: sale.status,
+      held: sale.held.toString(),
+      return_status: 'returning',
+      return_tx: returnTx,
+    });
+    return this.saleDto(id, ref, sale, 'returning', returnTx, vault.contractAddress);
+  }
+
+  /** The configured SaleVault client, or a 503 that names the missing configuration rather than crashing. */
+  private requireSaleVault(where: string): SaleVaultClient {
+    if (this.saleVault === undefined) {
+      throw reject(
+        { tag: 'Other', value: { code: 'SALE_VAULT_UNAVAILABLE', message: 'The off-ramp sale vault is not configured.' } },
+        `${where}() called without a sale vault client.`,
+        503,
+      );
+    }
+    return this.saleVault;
+  }
+
+  /** One sale view, shared by the read and the return paths so the two cannot drift apart. */
+  private saleDto(
+    id: string,
+    ref: string,
+    sale: { recipient: string; amount: bigint; home: string; held: bigint; status: number },
+    returnStatus: VaultReturnStatus,
+    returnTx: string | null,
+    contract: string,
+  ): OfframpSaleDto {
+    return {
+      fundingRequestId: id,
+      chain: this.cfg.sale_vault?.chain ?? '',
+      contract,
+      ref,
+      status: SALE_STATUS_LABELS[sale.status] ?? 'none',
+      recipient: sale.recipient,
+      amount: sale.amount.toString(),
+      home: sale.home,
+      held: sale.held.toString(),
+      returnStatus,
+      returnTx,
+    };
   }
 
   /**

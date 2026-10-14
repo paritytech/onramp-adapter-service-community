@@ -1170,6 +1170,66 @@ describe('the supported-corridors cache', () => {
   });
 });
 
+describe('the off-ramp SaleVault state', () => {
+  const base = {
+    funding_request_id: 'sold-1',
+    chain: 'arbitrum-sepolia',
+    contract: '0x81949127042930F8e7A1723385A2F76213C72ee9',
+    ref: `0x${'11'.repeat(32)}`,
+    contract_status: null,
+    held: null,
+    return_status: 'none' as const,
+    return_tx: null,
+  };
+
+  it('writes a sale and reads it back, with nulls where nothing is observed yet', async () => {
+    await withStore(async (store) => {
+      await store.upsertVaultSale(base);
+      const row = await store.readVaultSale('sold-1');
+      expect(row).toMatchObject({
+        funding_request_id: 'sold-1',
+        chain: 'arbitrum-sepolia',
+        contract: base.contract,
+        ref: base.ref,
+        contract_status: null,
+        held: null,
+        return_status: 'none',
+        return_tx: null,
+      });
+      expect(typeof row?.created_at).toBe('number');
+      expect(typeof row?.updated_at).toBe('number');
+    });
+  });
+
+  it('updates the mutable fields on conflict, keeps created_at and bumps updated_at', async () => {
+    await withStore(async (store) => {
+      await store.upsertVaultSale(base);
+      const first = await store.readVaultSale('sold-1');
+
+      // A gap so the second stamp is a later millisecond.
+      await new Promise((resolve) => setTimeout(resolve, 3));
+      await store.upsertVaultSale({
+        ...base,
+        contract_status: 2,
+        held: '12.5',
+        return_status: 'returning',
+        return_tx: `0x${'ab'.repeat(32)}`,
+      });
+
+      const row = await store.readVaultSale('sold-1');
+      expect(row).toMatchObject({ contract_status: 2, held: '12.5', return_status: 'returning', return_tx: `0x${'ab'.repeat(32)}` });
+      expect(row?.created_at).toBe(first?.created_at);
+      expect(row?.updated_at).toBeGreaterThan(first?.updated_at ?? 0);
+    });
+  });
+
+  it('returns undefined for a funding request with no sale row', async () => {
+    await withStore(async (store) => {
+      expect(await store.readVaultSale('missing')).toBeUndefined();
+    });
+  });
+});
+
 describe('closing the store', () => {
   it('is idempotent, because the shutdown path that calls it promises to be', async () => {
     // SIGTERM and SIGINT are owned separately, so `close` can be asked to run twice. The second

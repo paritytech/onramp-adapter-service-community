@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { reject, transactionId, type CreateSessionResponse, type QuoteResponse } from '../src/contract.js';
 import type { FundingRecord } from '../src/funding/types.js';
 import { MeldHttpError } from '../src/meld/client.js';
-import type { SupportedCorridorDto } from '../src/onramp.js';
+import type { OfframpSaleDto, SupportedCorridorDto } from '../src/onramp.js';
 import type { OfframpCorridor } from '../src/offramp.js';
 import { Secret } from '../src/secret.js';
 import { buildServer } from '../src/server.js';
@@ -59,6 +59,8 @@ const serve = async (
     cancel: () => Promise<FundingRecord | undefined>;
     supportedCorridors: () => Promise<SupportedCorridorDto[]>;
     offrampCorridors: () => Promise<OfframpCorridor[]>;
+    offrampSale: () => Promise<OfframpSaleDto | undefined>;
+    offrampReturn: () => Promise<OfframpSaleDto | undefined>;
   }> = {},
   sink?: { write: (line: string) => void },
 ) => {
@@ -72,6 +74,8 @@ const serve = async (
     supportedCorridors: async () => [],
     offrampCorridors: async () => [],
     offramp: async (country: string) => ({ country, fiat: 'USD', methods: [] }),
+    offrampSale: async () => undefined,
+    offrampReturn: async () => undefined,
     quote: async () => ({
       // A complete breakdown, because the test below is named for it. An incomplete fixture
       // under that name is the fake and the code agreeing with each other. Amounts are decimal
@@ -159,6 +163,8 @@ describe('logging', () => {
           supportedCorridors: async () => [],
     offrampCorridors: async () => [],
     offramp: async (country: string) => ({ country, fiat: 'USD', methods: [] }),
+          offrampSale: async () => undefined,
+          offrampReturn: async () => undefined,
           quote: async () => ({
             quotes: [],
             requested: { destinationCurrencyCode: 'USDC_ASSETHUB', sourceAmount: '20', fiat: 'USD' },
@@ -611,6 +617,51 @@ describe('the transaction id', () => {
       headers: DEV_HEADERS,
     });
     expect(response.statusCode).toBe(200);
+  });
+});
+
+describe('the off-ramp sale routes', () => {
+  const dto: OfframpSaleDto = {
+    fundingRequestId: 'funding-1',
+    chain: 'arbitrum-sepolia',
+    contract: '0x81949127042930F8e7A1723385A2F76213C72ee9',
+    ref: `0x${'11'.repeat(32)}`,
+    status: 'held',
+    recipient: `0x${'22'.repeat(20)}`,
+    amount: '100',
+    home: `0x${'ab'.repeat(32)}`,
+    held: '80',
+    returnStatus: 'none',
+    returnTx: null,
+  };
+
+  it('serves the on-chain sale state for a known request', async () => {
+    const app = await serve(async () => RESPONSE, config(), { offrampSale: async () => dto });
+    const response = await app.inject({ method: 'GET', url: '/offramp/sale/funding-1', headers: DEV_HEADERS });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().sale).toMatchObject({ status: 'held', held: '80' });
+  });
+
+  it('answers 404 when the request is unknown or another caller owns it', async () => {
+    const app = await serve(async () => RESPONSE, config(), { offrampSale: async () => undefined });
+    const response = await app.inject({ method: 'GET', url: '/offramp/sale/funding-1', headers: DEV_HEADERS });
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error.value.code).toBe('NOT_FOUND');
+  });
+
+  it('returns a held sale and echoes the new state', async () => {
+    const app = await serve(async () => RESPONSE, config(), {
+      offrampReturn: async () => ({ ...dto, returnStatus: 'returning', returnTx: `0x${'cd'.repeat(32)}` }),
+    });
+    const response = await app.inject({ method: 'POST', url: '/offramp/returns/funding-1', headers: DEV_HEADERS });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().sale.returnStatus).toBe('returning');
+  });
+
+  it('answers 404 on a return for an unknown request', async () => {
+    const app = await serve(async () => RESPONSE, config(), { offrampReturn: async () => undefined });
+    const response = await app.inject({ method: 'POST', url: '/offramp/returns/funding-1', headers: DEV_HEADERS });
+    expect(response.statusCode).toBe(404);
   });
 });
 

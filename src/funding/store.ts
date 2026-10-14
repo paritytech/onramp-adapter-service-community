@@ -118,6 +118,24 @@ export interface SupportedCorridorRow {
   updated_at: number;
 }
 
+/** The return the adapter issues on a sale, its alphabet pinned by a CHECK in `schema.ts`. */
+export type VaultReturnStatus = 'none' | 'returning' | 'returned';
+
+// One off-ramp SaleVault row, keyed by the funding request. chain/contract/ref are its on-chain identity.
+// contract_status is the last-observed Sale.Status ordinal, held the last-observed held amount as a string.
+export interface VaultSaleRow {
+  funding_request_id: string;
+  chain: string;
+  contract: string;
+  ref: string;
+  contract_status: number | null;
+  held: string | null;
+  return_status: VaultReturnStatus;
+  return_tx: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
 /** The outcome of a reservation attempt. See `reserve`. */
 export type Reservation =
   /** The row belongs to this caller: nothing else held their key. */
@@ -751,6 +769,41 @@ export class FundingStore {
       [code, direction, freshAfter],
     );
     return result.rows;
+  }
+
+  // Upsert the SaleVault row for a funding request. created_at kept on conflict, mutable fields replaced, updated_at stamped.
+  async upsertVaultSale(row: Omit<VaultSaleRow, 'created_at' | 'updated_at'>): Promise<void> {
+    const now = Date.now();
+    await this.pool.query(
+      'INSERT INTO vault_sales (funding_request_id, chain, contract, ref, contract_status, held, ' +
+        'return_status, return_tx, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ' +
+        'ON CONFLICT (funding_request_id) DO UPDATE SET ' +
+        'chain = EXCLUDED.chain, contract = EXCLUDED.contract, ref = EXCLUDED.ref, ' +
+        'contract_status = EXCLUDED.contract_status, held = EXCLUDED.held, ' +
+        'return_status = EXCLUDED.return_status, return_tx = EXCLUDED.return_tx, updated_at = EXCLUDED.updated_at',
+      [
+        row.funding_request_id,
+        row.chain,
+        row.contract,
+        row.ref,
+        row.contract_status,
+        row.held,
+        row.return_status,
+        row.return_tx,
+        now,
+        now,
+      ],
+    );
+  }
+
+  // The off-ramp SaleVault row for a funding request, or undefined when none has been written yet.
+  async readVaultSale(fundingRequestId: string): Promise<VaultSaleRow | undefined> {
+    const result = await this.pool.query<VaultSaleRow>(
+      'SELECT funding_request_id, chain, contract, ref, contract_status, held, return_status, ' +
+        'return_tx, created_at, updated_at FROM vault_sales WHERE funding_request_id = $1',
+      [fundingRequestId],
+    );
+    return result.rows[0];
   }
 
   /**
