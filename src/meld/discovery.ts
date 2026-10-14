@@ -463,25 +463,17 @@ export class MeldDiscovery implements Discovery {
   }
 
   /**
-   * Sell's stand-in for a defaults endpoint that returns `404` for every country (see
-   * `defaultFiat`). `fiat-limits` is not scoped to one country -- the probe's own example, read
-   * for `countryCode=GB`, came back carrying rows for AD, AU, BH and others alongside GB -- so it
-   * is read once, unfiltered, and the whole (country -> currency) map is cached together, the same
-   * shape `countries` already caches whole.
-   *
-   * A country carries one row per payout currency a provider offers there, and most carry several:
-   * GB lists EUR before GBP, BR lists USD before BRL. The first one seen is not the country's own,
-   * and a corridor built on it quotes nothing (GB in EUR: `NO_VALID_QUOTES`; in GBP: quoted). So a
-   * country with several is given its own civil currency, the buy default, when that is among them,
-   * and the first listed otherwise.
+   * Sell's stand-in for the defaults endpoint (404 for every country): `fiat-limits` rows, read
+   * once unfiltered and cached whole. A country with several currencies gets the buy default when
+   * listed (GB lists EUR before GBP, and EUR does not quote), else the first listed. A buy-default
+   * failure throws rather than falling back, so the refresh keeps the last known fiat.
    */
   private async offrampDefaultFiat(country: string): Promise<string> {
     const hit = this.fresh(this.offrampFiatCatalog, this.ttls.defaults);
     const currencies = hit ?? (await this.readOfframpFiatCatalog());
     const listed = currencies.get(country) ?? [];
     if (listed.length <= 1) return listed[0] ?? '';
-    // The buy default failing is no reason to drop the country: the first listed still serves.
-    const local = await this.defaultFiat(country, 'buy').catch(() => '');
+    const local = await this.defaultFiat(country, 'buy');
     return listed.includes(local) ? local : (listed[0] as string);
   }
 
@@ -497,7 +489,8 @@ export class MeldDiscovery implements Discovery {
     for (const row of env.data.fiatLimits ?? []) {
       if (row.countryCode === undefined || row.countryCode === null) continue;
       const listed = catalog.get(row.countryCode) ?? [];
-      const currency = row.currencyCode ?? '';
+      const currency = row.currencyCode;
+      if (currency === undefined || currency === null || currency === '') continue;
       if (!listed.includes(currency)) listed.push(currency);
       catalog.set(row.countryCode, listed);
     }

@@ -195,10 +195,10 @@ export class Onramp {
   // fresh within the last few passes. `direction` absent means `buy`, as everywhere else on this
   // surface.
   async supportedCorridors(code: string, direction?: Direction): Promise<SupportedCorridorDto[]> {
-    resolveForDirection(code, this.direction(direction));
+    const dir = this.direction(direction);
+    resolveForDirection(code, dir);
     // The rows are written by the routes pass, so that is the cadence staleness is measured in;
     // sell jobs run it on their own, slower, interval.
-    const dir = this.direction(direction);
     const interval = dir === 'sell' ? this.cfg.supported.sell_routes_interval_ms : this.cfg.supported.routes_interval_ms;
     const freshAfter = this.clock() - interval * STALE_PASSES;
     const rows = await this.funding.readCorridors(code, dir, freshAfter);
@@ -243,11 +243,13 @@ export class Onramp {
         503,
       );
     }
-    const views: LaneCorridor[] = [];
-    for (const lane of this.cfg.supported.offramp_lanes) {
-      const c = await this.discovery.corridorForCountry(country, lane.code, 'sell');
-      views.push({ lane, country: c.country, fiat: c.fiat, methods: c.methods });
-    }
+    const discovery = this.discovery;
+    const views: LaneCorridor[] = await Promise.all(
+      this.cfg.supported.offramp_lanes.map(async (lane) => {
+        const c = await discovery.corridorForCountry(country, lane.code, 'sell');
+        return { lane, country: c.country, fiat: c.fiat, methods: c.methods };
+      }),
+    );
     const fiat = views.find((v) => v.methods.length > 0)?.fiat ?? views.find((v) => v.fiat !== '')?.fiat ?? '';
     const methods = mergeMethods(views, fiat);
     return { country, fiat, methods };

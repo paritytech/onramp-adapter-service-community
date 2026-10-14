@@ -3,7 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { Refusal } from '../../src/contract.js';
 import {
   DESTINATIONS,
-  isDeliveredCrypto,
+  chainOf,
+  isKnownCrypto,
   isOfframpOnly,
   isSellable,
   OFFRAMP_ONLY,
@@ -67,7 +68,7 @@ describe('sell-only codes', () => {
       expect(resolveSellCode(code)).toEqual({ code });
       expect(isOfframpOnly(code)).toBe(true);
       expect(isSellable(code)).toBe(true);
-      expect(isDeliveredCrypto(code)).toBe(true);
+      expect(isKnownCrypto(code)).toBe(true);
     }
   });
 
@@ -78,6 +79,15 @@ describe('sell-only codes', () => {
     expect(isSellable('USDC_ETHEREUM')).toBe(false);
     expect(isOfframpOnly('DOT_ASSETHUB')).toBe(false);
     expect(resolveForDirection('DOT_ASSETHUB', 'sell')).toEqual({ code: 'DOT_ASSETHUB' });
-    expect(isDeliveredCrypto('BTC')).toBe(false);
+    expect(isKnownCrypto('BTC')).toBe(false);
+  });
+});
+
+describe('chainOf', () => {
+  it('derives the chain from the code, and is undefined for an unknown suffix', () => {
+    expect(chainOf('DOT_STATEMINT')).toBe('assethub');
+    expect(chainOf('USDC_SOLANA')).toBe('solana');
+    expect(chainOf('USDC_ARBITRUM')).toBe('arbitrum');
+    expect(chainOf('BTC')).toBeUndefined();
   });
 });

@@ -17,7 +17,7 @@ import { z } from 'zod';
 import { upstreamUnavailable } from '../contract.js';
 import type { Direction } from '../rail.js';
 import type { Secret } from '../secret.js';
-import { isDeliveredCrypto } from './catalog.js';
+import { isKnownCrypto } from './catalog.js';
 
 /**
  * Refuse to send a request whose legs contradict its direction.
@@ -42,10 +42,10 @@ import { isDeliveredCrypto } from './catalog.js';
  * not a `400` for someone to act on, and it is the same judgement `onramp.ts`'s `committedTerm`
  * makes about a term the schema was supposed to have guaranteed.
  *
- * The test is "a crypto this deployment delivers", not "a crypto"; see `isDeliveredCrypto`.
+ * The test is "a crypto this deployment delivers", not "a crypto"; see `isKnownCrypto`.
  */
 function assertLegs(direction: Direction, sourceCurrencyCode: string, destinationCurrencyCode: string): void {
-  const sourceIsCrypto = isDeliveredCrypto(sourceCurrencyCode);
+  const sourceIsCrypto = isKnownCrypto(sourceCurrencyCode);
   if (sourceIsCrypto !== (direction === 'sell')) {
     throw new Error(
       `Meld ${direction}: sourceCurrencyCode "${sourceCurrencyCode}" ${sourceIsCrypto ? 'is' : 'is not'} a ` +
@@ -55,7 +55,7 @@ function assertLegs(direction: Direction, sourceCurrencyCode: string, destinatio
   // The other way to build a request Meld cannot read as intended, and one the check above
   // cannot see, since it only looks at the source. Exactly one leg is crypto in either
   // direction; two of a kind is a mapping that dropped a leg rather than crossing it.
-  if (isDeliveredCrypto(destinationCurrencyCode) === sourceIsCrypto) {
+  if (isKnownCrypto(destinationCurrencyCode) === sourceIsCrypto) {
     throw new Error(
       `Meld ${direction}: both legs name the same kind of currency ` +
         `("${sourceCurrencyCode}" -> "${destinationCurrencyCode}"). One leg is fiat in either direction.`,

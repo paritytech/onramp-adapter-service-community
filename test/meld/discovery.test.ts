@@ -299,6 +299,22 @@ describe('MeldDiscovery.defaultFiat for sell: the fiat-limits substitute', () =>
     expect(calls).toBe(2);
   });
 
+  it('skips rows with a null or empty currency', async () => {
+    const d = new MeldDiscovery(
+      async () => ({
+        fiatLimits: [
+          { countryCode: 'GB', currencyCode: null },
+          { countryCode: 'GB', currencyCode: '' },
+          { countryCode: 'GB', currencyCode: 'GBP' },
+          { countryCode: 'ZZ', currencyCode: null },
+        ],
+      }),
+      ttls(3_600_000),
+    );
+    expect(await d.defaultFiat('GB', 'sell')).toBe('GBP');
+    expect(await d.defaultFiat('ZZ', 'sell')).toBe('');
+  });
+
   it('throws on an unparseable fiat-limits body, and caches nothing', async () => {
     let calls = 0;
     const d = new MeldDiscovery(async () => {
@@ -767,13 +783,13 @@ describe('MeldDiscovery.defaultFiat for sell: a country listing several currenci
     expect(await d.defaultFiat('BR', 'sell')).toBe('USD');
   });
 
-  it('falls back to the first listed when the buy default cannot be read', async () => {
+  it('throws, not pinning the first listed, when the buy default cannot be read', async () => {
     const d = new MeldDiscovery(
       several(() => {
         throw new Error('meld down');
       }),
       ttls(3_600_000),
     );
-    expect(await d.defaultFiat('GB', 'sell')).toBe('EUR');
+    await expect(d.defaultFiat('GB', 'sell')).rejects.toThrow('meld down');
   });
 });

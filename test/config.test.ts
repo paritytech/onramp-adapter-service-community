@@ -888,6 +888,11 @@ describe('parseConfig', () => {
       expect(lanes([{ code: 'USDT_SOLANA', chain: 'solana', extra: 1 }])).toThrow();
       expect(lanes([{ code: 'USDT_SOLANA' }])).toThrow();
     });
+
+    it('refuses a chain that does not match the code', () => {
+      expect(lanes([{ code: 'USDC_SOLANA', chain: 'assethub' }])).toThrow(/not "assethub"/);
+      expect(lanes([{ code: 'DOT_STATEMINT', chain: 'solana' }])).toThrow(/chain/);
+    });
   });
 
   it('gives each Meld endpoint its own cache lifetime, on the scale its data moves', () => {

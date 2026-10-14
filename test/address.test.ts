@@ -73,7 +73,7 @@ describe('canonicalizeDisclosedAddress for a sell-only code', () => {
 
   it('leaves SS58 handling for Asset Hub codes as it was', () => {
     expect(canonicalizeDisclosedAddress(ALICE_PREFIX_42, 'DOT_ASSETHUB')).toBe(ALICE_PREFIX_0);
-    expect(canonicalizeDisclosedAddress(ALICE_PREFIX_42)).toBe(ALICE_PREFIX_0);
+    expect(canonicalizeDisclosedAddress(ALICE_PREFIX_42, 'DOT_ASSETHUB')).toBe(ALICE_PREFIX_0);
     expect(canonicalizeDisclosedAddress(SOLANA, 'DOT_ASSETHUB')).toBeUndefined();
   });
 });
