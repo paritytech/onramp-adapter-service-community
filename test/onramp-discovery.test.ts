@@ -93,8 +93,15 @@ function fakeDiscovery(opts: {
   };
 }
 
-const build = (discovery: Discovery | undefined) =>
-  new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'funding-1', discovery);
+const build = (discovery: Discovery | undefined, cfg = config()) =>
+  new Onramp(cfg, { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'funding-1', discovery);
+
+/** The test config with `codes` as its offramp lanes. */
+const withLanes = (...codes: string[]) => {
+  const c = config();
+  const chain = (code: string) => (code.endsWith('_SOLANA') ? 'solana' : code.endsWith('_ARBITRUM') ? 'arbitrum' : 'assethub');
+  return { ...c, supported: { ...c.supported, offramp_lanes: codes.map((code) => ({ code, chain: chain(code) })) } };
+};
 
 const quoteBody = (over: Record<string, unknown> = {}) => ({
   country: 'US',
@@ -421,7 +428,7 @@ describe('sell-only codes across the sell paths', () => {
   });
 
   it('quotes and opens a sell session, and refuses both on a buy', async () => {
-    const svc = build(fakeDiscovery({ methods: [method({ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' })] }));
+    const svc = build(fakeDiscovery({ methods: [method({ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' })] }), withLanes('DOT_ASSETHUB', SOL_CODE));
     expect((await svc.quote(asQuote(sellQuoteBody({ destinationCurrencyCode: SOL_CODE })))).quotes).toHaveLength(1);
     const opened = await svc.createSession(SUBJECT, asSession(sellRequest({ destinationCurrencyCode: SOL_CODE })), 'req-sol');
     expect(opened.pinned.cryptoAmount).toBe('12.3456789012');
@@ -430,6 +437,17 @@ describe('sell-only codes across the sell paths', () => {
     expect(
       (await refusalOf(() => svc.createSession(SUBJECT, asSession(sessionBody({ destinationCurrencyCode: SOL_CODE })), 'req-sol-buy'))).tag,
     ).toBe('WrongAssetOrChain');
+  });
+
+  it('refuses a sell of a code that is not a configured offramp lane, before any rail call', async () => {
+    const discovery = fakeDiscovery({ methods: [method({ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' })] });
+    const svc = build(discovery, withLanes('DOT_ASSETHUB'));
+    expect(await refusalOf(() => svc.quote(asQuote(sellQuoteBody({ destinationCurrencyCode: SOL_CODE }))))).toEqual({ tag: 'RegionUnavailable' });
+    expect(
+      await refusalOf(() => svc.createSession(SUBJECT, asSession(sellRequest({ destinationCurrencyCode: SOL_CODE })), 'req-sol-off')),
+    ).toEqual({ tag: 'RegionUnavailable' });
+    // The lane still listed sells as before.
+    expect((await svc.quote(asQuote(sellQuoteBody()))).quotes).toHaveLength(1);
   });
 
   it('still refuses a walletAddress on a sell session', async () => {

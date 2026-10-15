@@ -198,13 +198,16 @@ supported:
   # Sell corridors, every offramp lane's included, change slower than buy ones: twice a day.
   sell_routes_interval_ms: 43200000
   # Sell lanes behind `GET /supported/offramp*`, in preference order; `*_STATEMINT` are Meld's older Asset Hub codes.
+  # The deployment's switch for off-ramp routes: a sell of a code not listed is refused, and a
+  # country no listed lane routes has no payout method. The direct Asset Hub sales by default; the
+  # Chainflip swap lanes are opt-in, uncomment them (the SPA's VITE_OFFRAMP_LANES must list them too).
   offramp_lanes:
     - { code: USDT_ASSETHUB, chain: assethub }
     - { code: USDT_STATEMINT, chain: assethub }
     - { code: DOT_ASSETHUB, chain: assethub }
     - { code: DOT_STATEMINT, chain: assethub }
-    - { code: USDC_ARBITRUM, chain: arbitrum }
-    - { code: USDC_SOLANA, chain: solana }
+    # - { code: USDC_ARBITRUM, chain: arbitrum }
+    # - { code: USDC_SOLANA, chain: solana }
 
 # The background worker that advances in-flight funding requests.
 worker:

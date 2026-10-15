@@ -1159,8 +1159,16 @@ export class Onramp {
    * absent or unreachable discovery leaves a sell ungated on both `/quote` and `/session`, which is
    * the pre-existing behaviour (a sell skipped this whole gate before direction-aware discovery
    * existed to check it) rather than a new hole opened by this function.
+   *
+   * One check does not need discovery: the code must be one of `supported.offramp_lanes`. That
+   * list is the deployment's switch for which off-ramp routes exist (the Chainflip swap lanes
+   * among them), so a code taken out of it is refused here as `RegionUnavailable`, before any
+   * rail call, whatever a client asks for.
    */
   private async sellCorridorCheck(code: string, currency: string, country: string, method: string): Promise<void> {
+    if (!this.cfg.supported.offramp_lanes.some((lane) => lane.code === code)) {
+      throw reject({ tag: 'RegionUnavailable' }, `${code} is not a configured offramp lane.`);
+    }
     if (this.discovery === undefined) return;
     await this.corridorMethod(this.discovery, code, currency, country, method, 'sell');
   }
