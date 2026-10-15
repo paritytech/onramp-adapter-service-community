@@ -529,6 +529,32 @@ describe('Onramp offramp discovery', () => {
     });
   });
 
+  it('counts a lane whose route read fails as having no methods, so the others still answer', async () => {
+    const discovery: Discovery = {
+      ...fakeDiscovery(),
+      corridorForCountry: async (country, code) => {
+        if (code === 'DOT_ASSETHUB') throw new Error('meld 429');
+        return { country, fiat: 'USD', crypto: code, methods: [method({ providers: ['X'] })] };
+      },
+    };
+    const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', discovery);
+    const out = await svc.offramp('US');
+    expect(out.fiat).toBe('USD');
+    expect(out.methods).toHaveLength(1);
+    expect(out.methods[0]?.lanes).toEqual([{ ...lanes[1], min: '5', max: '3000', currency: 'USD' }]);
+  });
+
+  it('rethrows the first failure when every lane fails, rather than answering empty', async () => {
+    const discovery: Discovery = {
+      ...fakeDiscovery(),
+      corridorForCountry: async (_country, code) => {
+        throw new Error(`meld down: ${code}`);
+      },
+    };
+    const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', discovery);
+    await expect(svc.offramp('US')).rejects.toThrow('meld down: DOT_ASSETHUB');
+  });
+
   it('reports a fiat with empty methods when nothing routes, and empty fiat when none is known', async () => {
     const mk = (fiat: string): Discovery => ({
       ...fakeDiscovery(),

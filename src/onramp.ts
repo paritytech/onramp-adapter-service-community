@@ -244,12 +244,23 @@ export class Onramp {
       );
     }
     const discovery = this.discovery;
+    // Each lane reads its own route, so one lane's failure (a 429 or a 5xx from Meld) counts as that
+    // lane having no methods rather than failing the whole answer while the others replied. When
+    // every lane fails there is no answer to give, and an empty-but-OK reply would read as "this
+    // country has no sell routes" during a total Meld outage, so the first failure is rethrown.
+    const failures: unknown[] = [];
     const views: LaneCorridor[] = await Promise.all(
-      this.cfg.supported.offramp_lanes.map(async (lane) => {
-        const c = await discovery.corridorForCountry(country, lane.code, 'sell');
-        return { lane, country: c.country, fiat: c.fiat, methods: c.methods };
+      this.cfg.supported.offramp_lanes.map(async (lane): Promise<LaneCorridor> => {
+        try {
+          const c = await discovery.corridorForCountry(country, lane.code, 'sell');
+          return { lane, country: c.country, fiat: c.fiat, methods: c.methods };
+        } catch (error) {
+          failures.push(error);
+          return { lane, country, fiat: '', methods: [] };
+        }
       }),
     );
+    if (failures.length > 0 && failures.length === views.length) throw failures[0];
     const fiat = views.find((v) => v.methods.length > 0)?.fiat ?? views.find((v) => v.fiat !== '')?.fiat ?? '';
     const methods = mergeMethods(views, fiat);
     return { country, fiat, methods };
