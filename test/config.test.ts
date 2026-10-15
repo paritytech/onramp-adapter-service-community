@@ -197,6 +197,25 @@ describe('parseConfig', () => {
     ).toThrow(/sale_vault.*plaintext/s);
   });
 
+  it('refuses the zero address as the sale_vault contract', () => {
+    // The zero address is the unset sentinel, and a swap delivered there burns the funds.
+    expect(() =>
+      parseConfig(
+        rawConfig({
+          sale_vault: {
+            chain: 'arbitrum-sepolia',
+            chain_id: 421614,
+            contract: `0x${'0'.repeat(40)}`,
+            rpc_url: 'http://127.0.0.1:1',
+            operator_key: { mode: 'env', var: 'OP_KEY' },
+            min_return: '1',
+            dust_target: '5',
+          },
+        }),
+      ),
+    ).toThrow(/sale_vault.contract.*zero address/s);
+  });
+
   it('refuses a port that could never appear in an Origin header', () => {
     // `:99999` passed the old `\d{1,5}` group, and `URL.parse` returns null for it, so it
     // validated at boot and could never match anything, which is the class the `:443` refinement

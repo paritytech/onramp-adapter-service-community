@@ -805,6 +805,15 @@ const configSchema = z
       });
     }
 
+    // The zero address is a sentinel for an unset contract, and a swap delivered there burns the funds.
+    if (cfg.sale_vault !== undefined && cfg.sale_vault.contract.toLowerCase() === `0x${'0'.repeat(40)}`) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['sale_vault', 'contract'],
+        message: 'sale_vault.contract must be the deployed SaleVault address, not the zero address.',
+      });
+    }
+
     // The store link carries every funding row (aliases, wallet addresses, amounts) and the
     // password that opens it. Plaintext across a VPC is refused for the same reason
     // `people_rpc_url` refuses `ws://`.

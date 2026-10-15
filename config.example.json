@@ -116,5 +116,14 @@
       { "code": "USDC_ARBITRUM", "chain": "arbitrum" },
       { "code": "USDC_SOLANA", "chain": "solana" }
     ]
+  },
+  "sale_vault": {
+    "chain": "arbitrum-sepolia",
+    "chain_id": 421614,
+    "contract": "0x81949127042930F8e7A1723385A2F76213C72ee9",
+    "rpc_url": "https://sepolia-rollup.arbitrum.io/rpc",
+    "operator_key": { "mode": "file", "path": "/run/secrets/sale-vault-operator-key" },
+    "min_return": "1",
+    "dust_target": "5"
   }
 }
