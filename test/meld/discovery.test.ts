@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { MeldHttpError } from '../../src/meld/client.js';
 import { MeldDiscovery, toCorridorDto } from '../../src/meld/discovery.js';
 
 /** One lifetime for all three endpoints, which is what these tests assumed before the split. */
@@ -791,5 +792,25 @@ describe('MeldDiscovery.defaultFiat for sell: a country listing several currenci
       ttls(3_600_000),
     );
     await expect(d.defaultFiat('GB', 'sell')).rejects.toThrow('meld down');
+  });
+
+  it('falls back to the first listed when Meld has no buy default for the country (404)', async () => {
+    const d = new MeldDiscovery(
+      several(() => {
+        throw new MeldHttpError(404);
+      }),
+      ttls(3_600_000),
+    );
+    expect(await d.defaultFiat('BR', 'sell')).toBe('USD');
+  });
+
+  it('still throws on a 5xx from the buy default, so the refresh keeps the last known entry', async () => {
+    const d = new MeldDiscovery(
+      several(() => {
+        throw new MeldHttpError(503);
+      }),
+      ttls(3_600_000),
+    );
+    await expect(d.defaultFiat('BR', 'sell')).rejects.toBeInstanceOf(MeldHttpError);
   });
 });
