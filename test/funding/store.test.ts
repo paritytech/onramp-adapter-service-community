@@ -101,7 +101,7 @@ describe('FundingStore', () => {
       await withStore(async (store) => {
         await store.create(sell({ status: 'session_opened' }));
         await store.update('funding-1', 'session_opened', 1_700_000_000_100, {
-          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
         });
 
         expect(await store.cancel('alias-abc', 'app.dot', 'funding-1', 1_700_000_000_200)).toBeUndefined();
@@ -938,7 +938,7 @@ describe('FundingStore', () => {
       await withStore(async (store) => {
         await store.create(inFlight);
         const updated = await store.update('funding-1', 'transaction_seen', 1_700_000_000_150, {
-          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
         });
 
         expect(updated?.status).toBe('transaction_seen');
@@ -948,7 +948,7 @@ describe('FundingStore', () => {
         const persisted = await store.byId('funding-1');
         expect(persisted?.deposit_address).toBe(ALICE);
         expect(persisted?.deposit_amount).toBe('12.3456789012');
-        expect(persisted?.deposit_currency).toBe('DOT_ASSETHUB');
+        expect(persisted?.deposit_currency).toBe('DOT');
         expect(persisted?.deposit_observed_at).toBe(1_700_000_000_150);
       });
     });
@@ -961,11 +961,11 @@ describe('FundingStore', () => {
       await withStore(async (store) => {
         await store.create(sell({ status: 'transaction_seen' }));
         await store.update('funding-1', 'transaction_seen', 1_700_000_000_100, {
-          deposit: { address: ALICE, amount: '1.0', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '1.0', currency: 'DOT' },
         });
 
         const conflicted = await store.update('funding-1', 'settled', 1_700_000_000_200, {
-          deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' },
+          deposit: { address: BOB, amount: '1.0', currency: 'DOT' },
         });
 
         // The unrelated, legitimate transition still applied.
@@ -982,10 +982,10 @@ describe('FundingStore', () => {
       await withStore(async (store) => {
         await store.create(sell({ status: 'transaction_seen' }));
         await store.update('funding-1', 'transaction_seen', 1_700_000_000_100, {
-          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
         });
         await store.update('funding-1', 'transaction_seen', 1_700_000_000_200, {
-          deposit: { address: ALICE, amount: '12.3', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3', currency: 'DOT' },
         });
 
         const persisted = await store.byId('funding-1');
@@ -1093,12 +1093,12 @@ describe('the supported-corridors cache', () => {
 
   it('inserts a corridor and reads it back, scoped by crypto and name-sorted', async () => {
     await withStore(async (store) => {
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'US', name: 'United States', fiat: 'USD', methods: [pix] });
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'US', name: 'United States', fiat: 'USD', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
       // A different crypto's row must not leak into this read.
-      await store.upsertCorridor({ destination_currency_code: 'USDC_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'USDC_DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
 
-      const rows = await store.readCorridors('DOT_ASSETHUB', 'buy');
+      const rows = await store.readCorridors('DOT', 'buy');
       expect(rows.map((r) => r.country)).toEqual(['BR', 'US']);
       expect(rows[0]).toMatchObject({ country: 'BR', direction: 'buy', name: 'Brazil', fiat: 'BRL', methods: [pix] });
       expect(typeof rows[0]?.updated_at).toBe('number');
@@ -1107,14 +1107,14 @@ describe('the supported-corridors cache', () => {
 
   it('updates an existing row on conflict rather than duplicating it, and refreshes updated_at', async () => {
     await withStore(async (store) => {
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
-      const first = (await store.readCorridors('DOT_ASSETHUB', 'buy'))[0]?.updated_at ?? 0;
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      const first = (await store.readCorridors('DOT', 'buy'))[0]?.updated_at ?? 0;
 
       // A gap so the second stamp is a later millisecond; drop `updated_at = EXCLUDED.updated_at`
       // from the ON CONFLICT SET and this row's timestamp would stay frozen at `first`.
       await new Promise((resolve) => setTimeout(resolve, 3));
       await store.upsertCorridor({
-        destination_currency_code: 'DOT_ASSETHUB',
+        destination_currency_code: 'DOT',
         direction: 'buy',
         country: 'BR',
         name: 'Brasil',
@@ -1122,7 +1122,7 @@ describe('the supported-corridors cache', () => {
         methods: [{ ...pix, min: '20' }],
       });
 
-      const rows = await store.readCorridors('DOT_ASSETHUB', 'buy');
+      const rows = await store.readCorridors('DOT', 'buy');
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({ name: 'Brasil', methods: [{ ...pix, min: '20' }] });
       expect(rows[0]?.updated_at).toBeGreaterThan(first);
@@ -1131,17 +1131,17 @@ describe('the supported-corridors cache', () => {
 
   it('returns an empty list for a crypto with no cached corridors', async () => {
     await withStore(async (store) => {
-      expect(await store.readCorridors('DOT_ASSETHUB', 'buy')).toEqual([]);
+      expect(await store.readCorridors('DOT', 'buy')).toEqual([]);
     });
   });
 
   it('hides rows older than the freshness cutoff, so a stale cache ages out', async () => {
     await withStore(async (store) => {
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
 
       // A cutoff in the past keeps the just-written row; one in the future hides it.
-      expect((await store.readCorridors('DOT_ASSETHUB', 'buy', 0)).map((r) => r.country)).toEqual(['BR']);
-      expect(await store.readCorridors('DOT_ASSETHUB', 'buy', Date.now() + 60_000)).toEqual([]);
+      expect((await store.readCorridors('DOT', 'buy', 0)).map((r) => r.country)).toEqual(['BR']);
+      expect(await store.readCorridors('DOT', 'buy', Date.now() + 60_000)).toEqual([]);
     });
   });
 
@@ -1152,11 +1152,11 @@ describe('the supported-corridors cache', () => {
   it('keeps a buy and a sell corridor for the same (crypto, country) as separate rows', async () => {
     await withStore(async (store) => {
       const payout = { paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' as const, min: '7', max: '18550', currency: 'GBP' };
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [pix] });
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'sell', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [payout] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'sell', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [payout] });
 
-      const buy = await store.readCorridors('DOT_ASSETHUB', 'buy');
-      const sell = await store.readCorridors('DOT_ASSETHUB', 'sell');
+      const buy = await store.readCorridors('DOT', 'buy');
+      const sell = await store.readCorridors('DOT', 'sell');
       expect(buy).toHaveLength(1);
       expect(sell).toHaveLength(1);
       expect(buy[0]?.methods).toEqual([pix]);
@@ -1164,8 +1164,145 @@ describe('the supported-corridors cache', () => {
 
       // Re-upserting the buy row must not touch the sell row (and vice versa): distinct conflict
       // targets, not a shared one that happens to look right today.
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [{ ...pix, min: '99' }] });
-      expect((await store.readCorridors('DOT_ASSETHUB', 'sell'))[0]?.methods).toEqual([payout]);
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [{ ...pix, min: '99' }] });
+      expect((await store.readCorridors('DOT', 'sell'))[0]?.methods).toEqual([payout]);
+    });
+  });
+});
+
+describe('the off-ramp SaleVault state', () => {
+  const base = {
+    funding_request_id: 'sold-1',
+    chain: 'arbitrum-sepolia',
+    contract: '0x81949127042930F8e7A1723385A2F76213C72ee9',
+    ref: `0x${'11'.repeat(32)}`,
+    contract_status: null,
+    held: null,
+    return_status: 'none' as const,
+    return_tx: null,
+  };
+
+  it('writes a sale and reads it back, with nulls where nothing is observed yet', async () => {
+    await withStore(async (store) => {
+      await store.upsertVaultSale(base);
+      const row = await store.readVaultSale('sold-1');
+      expect(row).toMatchObject({
+        funding_request_id: 'sold-1',
+        chain: 'arbitrum-sepolia',
+        contract: base.contract,
+        ref: base.ref,
+        contract_status: null,
+        held: null,
+        return_status: 'none',
+        return_tx: null,
+      });
+      expect(typeof row?.created_at).toBe('number');
+      expect(typeof row?.updated_at).toBe('number');
+    });
+  });
+
+  it('updates the mutable fields on conflict, keeps created_at and bumps updated_at', async () => {
+    await withStore(async (store) => {
+      await store.upsertVaultSale(base);
+      const first = await store.readVaultSale('sold-1');
+
+      // A gap so the second stamp is a later millisecond.
+      await new Promise((resolve) => setTimeout(resolve, 3));
+      await store.upsertVaultSale({
+        ...base,
+        contract_status: 2,
+        held: '12.5',
+        return_status: 'returning',
+        return_tx: `0x${'ab'.repeat(32)}`,
+      });
+
+      const row = await store.readVaultSale('sold-1');
+      expect(row).toMatchObject({ contract_status: 2, held: '12.5', return_status: 'returning', return_tx: `0x${'ab'.repeat(32)}` });
+      expect(row?.created_at).toBe(first?.created_at);
+      expect(row?.updated_at).toBeGreaterThan(first?.updated_at ?? 0);
+    });
+  });
+
+  it('returns undefined for a funding request with no sale row', async () => {
+    await withStore(async (store) => {
+      expect(await store.readVaultSale('missing')).toBeUndefined();
+    });
+  });
+
+  const claim = {
+    chain: 'arbitrum-sepolia',
+    contract: base.contract,
+    ref: base.ref,
+    contract_status: 2,
+    held: '80',
+  };
+
+  it('claimVaultReturn claims once, refuses a second, and setVaultReturnTx records the hash', async () => {
+    await withStore(async (store) => {
+      expect(await store.claimVaultReturn({ funding_request_id: 'sold-c', ...claim })).toBe(true);
+      // A second claim while it is returning is refused, so no second broadcast signs the same nonce.
+      expect(await store.claimVaultReturn({ funding_request_id: 'sold-c', ...claim })).toBe(false);
+      await store.setVaultReturnTx('sold-c', `0x${'ab'.repeat(32)}`);
+      expect(await store.readVaultSale('sold-c')).toMatchObject({
+        return_status: 'returning',
+        return_tx: `0x${'ab'.repeat(32)}`,
+        contract_status: 2,
+        held: '80',
+      });
+    });
+  });
+
+  it('releaseVaultReturn frees a claim that never broadcast, and leaves one with a tx alone', async () => {
+    await withStore(async (store) => {
+      await store.claimVaultReturn({ funding_request_id: 'sold-r', ...claim });
+      await store.releaseVaultReturn('sold-r');
+      expect((await store.readVaultSale('sold-r'))?.return_status).toBe('none');
+      // Re-claimable after a release, since nothing ever left.
+      expect(await store.claimVaultReturn({ funding_request_id: 'sold-r', ...claim })).toBe(true);
+      // Once a tx is on the row, release does not undo it.
+      await store.setVaultReturnTx('sold-r', `0x${'cd'.repeat(32)}`);
+      await store.releaseVaultReturn('sold-r');
+      expect((await store.readVaultSale('sold-r'))?.return_status).toBe('returning');
+    });
+  });
+
+  it('resetStaleVaultReturn frees a broadcast return only when the tx still matches', async () => {
+    await withStore(async (store) => {
+      await store.claimVaultReturn({ funding_request_id: 'sold-s', ...claim });
+      await store.setVaultReturnTx('sold-s', `0x${'cd'.repeat(32)}`);
+      // A reset keyed to a different tx (a stale poll that lost the race) leaves the row alone.
+      await store.resetStaleVaultReturn('sold-s', `0x${'99'.repeat(32)}`);
+      expect((await store.readVaultSale('sold-s'))?.return_status).toBe('returning');
+      // Keyed to the real tx, it frees the row so the return can be re-sent.
+      await store.resetStaleVaultReturn('sold-s', `0x${'cd'.repeat(32)}`);
+      expect((await store.readVaultSale('sold-s'))?.return_status).toBe('none');
+      expect(await store.claimVaultReturn({ funding_request_id: 'sold-s', ...claim })).toBe(true);
+    });
+  });
+
+  it('touchVaultSale refreshes read fields, settles returned, and never lowers return_status', async () => {
+    await withStore(async (store) => {
+      await store.touchVaultSale({ funding_request_id: 'sold-t', ...claim, returned: false });
+      expect((await store.readVaultSale('sold-t'))?.return_status).toBe('none');
+      await store.claimVaultReturn({ funding_request_id: 'sold-t', ...claim });
+      await store.setVaultReturnTx('sold-t', `0x${'ef'.repeat(32)}`);
+      // A poll that has not seen the chain settle must not write 'returning' back to 'none'.
+      await store.touchVaultSale({ funding_request_id: 'sold-t', ...claim, returned: false });
+      expect((await store.readVaultSale('sold-t'))?.return_status).toBe('returning');
+      // Once the chain shows Returned, the row settles, keeping the recorded tx.
+      await store.touchVaultSale({ funding_request_id: 'sold-t', ...claim, contract_status: 3, held: '0', returned: true });
+      expect(await store.readVaultSale('sold-t')).toMatchObject({
+        return_status: 'returned',
+        return_tx: `0x${'ef'.repeat(32)}`,
+        contract_status: 3,
+      });
+    });
+  });
+
+  it('touchVaultSale writes a fresh row straight to returned when the chain already shows it', async () => {
+    await withStore(async (store) => {
+      await store.touchVaultSale({ funding_request_id: 'sold-tr', ...claim, contract_status: 3, held: '0', returned: true });
+      expect((await store.readVaultSale('sold-tr'))?.return_status).toBe('returned');
     });
   });
 });

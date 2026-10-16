@@ -3,7 +3,7 @@ import { encodeAddress } from '@polkadot/util-crypto';
 import { parseConfig, type Config } from '../src/config.js';
 import { TERMINAL_STATES, type FundingState } from '../src/funding/state.js';
 import { mergeAdvance } from '../src/funding/merge.js';
-import type { FundingStore, SupportedCorridorRow } from '../src/funding/store.js';
+import type { FundingStore, SupportedCorridorRow, VaultSaleRow } from '../src/funding/store.js';
 import { directionTermsViolation, type FundingRecord } from '../src/funding/types.js';
 import type { Direction, RailBuySession, RailSellSession } from '../src/rail.js';
 
@@ -28,6 +28,20 @@ export const SHORT_KEY_ADDRESS = encodeAddress(ALICE_PUBKEY.slice(0, 8), 0);
 /** A different person entirely, not another spelling of ALICE (which normalises back to it). */
 export const BOB = encodeAddress(new Uint8Array(32).fill(2), 0);
 
+/**
+ * What the test deployment calls each asset: Meld's current codes, every asset named. The setup file
+ * (`test/setup.ts`) installs the same table as the active catalog, so a suite that never boots the
+ * service still resolves codes the way a booted one does.
+ */
+export const TEST_ASSETS = {
+  'dot@assethub': 'DOT',
+  'usdt@assethub': 'USDT_DOT',
+  'usdc@assethub': 'USDC_DOT',
+  'usdt@solana': 'USDT_SOLANA',
+  'usdc@solana': 'USDC_SOLANA',
+  'usdc@arbitrum': 'USDC_ARBITRUM',
+} as const;
+
 export const rawConfig = (overrides: Record<string, unknown> = {}) => ({
   // `development`, because the base fixture pairs this with `auth.mode: 'insecure_dev'` and that
   // mode is refused anywhere else: it gives every caller of a product the same alias, so a
@@ -41,7 +55,7 @@ export const rawConfig = (overrides: Record<string, unknown> = {}) => ({
     api_version: '2025-01-01',
     timeout_ms: 8000,
     boot_probe: {
-      destination_code: 'USDC_ASSETHUB',
+      asset: 'usdc@assethub',
       source_amount: '20',
       source_currency: 'USD',
       country_code: 'US',
@@ -49,7 +63,8 @@ export const rawConfig = (overrides: Record<string, unknown> = {}) => ({
     },
   },
   auth: { mode: 'insecure_dev' },
-  limits: [{ code: 'USDC_ASSETHUB', min: '10.00', max: '2000.00', currency: 'USD' }],
+  assets: TEST_ASSETS,
+  limits: [{ asset: 'usdc@assethub', min: '10.00', max: '2000.00', currency: 'USD' }],
   allowed_products: ['app.dot'],
   cors: { allowed_origins: ['https://app.example'] },
   rate_limit: { per_person_max: 1000, per_address_max: 1000, window_seconds: 60 },
@@ -110,7 +125,7 @@ export const config = (overrides: Record<string, unknown> = {}): Config =>
 /** The body the consumer frontend said it would send, field for field. */
 export const createRequest = (overrides: Record<string, unknown> = {}) => ({
   idempotencyKey: 'idem-0000-0001',
-  destinationCurrencyCode: 'USDC_ASSETHUB',
+  destinationCurrencyCode: 'USDC_DOT',
   walletAddress: ALICE,
   sourceAmount: '25.00',
   fiat: 'USD',
@@ -132,7 +147,7 @@ export const createRequest = (overrides: Record<string, unknown> = {}) => ({
 export const sellRequest = (overrides: Record<string, unknown> = {}) => ({
   idempotencyKey: 'idem-sell-0001',
   direction: 'sell',
-  destinationCurrencyCode: 'DOT_ASSETHUB',
+  destinationCurrencyCode: 'DOT',
   cryptoAmount: '12.3456789012',
   fiat: 'GBP',
   country: 'GB',
@@ -144,7 +159,7 @@ export const sellRequest = (overrides: Record<string, unknown> = {}) => ({
 /** The sell counterpart of `quoteRequestBody`. */
 export const sellQuoteBody = (overrides: Record<string, unknown> = {}) => ({
   direction: 'sell',
-  destinationCurrencyCode: 'DOT_ASSETHUB',
+  destinationCurrencyCode: 'DOT',
   cryptoAmount: '12.3456789012',
   fiat: 'GBP',
   country: 'GB',
@@ -161,7 +176,7 @@ export const sellQuoteBody = (overrides: Record<string, unknown> = {}) => ({
  */
 export const railSessionInput = (overrides: Partial<RailBuySession> = {}): RailBuySession => ({
   direction: 'buy',
-  destinationCode: 'USDC_ASSETHUB',
+  destinationCode: 'USDC_DOT',
   walletAddress: '5x...',
   sourceAmount: '25.00',
   fiat: 'USD',
@@ -180,7 +195,7 @@ export const railSessionInput = (overrides: Partial<RailBuySession> = {}): RailB
  */
 export const railSellSessionInput = (overrides: Partial<RailSellSession> = {}): RailSellSession => ({
   direction: 'sell',
-  destinationCode: 'DOT_ASSETHUB',
+  destinationCode: 'DOT',
   cryptoAmount: '12.3456789012',
   fiat: 'GBP',
   countryCode: 'GB',
@@ -192,7 +207,7 @@ export const railSellSessionInput = (overrides: Partial<RailSellSession> = {}): 
 });
 
 export const quoteRequestBody = (overrides: Record<string, unknown> = {}) => ({
-  destinationCurrencyCode: 'USDC_ASSETHUB',
+  destinationCurrencyCode: 'USDC_DOT',
   sourceAmount: '20',
   fiat: 'USD',
   country: 'US',
@@ -213,7 +228,7 @@ export const fundingRecord = (overrides: Partial<FundingRecord> = {}): FundingRe
   // A buy, like every row written before the direction column existed and like every fixture
   // that does not say otherwise. `sellRecord` below is the other one.
   direction: 'buy',
-  destination_currency_code: 'USDC_ASSETHUB',
+  destination_currency_code: 'USDC_DOT',
   wallet_address: '0x...',
   source_amount: '25.00',
   crypto_amount: undefined,
@@ -252,7 +267,7 @@ export const fundingRecord = (overrides: Partial<FundingRecord> = {}): FundingRe
 export const sellRecord = (overrides: Partial<FundingRecord> = {}): FundingRecord =>
   fundingRecord({
     direction: 'sell',
-    destination_currency_code: 'DOT_ASSETHUB',
+    destination_currency_code: 'DOT',
     wallet_address: undefined,
     source_amount: undefined,
     // Ten fraction digits: DOT's own precision, and more than `MINOR_UNIT_DECIMAL` can express.
@@ -283,6 +298,7 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
   // In-memory supported-corridors cache, keyed `${code}|${direction}|${country}`, mirroring the
   // real table's v7 -> v8 primary key.
   const corridors = new Map<string, SupportedCorridorRow>();
+  const vaultSales = new Map<string, VaultSaleRow>();
 
   /** The row already holding this record's (alias, product, reference), if any. */
   const held = (record: FundingRecord): FundingRecord | undefined =>
@@ -439,6 +455,74 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       [...corridors.values()]
         .filter((r) => r.destination_currency_code === code && r.direction === direction && r.updated_at >= freshAfter)
         .map((r) => structuredClone(r)),
+    upsertVaultSale: async (row: Omit<VaultSaleRow, 'created_at' | 'updated_at'>) => {
+      const previous = vaultSales.get(row.funding_request_id);
+      vaultSales.set(row.funding_request_id, {
+        ...structuredClone(row),
+        created_at: previous?.created_at ?? 1_000,
+        updated_at: 2_000,
+      });
+    },
+    readVaultSale: async (fundingRequestId: string) => {
+      const row = vaultSales.get(fundingRequestId);
+      return row === undefined ? undefined : structuredClone(row);
+    },
+    claimVaultReturn: async (row: {
+      funding_request_id: string;
+      chain: string;
+      contract: string;
+      ref: string;
+      contract_status: number;
+      held: string;
+    }) => {
+      const previous = vaultSales.get(row.funding_request_id);
+      if (previous !== undefined && previous.return_status !== 'none') return false;
+      vaultSales.set(row.funding_request_id, {
+        ...structuredClone(row),
+        return_status: 'returning',
+        return_tx: null,
+        created_at: previous?.created_at ?? 1_000,
+        updated_at: 2_000,
+      });
+      return true;
+    },
+    setVaultReturnTx: async (fundingRequestId: string, returnTx: string) => {
+      const row = vaultSales.get(fundingRequestId);
+      if (row !== undefined && row.return_status === 'returning') {
+        vaultSales.set(fundingRequestId, { ...row, return_tx: returnTx, updated_at: 2_000 });
+      }
+    },
+    releaseVaultReturn: async (fundingRequestId: string) => {
+      const row = vaultSales.get(fundingRequestId);
+      if (row !== undefined && row.return_status === 'returning' && row.return_tx === null) {
+        vaultSales.set(fundingRequestId, { ...row, return_status: 'none', return_tx: null, updated_at: 2_000 });
+      }
+    },
+    resetStaleVaultReturn: async (fundingRequestId: string, staleTx: string) => {
+      const row = vaultSales.get(fundingRequestId);
+      if (row !== undefined && row.return_status === 'returning' && row.return_tx === staleTx) {
+        vaultSales.set(fundingRequestId, { ...row, return_status: 'none', return_tx: null, updated_at: 2_000 });
+      }
+    },
+    touchVaultSale: async (row: {
+      funding_request_id: string;
+      chain: string;
+      contract: string;
+      ref: string;
+      contract_status: number;
+      held: string;
+      returned: boolean;
+    }) => {
+      const { returned, ...fields } = row;
+      const previous = vaultSales.get(row.funding_request_id);
+      vaultSales.set(row.funding_request_id, {
+        ...structuredClone(fields),
+        return_status: returned ? 'returned' : (previous?.return_status ?? 'none'),
+        return_tx: previous?.return_tx ?? null,
+        created_at: previous?.created_at ?? 1_000,
+        updated_at: 2_000,
+      });
+    },
     close: async () => undefined,
   };
 }

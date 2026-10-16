@@ -3,8 +3,9 @@
 Every route, its request and response shape, and the errors it returns.
 See [README.md](../README.md) for what the service is and how to run it.
 
-Nine routes are authenticated by the short-lived JWT the handshake mints: `POST /quote`,
-`POST /session`, `GET /supported`, `GET /supported/countries`, `GET /supported/corridors`,
+Twelve routes are authenticated by the short-lived JWT the handshake mints: `GET /assets`,
+`POST /quote`, `POST /session`, `GET /supported`, `GET /supported/countries`,
+`GET /supported/corridors`, `GET /supported/offramp`, `GET /supported/offramp/corridors`,
 `GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel` and `GET /transaction/:id`. The
 unauthenticated remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
 
@@ -12,11 +13,14 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | --- | --- | --- |
 | `POST /api/v1/auth/challenge` | none | Mints a fresh 56-byte blind challenge. No auth, rate-limited. |
 | `POST /api/v1/auth/redeem` | none | Exchanges a challenge + ring-VRF proof for a short-lived JWT. Verifies against the People-chain commitment. |
+| `GET /assets` | none | What Meld currently calls each asset this deployment serves, from the `assets` config: `{assets: [{asset, code, chain, deliverable}]}`. Clients send these codes rather than keeping their own copy. See "`GET /assets`" below. |
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
-| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{code, chain, min, max, currency}]}]}]}`. No query parameters (strict). See "Offramp lanes" below. |
-| `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
+| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{asset, code, chain, min, max, currency}]}]}]}`. When a SaleVault lane is configured, a `vault: {chain, chainId, contract}` field names the deployment-wide SaleVault the app's Chainflip CCM must deliver to. No query parameters (strict). See "Offramp lanes" and "The off-ramp SaleVault" below. |
+| `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`, plus the same `vault` field when configured. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
+| `GET /offramp/sale/:fundingRequestId` | none (reads the SaleVault on chain) | The on-chain SaleVault state of one of the caller's off-ramp sales, scoped by alias: `{sale: {fundingRequestId, chain, contract, ref, status, recipient, amount, home, held, returnStatus, returnTx}}`. `status` is the contract's `Sale.Status` (`none`/`paid`/`held`/`returned`); `returnStatus` is this service's own record of a return (`none`/`returning`/`returned`). 404 for an unknown or another caller's request; 503 when no vault is configured or the chain is unreachable. See "The off-ramp SaleVault" below. |
+| `POST /offramp/returns/:fundingRequestId` | none (operator-signs the SaleVault) | Return a held sale to its own Asset Hub home, operator-signed. Empty body. The return is claimed before it is broadcast, so a retried or concurrent tap cannot sign two; 409 only when the sale has nothing held to return (not in the `held` state), 404 for an unknown request, 503 when no vault is configured or the chain is unreachable. The response is the same `{sale: {...}}` shape as the read. |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
 | `GET /transaction/:id` | `GET /payments/transactions/{id}` | Status, projected onto the five fields this service declares. |
@@ -59,7 +63,8 @@ endpoint for `CRYPTO_OFFRAMP` (it answers `404` for every country); the substitu
 
 Field names are the caller's, which are mostly Meld's: `country`, `fiat`,
 `destinationCurrencyCode`, `sourceAmount`, `paymentMethodType`. Operator configuration stays
-snake_case.
+snake_case. `fiat` is three letters, any case, and is refused `400` when it names a crypto code
+this deployment serves: Meld's code for DOT is `DOT`, the same shape as a fiat.
 
 ## `direction`: buy and sell
 
@@ -207,7 +212,7 @@ applies. Each new disagreement is still logged loudly, at its own level. A malfo
 (`sourceCurrencyCode`, `sourceAmount`, `cryptoDetails.destinationWalletAddress`), but no sell has
 yet been driven through this account far enough to produce a transaction: the sandbox never
 settles a sell, since no provider receives crypto there, and the account this was built against
-was reported to off-ramp no `*_ASSETHUB` asset. Unverified in practice: the status at which Meld
+was reported to off-ramp no Asset Hub asset (under the `*_ASSETHUB` codes Meld used then). Unverified in practice: the status at which Meld
 first discloses an address, the exact asset code it puts on a sell's transaction, and whether any
 asset this service delivers needs the `memo` field, which no observed schema has a candidate for.
 
@@ -244,9 +249,10 @@ verified live against the sandbox:
   `currencyCode` per country and is read and cached the same way the country list is.
 
 **What discovery being live does not mean: that a sell corridor is actually deliverable.** The
-account this service was built against has exactly one onboarded provider, and that provider
-off-ramps no `*_ASSETHUB` asset at all -- a keyed sell-corridor read for DOT_ASSETHUB, USDC_ASSETHUB
-or USDT_ASSETHUB in any country returns `methods: []` on this account, correctly. That is Meld's
+account this service was built against had exactly one onboarded provider, and that provider
+off-ramped no Asset Hub asset at all -- a keyed sell-corridor read for DOT_ASSETHUB, USDC_ASSETHUB
+or USDT_ASSETHUB (Meld's codes at the time, since renamed `DOT`, `USDC_DOT` and `USDT_DOT`) in any
+country returned `methods: []` on this account, correctly. That is Meld's
 account-level truth, surfaced honestly, not a defect in this service: `GET /supported` and
 `GET /supported/corridors` answering "not offered" for a corridor genuinely not offered is the
 whole point of asking live rather than hand-maintaining a list. The day a provider that off-ramps
@@ -254,8 +260,8 @@ these assets is onboarded, the same code starts returning it, without a deploy.
 
 ### Offramp lanes
 
-A sell can settle through more than one crypto lane (USDT or DOT on Asset Hub, each under either of
-Meld's codes for it, or a stablecoin sold after a Chainflip swap). `supported.offramp_lanes` lists the lanes in preference order, and the two
+A sell can settle through more than one crypto lane (USDT or DOT on Asset Hub, or a stablecoin sold
+after a Chainflip swap). `supported.offramp_lanes` lists the lanes in preference order, and the two
 `/supported/offramp*` routes answer "what can a seller in this country use" without the caller
 picking a lane first.
 
@@ -266,7 +272,9 @@ payout method.
 
 Merge rule, per country: the set of countries is the union across lanes. For each
 `paymentMethodType`, the method lists **every** configured lane (in configuration order) whose corridor
-offers it, as `lanes: [{code, chain, min, max, currency}]`, each with that lane's own limits. The method's
+offers it, as `lanes: [{asset, code, chain, min, max, currency}]`, each with that lane's own limits. `asset`
+is this service's own name for the lane's asset, which a Meld rename does not change; `code` is what a quote
+or session for the lane must send. The method's
 own `min` is the smallest lane `min` and its `max` the largest lane `max` (compared as exact decimals, the
 original text is returned), and its `currency` is the country fiat. `name` and `fiat` come from the first
 lane that has the country. Methods are ordered by first sight across lanes in configuration order. A client
@@ -280,8 +288,8 @@ picks a lane from `lanes` and checks the amount against that lane's limits.
   "max": "5000",
   "currency": "BRL",
   "lanes": [
-    { "code": "DOT_ASSETHUB", "chain": "assethub", "min": "10", "max": "3000", "currency": "BRL" },
-    { "code": "USDC_ARBITRUM", "chain": "arbitrum", "min": "5", "max": "5000", "currency": "BRL" }
+    { "asset": "dot@assethub", "code": "DOT", "chain": "assethub", "min": "10", "max": "3000", "currency": "BRL" },
+    { "asset": "usdc@arbitrum", "code": "USDC_ARBITRUM", "chain": "arbitrum", "min": "5", "max": "5000", "currency": "BRL" }
   ]
 }
 ```
@@ -290,14 +298,54 @@ picks a lane from `lanes` and checks the amount against that lane's limits.
 rule as `GET /supported/corridors` except that sell rows age out after three *sell* routes passes (`supported.sell_routes_interval_ms`, 12h by default) rather than three buy passes; `GET /supported/offramp` asks Meld live, one `corridorForCountry`
 per lane in sell direction.
 
-The sell-only codes `USDT_SOLANA`, `USDC_SOLANA`, `USDC_ARBITRUM`, `DOT_STATEMINT` and `USDT_STATEMINT` are
-accepted wherever `direction=sell` is, and refused with `WrongAssetOrChain` on every buy path. `DOT_STATEMINT`
-and `USDT_STATEMINT` are Meld's older codes for DOT and USDT on Polkadot Asset Hub (Statemint was Asset Hub's
-name), which some providers, Onramp Money among them, buy only under those codes. The disclosed deposit address is validated per code: a
-`*_SOLANA` sell discloses a base58 32-byte address, stored and compared exactly as given (case-sensitive), not
-SS58-normalised; `USDC_ARBITRUM` discloses an EVM address (`0x` plus 40 hex), stored lowercased so comparisons are
-case-insensitive; the `*_STATEMINT` codes disclose an Asset Hub address, SS58-normalised like `DOT_ASSETHUB`. Anything
+The sell-only codes (`USDT_SOLANA`, `USDC_SOLANA`, `USDC_ARBITRUM` in the shipped config) are
+accepted wherever `direction=sell` is, and refused with `WrongAssetOrChain` on every buy path. The disclosed
+deposit address is validated per chain: a Solana sell discloses a base58 32-byte address, stored and compared
+exactly as given (case-sensitive), not SS58-normalised; an Arbitrum sell discloses an EVM address (`0x` plus 40
+hex), stored lowercased so comparisons are case-insensitive; an Asset Hub sell discloses an SS58 address,
+normalised to the Polkadot prefix. Anything
 else for that code is recorded as malformed and never disclosed.
+
+### The off-ramp SaleVault
+
+On the Arbitrum lane a sale's Chainflip egress can be delivered to a **SaleVault** contract rather than
+straight to the provider, so the exact promised amount is paid and any shortfall is held for the seller
+rather than lost. The vault is deployment-wide: `GET /supported/offramp*` carry its `{chain, chainId,
+contract}` as a `vault` field, which the app reads to target its CCM. The CCM message the app encodes
+(`ref`, provider recipient, committed amount, the seller's Asset Hub home) is 128 bytes; `ref =
+keccak256(fundingRequestId)`.
+
+Two routes read and drive the vault for one of the caller's own sales, keyed by `fundingRequestId`:
+
+- `GET /offramp/sale/:fundingRequestId` reads the on-chain `Sale` (status, recipient, amount, home,
+  held) and this service's return record, persisting the refreshed state. A return that was broadcast
+  but never mined is released on a read once it is stale, so a fresh return can re-send it.
+- `POST /offramp/returns/:fundingRequestId` returns a **held** sale to its Asset Hub home, signed by the
+  operator. The return is claimed in the store before it is broadcast, so a retried or concurrent tap
+  cannot sign two; a broadcast that never leaves releases the claim so it can be re-sent. `held` funds
+  can only ever leave to the sale's own home, never to the operator.
+
+## `GET /assets`
+
+What Meld calls each asset this deployment serves, by this service's own name for it. Behind the
+caller gate like every route but `/health`. Static for the life of the process, so a client reads
+it once and sends the `code` it names on `/quote`, `/session` and the `/supported*` routes, rather
+than keeping its own copy of Meld's codes: when Meld renames one, the operator edits `assets` and
+no client release follows.
+
+```json
+{
+  "assets": [
+    { "asset": "dot@assethub", "code": "DOT", "chain": "assethub", "deliverable": true },
+    { "asset": "usdt@assethub", "code": "USDT_DOT", "chain": "assethub", "deliverable": true },
+    { "asset": "usdc@assethub", "code": "USDC_DOT", "chain": "assethub", "deliverable": true },
+    { "asset": "usdc@solana", "code": "USDC_SOLANA", "chain": "solana", "deliverable": false },
+    { "asset": "usdc@arbitrum", "code": "USDC_ARBITRUM", "chain": "arbitrum", "deliverable": false }
+  ]
+}
+```
+
+`deliverable` is whether a buyer may receive it; the others are sold only.
 
 ## `POST /quote`
 
@@ -315,7 +363,7 @@ pay. Omitting it is a local `MALFORMED_REQUEST`, before any upstream call.
 {
   "country": "US",
   "fiat": "USD",
-  "destinationCurrencyCode": "USDC_ASSETHUB",
+  "destinationCurrencyCode": "USDC_DOT",
   "sourceAmount": "21.47",
   "paymentMethodType": "CREDIT_DEBIT_CARD"
 }
@@ -332,7 +380,7 @@ breakdown is complete:
       "sourceAmount": "21.47",
       "sourceCurrencyCode": "USD",
       "destinationAmount": "20",
-      "destinationCurrencyCode": "USDC_ASSETHUB",
+      "destinationCurrencyCode": "USDC_DOT",
       "exchangeRate": "0.9315",
       "totalFee": "1.47",
       "transactionFee": "0.19",
@@ -340,7 +388,7 @@ breakdown is complete:
       "partnerFee": "1.00"
     }
   ],
-  "requested": { "destinationCurrencyCode": "USDC_ASSETHUB", "sourceAmount": "21.47", "fiat": "USD" }
+  "requested": { "destinationCurrencyCode": "USDC_DOT", "sourceAmount": "21.47", "fiat": "USD" }
 }
 ```
 
@@ -352,7 +400,7 @@ first.
 ```json
 {
   "quotes": [ /* ... */ ],
-  "requested": { "destinationCurrencyCode": "DOT_ASSETHUB", "cryptoAmount": "12.3456789012", "fiat": "GBP" }
+  "requested": { "destinationCurrencyCode": "DOT", "cryptoAmount": "12.3456789012", "fiat": "GBP" }
 }
 ```
 
@@ -401,7 +449,7 @@ guarantee about what the provider's widget will allow.
   "idempotencyKey": "<caller-prefix>-<uuid-v4>",
   "country": "US",
   "fiat": "USD",
-  "destinationCurrencyCode": "USDC_ASSETHUB",
+  "destinationCurrencyCode": "USDC_DOT",
   "sourceAmount": "21.47",
   "walletAddress": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
   "paymentMethodType": "CREDIT_DEBIT_CARD",
@@ -419,7 +467,7 @@ and no `walletAddress`:
   "direction": "sell",
   "country": "GB",
   "fiat": "GBP",
-  "destinationCurrencyCode": "DOT_ASSETHUB",
+  "destinationCurrencyCode": "DOT",
   "cryptoAmount": "12.3456789012",
   "paymentMethodType": "PAYOUT_TO_BANK",
   "serviceProvider": "TRANSAK"
@@ -452,7 +500,7 @@ Rejected as `REDIRECT_NOT_ALLOWED`, locally.
   "widgetUrl": "https://meldcrypto.com/?sessionId=...",
   "expiresAt": 1800000000000,
   "pinned": {
-    "destinationCurrencyCode": "USDC_ASSETHUB",
+    "destinationCurrencyCode": "USDC_DOT",
     "walletAddress": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
     "sourceAmount": "21.47",
     "fiat": "USD",
@@ -561,7 +609,7 @@ for another caller's alike.
   "direction": "buy",
   "status": "transaction_seen",
   "providerStatus": "PENDING",
-  "destinationCurrencyCode": "USDC_ASSETHUB",
+  "destinationCurrencyCode": "USDC_DOT",
   "walletAddress": "15oF4u...",
   "sourceAmount": "21.47",
   "fiat": "USD",
@@ -585,7 +633,7 @@ On a sell whose provider has disclosed a deposit address, the object also carrie
 "deposit": {
   "address": "1CounterpartyDepositAddressXXXXXXXXXXXXXXXXX",
   "amount": "12.3456789012",
-  "currency": "DOT_ASSETHUB",
+  "currency": "DOT",
   "observedAt": 1800000000200
 }
 ```
@@ -668,7 +716,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 
 | Status | Tag | Meaning |
 | --- | --- | --- |
-| 400 | `WrongAssetOrChain` | Destination code is not one this service delivers. |
+| 400 | `WrongAssetOrChain` | A code `assets` does not name (including one Meld has since renamed), or a sell-only code on a buy. |
 | 400 | `Other{ REDIRECT_NOT_ALLOWED }` | The redirect target's origin is not in `cors.allowed_origins`. |
 | 409 | `Other{ IDEMPOTENCY_KEY_REUSED }` | The idempotency key was first used for a different request. Mint a new key. |
 | 409 | `Other{ REQUEST_SURFACE_EXPIRED }` | The rail's payment page for that request has closed, but the request has **not** concluded: a transfer may still be in flight, and the worker is still watching. Do **not** start another: poll `GET /funding/:id` and act on the conclusion when it arrives. Cleared by the worker concluding the row, so a stopped worker leaves a caller on this code indefinitely. |

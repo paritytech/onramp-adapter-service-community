@@ -42,6 +42,7 @@ import {
   type ErrorResponse,
   fundingListQuery,
 } from './contract.js';
+import { AssetCatalog } from './meld/catalog.js';
 import { toCorridorDto } from './meld/discovery.js';
 import { toFundingRequestDto } from './funding/types.js';
 import { MeldHttpError } from './meld/client.js';
@@ -58,6 +59,8 @@ type OnrampPort = Pick<
   | 'supportedCorridors'
   | 'offrampCorridors'
   | 'offramp'
+  | 'offrampSale'
+  | 'offrampReturn'
   | 'transaction'
   | 'cancel'
   | 'get'
@@ -291,6 +294,14 @@ export async function buildServer(
    */
   app.get('/health', { logLevel: 'silent' }, async () => ({ status: 'ok' }));
 
+  // What Meld calls each asset this deployment serves, by this service's own name for it. A client
+  // sends these codes on /quote and /session rather than writing its own copy of them, so a Meld
+  // rename is one config edit here and no client release. Static for the life of the process.
+  const assets = new AssetCatalog(cfg.assets)
+    .all()
+    .map(({ asset, code, chain, deliverable }) => ({ asset, code, chain, deliverable }));
+  app.get('/assets', asCaller, async () => ({ assets }));
+
   /** Spends a Meld call but no money, which is why boot uses it as the credential probe. */
   app.post('/quote', asCaller, async (request, reply) =>
     reply.send(await onramp.quote(parse(quoteRequest, request.body))),
@@ -324,7 +335,12 @@ export async function buildServer(
   // Sell corridors merged across the configured offramp lanes: cached (all countries) and live (one).
   app.get<{ Querystring: Record<string, string> }>('/supported/offramp/corridors', asCaller, async (request, reply) => {
     parse(supportedOfframpCorridorsQuery, request.query);
-    return reply.send({ corridors: await onramp.offrampCorridors() });
+    // The SaleVault is deployment-wide, so it rides the bulk read the app loads once for the picker.
+    const vault = cfg.sale_vault;
+    return reply.send({
+      corridors: await onramp.offrampCorridors(),
+      ...(vault ? { vault: { chain: vault.chain, chainId: vault.chain_id, contract: vault.contract } } : {}),
+    });
   });
   app.get<{ Querystring: Record<string, string> }>('/supported/offramp', asCaller, async (request, reply) => {
     const q = parse(supportedOfframpQuery, request.query);
@@ -436,6 +452,32 @@ export async function buildServer(
       } satisfies ErrorResponse);
     }
     return reply.send({ funding: toFundingRequestDto(record, Date.now()) });
+  });
+
+  // The on-chain SaleVault state for one of the caller's off-ramp requests. 404 for unknown or
+  // another caller's, the same answer the funding read gives, so this is not an existence oracle.
+  app.get<{ Params: { id: string } }>('/offramp/sale/:id', asCaller, async (request, reply) => {
+    const subject = gate.subjectOf(request);
+    const id = parse(transactionId, request.params.id);
+    const sale = await onramp.offrampSale(subject, id);
+    if (sale === undefined) {
+      const missing = notFound('No such funding request.');
+      return reply.code(missing.status).send({ error: missing.failure, request_id: request.id } satisfies ErrorResponse);
+    }
+    return reply.send({ sale });
+  });
+
+  // Return a held off-ramp sale to its own Asset Hub home. Body-less, like cancel. 404 for unknown
+  // or another caller's, 409 (thrown in onramp) when the sale has nothing held to return.
+  app.post<{ Params: { id: string } }>('/offramp/returns/:id', asCaller, async (request, reply) => {
+    const subject = gate.subjectOf(request);
+    const id = parse(transactionId, request.params.id);
+    const sale = await onramp.offrampReturn(subject, id);
+    if (sale === undefined) {
+      const missing = notFound('No such funding request.');
+      return reply.code(missing.status).send({ error: missing.failure, request_id: request.id } satisfies ErrorResponse);
+    }
+    return reply.send({ sale });
   });
 
   /**

@@ -316,8 +316,10 @@ describe('creating a fresh schema', () => {
  * migration chain tries to add a column that already exists. That is the intended failure: it
  * says the fixture was not kept up, rather than passing while proving less.
  */
-const atV5 = (sql: string): string =>
-  sql
+const atV5 = (sql: string): string => {
+  // vault_sales is new at v9, so a v5 database does not have it. The v8 -> v9 migration adds it.
+  if (sql.startsWith('CREATE TABLE IF NOT EXISTS vault_sales')) return '';
+  return sql
     .replace(" direction TEXT NOT NULL DEFAULT 'buy',", '')
     .replace(' crypto_amount TEXT,', '')
     .replace(' deposit_address TEXT,', '')
@@ -344,19 +346,20 @@ const atV5 = (sql: string): string =>
       ", direction, country), CONSTRAINT supported_corridors_direction_known CHECK (direction IN ('buy', 'sell'))",
       ', country)',
     );
+};
 
 describe('the v5 -> v6 migration', () => {
   /** A v5 database with one buy row in it, stamped at 5. Returns the schema name. */
   const atVersionFive = async (): Promise<string> => {
     const schema = await createSchema();
-    for (const sql of freshSchema().map(atV5)) await raw(schema, sql);
+    for (const sql of freshSchema().map(atV5)) if (sql) await raw(schema, sql);
     await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
     await raw(schema, 'INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)');
     await raw(
       schema,
       'INSERT INTO funding_requests (id, subject_alias, product_id, destination_currency_code, ' +
         'wallet_address, source_amount, fiat, payment_method_type, rail, status, status_history, ' +
-        "created_at, updated_at) VALUES ('bought', 'alias-abc', 'app.dot', 'USDC_ASSETHUB', " +
+        "created_at, updated_at) VALUES ('bought', 'alias-abc', 'app.dot', 'USDC_DOT', " +
         "'0x0', '25.00', 'USD', 'CREDIT_DEBIT_CARD', 'meld', 'settled', '[]', 1, 1)",
     );
     return schema;
@@ -378,8 +381,8 @@ describe('the v5 -> v6 migration', () => {
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Not just [5, 6]: `openIn` always walks to `SCHEMA_VERSION`, so a database stamped at 5
-      // takes the v6, v7 and v8 steps in one boot.
-      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8]);
+      // takes the v6, v7, v8 and v9 steps in one boot.
+      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8, 9]);
     } finally {
       await dropSchema(schema);
     }
@@ -437,6 +440,21 @@ describe('a fresh database and a migrated one are the same database', () => {
         "WHERE conrelid = 'supported_corridors'::regclass ORDER BY conname",
     );
 
+  /** As above, for `vault_sales`: new at v9, created fresh on one path and by the v8 -> v9 migration on the other. */
+  const vaultSalesColumnsOf = async (schema: string) =>
+    query(
+      schema,
+      'SELECT ordinal_position, column_name, data_type, is_nullable, column_default ' +
+        "FROM information_schema.columns WHERE table_name = 'vault_sales' " +
+        'AND table_schema = current_schema() ORDER BY ordinal_position',
+    );
+  const vaultSalesConstraintsOf = async (schema: string) =>
+    query(
+      schema,
+      'SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint ' +
+        "WHERE conrelid = 'vault_sales'::regclass ORDER BY conname",
+    );
+
   it('agrees column for column and constraint for constraint', async () => {
     // This is the test that was missing, and the omission shipped a real divergence:
     // `crypto_amount` was hand-placed after `source_amount` in `freshSchema()` while the
@@ -456,7 +474,7 @@ describe('a fresh database and a migrated one are the same database', () => {
     try {
       await (await openIn(fresh)).close();
 
-      for (const sql of freshSchema().map(atV5)) await raw(migrated, sql);
+      for (const sql of freshSchema().map(atV5)) if (sql) await raw(migrated, sql);
       await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
       await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)');
       await (await openIn(migrated)).close();
@@ -469,6 +487,10 @@ describe('a fresh database and a migrated one are the same database', () => {
       // that only proves the table exists.
       expect(await corridorColumnsOf(migrated)).toEqual(await corridorColumnsOf(fresh));
       expect(await corridorConstraintsOf(migrated)).toEqual(await corridorConstraintsOf(fresh));
+      // vault_sales is new at v9, created by the migration on the migrated path (the v5 fixture
+      // strips it) and by freshSchema on the fresh one, so the two CREATEs must agree here too.
+      expect(await vaultSalesColumnsOf(migrated)).toEqual(await vaultSalesColumnsOf(fresh));
+      expect(await vaultSalesConstraintsOf(migrated)).toEqual(await vaultSalesConstraintsOf(fresh));
     } finally {
       await dropSchema(fresh);
       await dropSchema(migrated);
@@ -538,7 +560,7 @@ describe('the per-direction term constraints', () => {
       const sold = await store.byId('sold');
       expect(sold).toMatchObject({
         direction: 'sell',
-        destination_currency_code: 'DOT_ASSETHUB',
+        destination_currency_code: 'DOT',
         crypto_amount: '12.3456789012',
         fiat: 'GBP',
       });
@@ -575,16 +597,17 @@ describe('the real migration chain', () => {
             .replace(' reason TEXT,', '')
             .replace(' cancelled_at BIGINT,', ''),
         )
-        // Everything v6 adds, stripped by the same helper the v5 fixture uses.
+        // Everything v6 adds, stripped by the same helper the v5 fixture uses (which also drops
+        // the v9 vault_sales table, leaving an empty string this loop skips).
         .map(atV5);
-      for (const sql of v1) await raw(schema, sql);
+      for (const sql of v1) if (sql) await raw(schema, sql);
       await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
       await raw(schema, 'INSERT INTO schema_migrations (version, applied_at) VALUES (1, 0)');
       await raw(
         schema,
         "INSERT INTO funding_requests (id, subject_alias, product_id, destination_currency_code, " +
           "wallet_address, source_amount, fiat, payment_method_type, rail, status, status_history, " +
-          "created_at, updated_at) VALUES ('older', 'alias-abc', 'app.dot', 'USDC_ASSETHUB', " +
+          "created_at, updated_at) VALUES ('older', 'alias-abc', 'app.dot', 'USDC_DOT', " +
           "'0x0', '25.00', 'USD', 'CREDIT_DEBIT_CARD', 'meld', 'settled', '[]', 1, 1)",
       );
 
@@ -612,26 +635,26 @@ describe('the real migration chain', () => {
       // v5's table is reachable through the store, not just present: the upsert and read prove the
       // migration landed somewhere the code can use.
       await store.upsertCorridor({
-        destination_currency_code: 'DOT_ASSETHUB',
+        destination_currency_code: 'DOT',
         direction: 'buy',
         country: 'BR',
         name: 'Brazil',
         fiat: 'BRL',
         methods: [{ paymentMethodType: 'PIX', category: 'bank', min: '10', max: '5000', currency: 'BRL' }],
       });
-      expect((await store.readCorridors('DOT_ASSETHUB', 'buy')).map((c) => c.country)).toEqual(['BR']);
+      expect((await store.readCorridors('DOT', 'buy')).map((c) => c.country)).toEqual(['BR']);
       // v8: a sell corridor for the same (crypto, country) lands beside the buy row rather than
       // over it -- the migration's whole point.
       await store.upsertCorridor({
-        destination_currency_code: 'DOT_ASSETHUB',
+        destination_currency_code: 'DOT',
         direction: 'sell',
         country: 'BR',
         name: 'Brazil',
         fiat: 'BRL',
         methods: [{ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank', min: '5', max: '1000', currency: 'BRL' }],
       });
-      expect((await store.readCorridors('DOT_ASSETHUB', 'buy')).map((c) => c.country)).toEqual(['BR']);
-      expect((await store.readCorridors('DOT_ASSETHUB', 'sell')).map((c) => c.country)).toEqual(['BR']);
+      expect((await store.readCorridors('DOT', 'buy')).map((c) => c.country)).toEqual(['BR']);
+      expect((await store.readCorridors('DOT', 'sell')).map((c) => c.country)).toEqual(['BR']);
       // v6: the pre-existing row is a buy, because it could not have been anything else, and the
       // column's DEFAULT is what says so without a backfill.
       expect(carried?.direction).toBe('buy');
@@ -647,10 +670,10 @@ describe('the real migration chain', () => {
       // v7: a deposit-address disclosure conflict is reachable through `store.update`, not just
       // present in the table, and the accepted address is left exactly as it was.
       await store.update('sold', 'transaction_seen', 2, {
-        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
       });
       await store.update('sold', 'transaction_seen', 3, {
-        deposit: { address: BOB, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        deposit: { address: BOB, amount: '12.3456789012', currency: 'DOT' },
       });
       const disputed = await store.byId('sold');
       expect(disputed?.deposit_address).toBe(ALICE);
@@ -661,7 +684,7 @@ describe('the real migration chain', () => {
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     } finally {
       await dropSchema(schema);
     }

@@ -2,10 +2,11 @@ import { describe, expect, it } from 'vitest';
 
 import { mergeMethods, mergeOfframpCorridors, type LaneCorridor, type OfframpLane } from '../src/offramp.js';
 import { refreshJobs } from '../src/startup.js';
+import { TEST_ASSETS } from './fixtures.js';
 
-const DOT: OfframpLane = { code: 'DOT_ASSETHUB', chain: 'assethub' };
-const SOL: OfframpLane = { code: 'USDT_SOLANA', chain: 'solana' };
-const ARB: OfframpLane = { code: 'USDC_ARBITRUM', chain: 'arbitrum' };
+const DOT: OfframpLane = { asset: 'dot@assethub', code: 'DOT', chain: 'assethub' };
+const SOL: OfframpLane = { asset: 'usdt@solana', code: 'USDT_SOLANA', chain: 'solana' };
+const ARB: OfframpLane = { asset: 'usdc@arbitrum', code: 'USDC_ARBITRUM', chain: 'arbitrum' };
 
 const m = (paymentMethodType: string, over: Record<string, unknown> = {}) => ({
   paymentMethodType,
@@ -101,7 +102,7 @@ describe('mergeOfframpCorridors', () => {
     expect(fr?.name).toBe('France');
     expect(fr?.fiat).toBe('EUR');
     expect(fr?.methods.map((x) => [x.paymentMethodType, x.lanes.map((l) => l.code)])).toEqual([
-      ['SEPA', ['DOT_ASSETHUB']],
+      ['SEPA', ['DOT']],
       ['CARD', ['USDT_SOLANA']],
     ]);
   });
@@ -119,19 +120,26 @@ describe('mergeOfframpCorridors', () => {
 
 describe('refreshJobs', () => {
   it('keeps DOT buy and sell, and adds a sell job per lane without duplicating', () => {
-    const jobs = refreshJobs([{ code: 'DOT_ASSETHUB' }, { code: 'USDT_SOLANA' }, { code: 'USDT_SOLANA' }]);
+    const jobs = refreshJobs([{ code: 'DOT' }, { code: 'USDT_SOLANA' }, { code: 'USDT_SOLANA' }], TEST_ASSETS);
     expect(jobs).toEqual([
-      { crypto: 'DOT_ASSETHUB', direction: 'buy' },
-      { crypto: 'DOT_ASSETHUB', direction: 'sell' },
+      { crypto: 'DOT', direction: 'buy' },
+      { crypto: 'DOT', direction: 'sell' },
       { crypto: 'USDT_SOLANA', direction: 'sell' },
     ]);
   });
 
   it('still refreshes DOT when it is not a configured lane', () => {
-    expect(refreshJobs([{ code: 'USDT_SOLANA' }]).map((j) => `${j.crypto}|${j.direction}`)).toEqual([
-      'DOT_ASSETHUB|buy',
-      'DOT_ASSETHUB|sell',
+    expect(refreshJobs([{ code: 'USDT_SOLANA' }], TEST_ASSETS).map((j) => `${j.crypto}|${j.direction}`)).toEqual([
+      'DOT|buy',
+      'DOT|sell',
       'USDT_SOLANA|sell',
+    ]);
+  });
+
+  it('refreshes DOT under whatever code the config names it, and skips it when unnamed', () => {
+    expect(refreshJobs([], { 'dot@assethub': 'DOT_RENAMED' }).map((j) => j.crypto)).toEqual(['DOT_RENAMED', 'DOT_RENAMED']);
+    expect(refreshJobs([{ code: 'USDC_SOLANA' }], { 'usdc@solana': 'USDC_SOLANA' })).toEqual([
+      { crypto: 'USDC_SOLANA', direction: 'sell' },
     ]);
   });
 });

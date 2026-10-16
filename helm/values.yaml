@@ -69,7 +69,7 @@ meld:
   defaults_cache_ttl_ms: 21600000
   routes_cache_ttl_ms: 900000
   boot_probe:
-    destination_code: DOT_ASSETHUB
+    asset: dot@assethub
     source_amount: "20"
     source_currency: USD
     country_code: US
@@ -94,6 +94,19 @@ auth:
     challenge_ttl_ms: 60000
     token_ttl_s: 300
 
+# What Meld calls each asset, by this service's own name for it. The only place a Meld code is
+# written: `limits`, `meld.boot_probe` and `supported.offramp_lanes` name assets, so when Meld
+# renames a code (it renamed DOT_ASSETHUB to DOT and USDT_ASSETHUB to USDT_DOT) this is the one
+# edit. Every code here is asked of Meld at boot and the pod refuses to start on one Meld answers
+# as unknown (400 INVALID_QUERY_PARAMETER); a busy or down Meld only warns. An asset left out
+# is not served. The asset names are fixed in `src/meld/catalog.ts`.
+assets:
+  dot@assethub: DOT
+  usdt@assethub: USDT_DOT
+  usdc@assethub: USDC_DOT
+  usdc@arbitrum: USDC_ARBITRUM
+  usdc@solana: USDC_SOLANA
+
 # Which destinations this deployment will actually sell, and between what amounts.
 #
 # The catalog in `meld/catalog.ts` is what the code can deliver; this is what a given deployment
@@ -101,15 +114,15 @@ auth:
 # so adding one here is the whole of enabling it, and leaving one out is a silent refusal rather
 # than an error at boot.
 #
-# `USDC_ASSETHUB` is here for the regions where DOT is not offered (1 Sep meeting). The buyer is
+# `usdc@assethub` is here for the regions where DOT is not offered (1 Sep meeting). The buyer is
 # sold USDC and the consumer swaps it to DOT. Same bounds as DOT deliberately: the fiat a buyer
 # may spend is a policy about the buyer, not about which token settles.
 limits:
-  - code: DOT_ASSETHUB
+  - asset: dot@assethub
     min: "10.00"
     max: "2000.00"
     currency: USD
-  - code: USDC_ASSETHUB
+  - asset: usdc@assethub
     min: "10.00"
     max: "2000.00"
     currency: USD
@@ -197,17 +210,28 @@ supported:
   routes_interval_ms: 7200000
   # Sell corridors, every offramp lane's included, change slower than buy ones: twice a day.
   sell_routes_interval_ms: 43200000
-  # Sell lanes behind `GET /supported/offramp*`, in preference order; `*_STATEMINT` are Meld's older Asset Hub codes.
+  # Sell lanes behind `GET /supported/offramp*`, in preference order, by asset (codes come from `assets`).
   # The deployment's switch for off-ramp routes: a sell of a code not listed is refused, and a
   # country no listed lane routes has no payout method. The direct Asset Hub sales by default; the
   # Chainflip swap lanes are opt-in, uncomment them (the SPA's VITE_OFFRAMP_LANES must list them too).
   offramp_lanes:
-    - { code: USDT_ASSETHUB, chain: assethub }
-    - { code: USDT_STATEMINT, chain: assethub }
-    - { code: DOT_ASSETHUB, chain: assethub }
-    - { code: DOT_STATEMINT, chain: assethub }
-    # - { code: USDC_ARBITRUM, chain: arbitrum }
-    # - { code: USDC_SOLANA, chain: solana }
+    - { asset: usdt@assethub }
+    - { asset: dot@assethub }
+    # - { asset: usdc@arbitrum }
+    # - { asset: usdc@solana }
+
+# The off-ramp SaleVault lane. Optional, enabled false runs without it so the sale and return endpoints answer 503.
+sale_vault:
+  enabled: false
+  chain: arbitrum-sepolia
+  # The numeric EVM chain id operator transactions are signed for.
+  chain_id: 421614
+  # The deployed SaleVault address, set by the operator when enabled.
+  contract: "0x0000000000000000000000000000000000000000"
+  rpc_url: https://sepolia-rollup.arbitrum.io/rpc
+  # The least held amount worth returning, and the dust the contract keeps for its own gas.
+  min_return: "1"
+  dust_target: "5"
 
 # The background worker that advances in-flight funding requests.
 worker:
@@ -269,7 +293,7 @@ serviceAccount:
 # Where secret files are mounted (config.json references these paths).
 secretMountPath: /run/secrets
 
-# The two runtime secrets, mounted as files so they never appear in `env` or the image.
+# The runtime secrets, mounted as files so they never appear in `env` or the image. The sale vault operator key is a third, mounted only when the lane is enabled.
 #
 # Declared here with empty `existingSecret` rather than omitted: the templates reference these
 # paths, and leaving the key absent made `helm template` with default values fail on a nil
@@ -283,6 +307,10 @@ secrets:
   jwtKey:
     existingSecret: ""
     key: jwt-key
+  # Mounted only when sale_vault.enabled is true, the same file way as the keys above.
+  saleVaultOperatorKey:
+    existingSecret: ""
+    key: sale-vault-operator-key
 
 # `ephemeral-storage` is still bounded, and its justification has changed twice. It used to be the
 # ceiling on the unbounded refusal write path, back when those rows lived on an `emptyDir`. They

@@ -11,6 +11,8 @@
  */
 
 import { z } from 'zod';
+
+import { isKnownCrypto } from './meld/catalog.js';
 import { MINOR_UNIT_DECIMAL } from './money.js';
 
 import { DEFAULT_DIRECTION, DIRECTIONS, RAIL_NAMES } from './rail.js';
@@ -167,8 +169,15 @@ const country = z.string().regex(/^[A-Z]{2}$/, 'Expected a two-letter ISO countr
  * Letters, not merely three characters: `length(3)` let `"$$$"` through to Meld on `/quote`,
  * which has no currency comparison to catch it, and the rejection came back as a misleading
  * `503`. Case-insensitive because the value is upper-cased downstream.
+ *
+ * And not a crypto code this service knows: Meld's code for DOT is `DOT`, three letters like a
+ * fiat, and a fiat leg naming it would cross the legs `client.ts` guards, which answers a caller's
+ * typo as this service's own `500`. Refused here as the malformed request it is.
  */
-const fiat = z.string().regex(/^[A-Za-z]{3}$/, 'Expected a three-letter ISO 4217 currency code.');
+const fiat = z
+  .string()
+  .regex(/^[A-Za-z]{3}$/, 'Expected a three-letter ISO 4217 currency code.')
+  .refine((code) => !isKnownCrypto(code.toUpperCase()), 'Expected a fiat currency, not a crypto code.');
 
 /** Meld's payment-method vocabulary: CREDIT_DEBIT_CARD, SEPA, ACH, PIX. Opaque here. */
 const paymentMethodType = z.string().min(1).max(48);

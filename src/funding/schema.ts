@@ -3,10 +3,10 @@
  *
  * The SQLite migration chain is gone, and deleting it was the point of moving. v0->v1->v2->v3
  * existed to bring an on-disk SQLite file forward in place; the Postgres chain is
- * 1->2->3->4->5->6->7->8, with 3->4 adding `cancelled_at`, 4->5 adding the supported-corridors
+ * 1->2->3->4->5->6->7->8->9, with 3->4 adding `cancelled_at`, 4->5 adding the supported-corridors
  * cache, 5->6 adding the sell direction and the terms only a sell commits, 6->7 recording a
- * deposit-address disclosure conflict, and 7->8 putting a direction into the supported-corridors
- * cache. Nothing was ever
+ * deposit-address disclosure conflict, 7->8 putting a direction into the supported-corridors
+ * cache, and 8->9 adding the off-ramp SaleVault state table. Nothing was ever
  * deployed, so that chain migrated a population of
  * zero, and CloudSQL starts from an empty database, so porting it would have meant carrying three
  * migrations for no rows, expressed against an engine this service has left. The v3 shape is the v1 shape
@@ -22,7 +22,7 @@ import { DIRECTIONS } from '../rail.js';
 import { FUNDING_STATES } from './state.js';
 
 /** The current schema version. Bump with each migration added here. */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /** A migration: bring the previous version's rows to this version's shape. */
 export interface Migration {
@@ -78,8 +78,8 @@ const SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT = `CONSTRAINT supported_corridors
 /**
  * The current shape of `supported_corridors`: one row per (crypto, direction, country), which is
  * what `upsertCorridor`'s `ON CONFLICT` target and `readCorridors`' predicate both assume from the
- * day this ships. Without `direction` in the key, a sell refresh pass upserting `(DOT_ASSETHUB,
- * GB)` would silently overwrite the buy row for the same corridor -- the two are different
+ * day this ships. Without `direction` in the key, a sell refresh pass upserting `(DOT, GB)`
+ * would silently overwrite the buy row for the same corridor -- the two are different
  * questions to Meld (different category, different route argument order; see
  * `meld/discovery.ts`), and this table must not fold their answers into one slot.
  *
@@ -109,6 +109,23 @@ const SUPPORTED_CORRIDORS_TABLE_CURRENT =
   `${SUPPORTED_CORRIDORS_DIRECTION_COLUMN},` +
   ' PRIMARY KEY (destination_currency_code, direction, country),' +
   ` ${SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT}` +
+  ')';
+
+// Off-ramp SaleVault state, one row per funding request. New at v9, same CREATE on fresh and migrated paths.
+// contract_status is the last-observed Sale.Status ordinal. return_status alphabet is pinned by a CHECK.
+const VAULT_SALES_TABLE =
+  'CREATE TABLE IF NOT EXISTS vault_sales (' +
+  ' funding_request_id TEXT PRIMARY KEY,' +
+  ' chain TEXT NOT NULL,' +
+  ' contract TEXT NOT NULL,' +
+  ' ref TEXT NOT NULL,' +
+  ' contract_status INTEGER,' +
+  ' held TEXT,' +
+  " return_status TEXT NOT NULL DEFAULT 'none'," +
+  ' return_tx TEXT,' +
+  ' created_at BIGINT NOT NULL,' +
+  ' updated_at BIGINT NOT NULL,' +
+  " CONSTRAINT vault_sales_return_status_known CHECK (return_status IN ('none', 'returning', 'returned'))" +
   ')';
 
 /**
@@ -229,7 +246,7 @@ const DEPOSIT_CONFLICT_CONSTRAINT =
  *
  * A fresh database is created at `SCHEMA_VERSION` directly by `freshSchema()`, so this list is
  * what an existing database walks through, one step at a time. The next migration appends
- * `{ from: 8, to: 9, sql: [...] }` and bumps `SCHEMA_VERSION`; `store.ts` needs no change.
+ * `{ from: 9, to: 10, sql: [...] }` and bumps `SCHEMA_VERSION`. `store.ts` needs no change.
  *
  * This chain is one-way. A build expecting v1 refuses a v2 database: the version check is
  * `!==`, deliberately, because reading a shape you do not understand is worse than not starting.
@@ -490,6 +507,12 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE supported_corridors ADD ${SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT}`,
     ],
   },
+  {
+    from: 8,
+    to: 9,
+    // v8 -> v9: the off-ramp SaleVault state table. A new table, identical CREATE to freshSchema.
+    sql: [VAULT_SALES_TABLE],
+  },
 ];
 
 /**
@@ -569,6 +592,8 @@ export function freshSchema(): string[] {
     // The supported-corridors cache, at the current (v8) shape. See the v7 -> v8 migration for
     // what an existing database walks through to reach the same table.
     SUPPORTED_CORRIDORS_TABLE_CURRENT,
+    // The off-ramp SaleVault state, new at v9. Same CREATE the v8 -> v9 migration runs.
+    VAULT_SALES_TABLE,
   ];
 }
 
