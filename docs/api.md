@@ -3,8 +3,9 @@
 Every route, its request and response shape, and the errors it returns.
 See [README.md](../README.md) for what the service is and how to run it.
 
-Nine routes are authenticated by the short-lived JWT the handshake mints: `POST /quote`,
-`POST /session`, `GET /supported`, `GET /supported/countries`, `GET /supported/corridors`,
+Twelve routes are authenticated by the short-lived JWT the handshake mints: `GET /assets`,
+`POST /quote`, `POST /session`, `GET /supported`, `GET /supported/countries`,
+`GET /supported/corridors`, `GET /supported/offramp`, `GET /supported/offramp/corridors`,
 `GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel` and `GET /transaction/:id`. The
 unauthenticated remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
 
@@ -12,10 +13,11 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | --- | --- | --- |
 | `POST /api/v1/auth/challenge` | none | Mints a fresh 56-byte blind challenge. No auth, rate-limited. |
 | `POST /api/v1/auth/redeem` | none | Exchanges a challenge + ring-VRF proof for a short-lived JWT. Verifies against the People-chain commitment. |
+| `GET /assets` | none | What Meld currently calls each asset this deployment serves, from the `assets` config: `{assets: [{asset, code, chain, deliverable}]}`. Clients send these codes rather than keeping their own copy. See "`GET /assets`" below. |
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
-| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{code, chain, min, max, currency}]}]}]}`. No query parameters (strict). See "Offramp lanes" below. |
+| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{asset, code, chain, min, max, currency}]}]}]}`. No query parameters (strict). See "Offramp lanes" below. |
 | `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
@@ -207,7 +209,7 @@ applies. Each new disagreement is still logged loudly, at its own level. A malfo
 (`sourceCurrencyCode`, `sourceAmount`, `cryptoDetails.destinationWalletAddress`), but no sell has
 yet been driven through this account far enough to produce a transaction: the sandbox never
 settles a sell, since no provider receives crypto there, and the account this was built against
-was reported to off-ramp no `*_ASSETHUB` asset. Unverified in practice: the status at which Meld
+was reported to off-ramp no Asset Hub asset (under the `*_ASSETHUB` codes Meld used then). Unverified in practice: the status at which Meld
 first discloses an address, the exact asset code it puts on a sell's transaction, and whether any
 asset this service delivers needs the `memo` field, which no observed schema has a candidate for.
 
@@ -244,9 +246,10 @@ verified live against the sandbox:
   `currencyCode` per country and is read and cached the same way the country list is.
 
 **What discovery being live does not mean: that a sell corridor is actually deliverable.** The
-account this service was built against has exactly one onboarded provider, and that provider
-off-ramps no `*_ASSETHUB` asset at all -- a keyed sell-corridor read for DOT_ASSETHUB, USDC_ASSETHUB
-or USDT_ASSETHUB in any country returns `methods: []` on this account, correctly. That is Meld's
+account this service was built against had exactly one onboarded provider, and that provider
+off-ramped no Asset Hub asset at all -- a keyed sell-corridor read for DOT_ASSETHUB, USDC_ASSETHUB
+or USDT_ASSETHUB (Meld's codes at the time, since renamed `DOT`, `USDC_DOT` and `USDT_DOT`) in any
+country returned `methods: []` on this account, correctly. That is Meld's
 account-level truth, surfaced honestly, not a defect in this service: `GET /supported` and
 `GET /supported/corridors` answering "not offered" for a corridor genuinely not offered is the
 whole point of asking live rather than hand-maintaining a list. The day a provider that off-ramps
@@ -691,7 +694,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 
 | Status | Tag | Meaning |
 | --- | --- | --- |
-| 400 | `WrongAssetOrChain` | Destination code is not one this service delivers. |
+| 400 | `WrongAssetOrChain` | A code `assets` does not name (including one Meld has since renamed), or a sell-only code on a buy. |
 | 400 | `Other{ REDIRECT_NOT_ALLOWED }` | The redirect target's origin is not in `cors.allowed_origins`. |
 | 409 | `Other{ IDEMPOTENCY_KEY_REUSED }` | The idempotency key was first used for a different request. Mint a new key. |
 | 409 | `Other{ REQUEST_SURFACE_EXPIRED }` | The rail's payment page for that request has closed, but the request has **not** concluded: a transfer may still be in flight, and the worker is still watching. Do **not** start another: poll `GET /funding/:id` and act on the conclusion when it arrives. Cleared by the worker concluding the row, so a stopped worker leaves a caller on this code indefinitely. |
