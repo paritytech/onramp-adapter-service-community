@@ -144,7 +144,7 @@ export class SaleVaultClient {
   /** The receipt of a broadcast transaction, or null when it is not yet mined (or was dropped). */
   async receipt(txHash: string): Promise<{ status: boolean } | null> {
     const r = (await this.rpc('eth_getTransactionReceipt', [txHash])) as { status?: string } | null;
-    if (r === null || r === undefined) return null;
+    if (r === null) return null;
     return { status: r.status === '0x1' };
   }
 
