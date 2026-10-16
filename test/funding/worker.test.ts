@@ -1728,7 +1728,7 @@ describe('a sell whose provider discloses a deposit address', () => {
   const inFlight = (overrides: Partial<FundingRecord> = {}): FundingRecord =>
     record({
       direction: 'sell',
-      destination_currency_code: 'DOT_ASSETHUB',
+      destination_currency_code: 'DOT',
       wallet_address: undefined,
       source_amount: undefined,
       crypto_amount: '12.3456789012',
@@ -1751,7 +1751,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       observations(async () => ({
         id: 'tx-1',
         status: 'PENDING',
-        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
       })),
       MAX_AGE,
       () => undefined,
@@ -1774,7 +1774,7 @@ describe('a sell whose provider discloses a deposit address', () => {
     // record, so it can be populated the very first time a transaction exists at all.
     const opening = record({
       direction: 'sell',
-      destination_currency_code: 'DOT_ASSETHUB',
+      destination_currency_code: 'DOT',
       wallet_address: undefined,
       source_amount: undefined,
       crypto_amount: '12.3456789012',
@@ -1788,7 +1788,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       observations(async () => ({
         id: 'tx-1',
         status: 'PENDING',
-        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
       })),
       MAX_AGE,
       () => undefined,
@@ -1807,7 +1807,7 @@ describe('a sell whose provider discloses a deposit address', () => {
     // concludes it, so a deposit carried here would be shown for an order that takes no deposit.
     const opening = record({
       direction: 'sell',
-      destination_currency_code: 'DOT_ASSETHUB',
+      destination_currency_code: 'DOT',
       wallet_address: undefined,
       source_amount: undefined,
       crypto_amount: '12.3456789012',
@@ -1822,7 +1822,7 @@ describe('a sell whose provider discloses a deposit address', () => {
         async () => ({
           id: 'tx-1',
           status: 'FAILED',
-          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
         }),
         (status) => (status === 'FAILED' ? 'failed' : 'transaction_seen'),
       ),
@@ -1863,7 +1863,7 @@ describe('a sell whose provider discloses a deposit address', () => {
     // `'error'`, on its own line, distinguishable from the generic per-record `'warn'` failure
     // that a transient rail hiccup produces just as easily.
     const { store } = tracking([
-      inFlight({ deposit_address: ALICE, deposit_amount: '1.0', deposit_currency: 'DOT_ASSETHUB' }),
+      inFlight({ deposit_address: ALICE, deposit_amount: '1.0', deposit_currency: 'DOT' }),
     ]);
     const { lines, levels, log } = notes();
 
@@ -1873,7 +1873,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       observations(async () => ({
         id: 'tx-1',
         status: 'PENDING',
-        deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' },
+        deposit: { address: BOB, amount: '1.0', currency: 'DOT' },
       })),
       MAX_AGE,
       log,
@@ -1900,7 +1900,7 @@ describe('a sell whose provider discloses a deposit address', () => {
     // The heart of the fix: a provider that keeps disclosing a wrong address must not also be
     // able to freeze a row that would otherwise correctly settle.
     const { store } = tracking([
-      inFlight({ id: 'bad', deposit_address: ALICE, deposit_amount: '1.0', deposit_currency: 'DOT_ASSETHUB' }),
+      inFlight({ id: 'bad', deposit_address: ALICE, deposit_amount: '1.0', deposit_currency: 'DOT' }),
       inFlight({ id: 'good', provider_transaction_id: 'tx-2' }),
     ]);
 
@@ -1910,7 +1910,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       observations(
         async (rec) =>
           rec.id === 'bad'
-            ? { id: 'tx-1', status: 'PENDING', deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' } }
+            ? { id: 'tx-1', status: 'PENDING', deposit: { address: BOB, amount: '1.0', currency: 'DOT' } }
             : { id: 'tx-2', status: 'SETTLED' },
         (status) => (status === 'SETTLED' ? 'settled' : 'transaction_seen'),
       ),
@@ -1936,7 +1936,7 @@ describe('a sell whose provider discloses a deposit address', () => {
     const conflicted = inFlight({
       deposit_address: ALICE,
       deposit_amount: '1.0',
-      deposit_currency: 'DOT_ASSETHUB',
+      deposit_currency: 'DOT',
       deposit_conflict_address: BOB,
       deposit_conflict_reason: 'address_changed',
       deposit_conflict_at: NOW - 1_000,
@@ -1949,7 +1949,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       observations(async () => ({
         id: 'tx-1',
         status: 'PENDING',
-        deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' },
+        deposit: { address: BOB, amount: '1.0', currency: 'DOT' },
       })),
       MAX_AGE,
       () => undefined,
@@ -1973,7 +1973,7 @@ describe('a sell whose provider discloses a deposit address', () => {
     const accepted = inFlight({
       deposit_address: ALICE,
       deposit_amount: '12.3456789012',
-      deposit_currency: 'DOT_ASSETHUB',
+      deposit_currency: 'DOT',
     });
     const { store, updated } = tracking([accepted]);
 
@@ -1983,7 +1983,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       observations(async () => ({
         id: 'tx-1',
         status: 'PENDING',
-        deposit: { address: ALICE_PREFIX_42, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        deposit: { address: ALICE_PREFIX_42, amount: '12.3456789012', currency: 'DOT' },
       })),
       MAX_AGE,
       () => undefined,
@@ -2003,7 +2003,7 @@ describe('a sell whose provider discloses a deposit address', () => {
     // the same amount need not be spelled the same way. Compared as text, every poll would write.
     for (const amount of ['23.45210000', '023.4521', '23.4521']) {
       const { store, updated } = tracking([
-        inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
+        inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT' }),
       ]);
 
       const advanced = await tick(
@@ -2012,7 +2012,7 @@ describe('a sell whose provider discloses a deposit address', () => {
         observations(async () => ({
           id: 'tx-1',
           status: 'PENDING',
-          deposit: { address: ALICE, amount, currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount, currency: 'DOT' },
         })),
         MAX_AGE,
         () => undefined,
@@ -2034,12 +2034,12 @@ describe('a sell whose provider discloses a deposit address', () => {
       ['1e1', '10'],
     ] as const) {
       const { store, updated } = tracking([
-        inFlight({ deposit_address: ALICE, deposit_amount: stored, deposit_currency: 'DOT_ASSETHUB' }),
+        inFlight({ deposit_address: ALICE, deposit_amount: stored, deposit_currency: 'DOT' }),
       ]);
       const restated = observations(async () => ({
         id: 'tx-1',
         status: 'PENDING',
-        deposit: { address: ALICE, amount, currency: 'DOT_ASSETHUB' },
+        deposit: { address: ALICE, amount, currency: 'DOT' },
       }));
 
       await tick(store, NOW, restated, MAX_AGE, () => undefined, lease());
@@ -2058,12 +2058,12 @@ describe('a sell whose provider discloses a deposit address', () => {
 
   it('records an asset the provider restates for the same address as a conflict, once', async () => {
     const { store, updated } = tracking([
-      inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
+      inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT' }),
     ]);
     const restated = observations(async () => ({
       id: 'tx-1',
       status: 'PENDING',
-      deposit: { address: ALICE, amount: '23.4521', currency: 'USDT_ASSETHUB' },
+      deposit: { address: ALICE, amount: '23.4521', currency: 'USDT_DOT' },
     }));
 
     await tick(store, NOW, restated, MAX_AGE, () => undefined, lease());
@@ -2071,7 +2071,7 @@ describe('a sell whose provider discloses a deposit address', () => {
 
     expect(updated).toHaveBeenCalledTimes(1);
     expect(await store.byId('funding-1')).toMatchObject({
-      deposit_currency: 'DOT_ASSETHUB',
+      deposit_currency: 'DOT',
       deposit_conflict_reason: 'terms_changed',
     });
     await store.close();
@@ -2084,7 +2084,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       inFlight({
         deposit_address: ALICE,
         deposit_amount: '1.0',
-        deposit_currency: 'DOT_ASSETHUB',
+        deposit_currency: 'DOT',
         updated_at: NOW + MAX_AGE,
       }),
     ]);
@@ -2099,12 +2099,12 @@ describe('a sell whose provider discloses a deposit address', () => {
     // No rail writes such a row (a disclosure always names its amount), but the column allows it,
     // and a figure appearing after the address is not one a client was shown.
     const { store, updated } = tracking([
-      inFlight({ deposit_address: ALICE, deposit_amount: undefined, deposit_currency: 'DOT_ASSETHUB' }),
+      inFlight({ deposit_address: ALICE, deposit_amount: undefined, deposit_currency: 'DOT' }),
     ]);
     const disclosed = observations(async () => ({
       id: 'tx-1',
       status: 'PENDING',
-      deposit: { address: ALICE, amount: '23.4521', currency: 'DOT_ASSETHUB' },
+      deposit: { address: ALICE, amount: '23.4521', currency: 'DOT' },
     }));
 
     await tick(store, NOW, disclosed, MAX_AGE, () => undefined, lease());
@@ -2121,7 +2121,7 @@ describe('a sell whose provider discloses a deposit address', () => {
 
   it('reads a repeated amount that is not a plain decimal as the same only when it is spelled the same', async () => {
     const { store, updated } = tracking([
-      inFlight({ deposit_address: ALICE, deposit_amount: '1e1', deposit_currency: 'DOT_ASSETHUB' }),
+      inFlight({ deposit_address: ALICE, deposit_amount: '1e1', deposit_currency: 'DOT' }),
     ]);
 
     await tick(
@@ -2130,7 +2130,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       observations(async () => ({
         id: 'tx-1',
         status: 'PENDING',
-        deposit: { address: ALICE, amount: '1e1', currency: 'DOT_ASSETHUB' },
+        deposit: { address: ALICE, amount: '1e1', currency: 'DOT' },
       })),
       MAX_AGE,
       () => undefined,
@@ -2143,7 +2143,7 @@ describe('a sell whose provider discloses a deposit address', () => {
 
   it('logs a restated term as a conflict that needs a person', async () => {
     const { store } = tracking([
-      inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
+      inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT' }),
     ]);
     const { lines, log } = notes();
 
@@ -2153,7 +2153,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       observations(async () => ({
         id: 'tx-1',
         status: 'PENDING',
-        deposit: { address: ALICE, amount: '20', currency: 'DOT_ASSETHUB' },
+        deposit: { address: ALICE, amount: '20', currency: 'DOT' },
       })),
       MAX_AGE,
       log,
@@ -2177,7 +2177,7 @@ describe('a sell whose provider discloses a deposit address', () => {
         async () => ({
           id: 'tx-1',
           status: 'FAILED',
-          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
         }),
         (status) => (status === 'FAILED' ? 'failed' : 'transaction_seen'),
       ),
@@ -2197,7 +2197,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       inFlight({
         deposit_address: ALICE,
         deposit_amount: '1.0',
-        deposit_currency: 'DOT_ASSETHUB',
+        deposit_currency: 'DOT',
         deposit_observed_at: NOW - 1_000,
         deposit_conflict_address: 'not-an-account',
         deposit_conflict_reason: 'address_malformed',
@@ -2211,7 +2211,7 @@ describe('a sell whose provider discloses a deposit address', () => {
       observations(async () => ({
         id: 'tx-1',
         status: 'PENDING',
-        deposit: { address: 'not-an-account', amount: '1.0', currency: 'DOT_ASSETHUB' },
+        deposit: { address: 'not-an-account', amount: '1.0', currency: 'DOT' },
       })),
       MAX_AGE,
       () => undefined,
@@ -2226,7 +2226,7 @@ describe('a sell whose provider discloses a deposit address', () => {
 
   it('logs, on ageing out, that an address was disclosed with no settlement ever observed', async () => {
     const { store } = tracking([
-      inFlight({ deposit_address: ALICE, deposit_amount: '1.0', deposit_currency: 'DOT_ASSETHUB' }),
+      inFlight({ deposit_address: ALICE, deposit_amount: '1.0', deposit_currency: 'DOT' }),
     ]);
     const { lines, log } = notes();
 

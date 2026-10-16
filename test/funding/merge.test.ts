@@ -23,7 +23,7 @@ const inFlight = () =>
 const deposit = (overrides: Partial<RailDeposit> = {}): RailDeposit => ({
   address: ALICE,
   amount: '12.3456789012',
-  currency: 'DOT_ASSETHUB',
+  currency: 'DOT',
   ...overrides,
 });
 
@@ -35,7 +35,7 @@ describe('mergeAdvance: the deposit disclosure', () => {
 
     expect(next.deposit_address).toBe(ALICE);
     expect(next.deposit_amount).toBe('12.3456789012');
-    expect(next.deposit_currency).toBe('DOT_ASSETHUB');
+    expect(next.deposit_currency).toBe('DOT');
     expect(next.deposit_observed_at).toBe(NOW);
     expect(next.status).toBe('transaction_seen');
     expect(next.updated_at).toBe(NOW);
@@ -112,8 +112,8 @@ describe('mergeAdvance: the deposit disclosure', () => {
     // The change is recorded, and from then on the deposit is no longer disclosed.
     const first = mergeAdvance(inFlight(), 'transaction_seen', NOW, { deposit: deposit() });
     for (const [incoming, at] of [
-      [{ address: ALICE_PREFIX_42, amount: '11', currency: 'DOT_ASSETHUB' }, NOW + 1000],
-      [{ address: ALICE, amount: '12.3456789012', currency: 'USDT_ASSETHUB' }, NOW + 2000],
+      [{ address: ALICE_PREFIX_42, amount: '11', currency: 'DOT' }, NOW + 1000],
+      [{ address: ALICE, amount: '12.3456789012', currency: 'USDT_DOT' }, NOW + 2000],
     ] as const) {
       const restated = mergeAdvance(first, 'transaction_seen', at, { deposit: incoming });
       expect(restated).toMatchObject({

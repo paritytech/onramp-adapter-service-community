@@ -27,7 +27,7 @@ const RESPONSE: CreateSessionResponse = {
     walletAddress: ALICE,
     sourceAmount: '25.00',
     fiat: 'USD',
-    destinationCurrencyCode: 'USDC_ASSETHUB',
+    destinationCurrencyCode: 'USDC_DOT',
   },
 };
 
@@ -69,7 +69,7 @@ const serve = async (
     get: async () => undefined,
     cancel: async () => undefined,
     list: async () => [],
-    supported: async () => ({ country: 'US', fiat: 'USD', crypto: 'DOT_ASSETHUB', methods: [] }),
+    supported: async () => ({ country: 'US', fiat: 'USD', crypto: 'DOT', methods: [] }),
     supportedCountries: async () => [],
     supportedCorridors: async () => [],
     offrampCorridors: async () => [],
@@ -87,7 +87,7 @@ const serve = async (
           sourceAmount: '21.47',
           sourceCurrencyCode: 'USD',
           destinationAmount: '20',
-          destinationCurrencyCode: 'USDC_ASSETHUB',
+          destinationCurrencyCode: 'USDC_DOT',
           totalFee: '1.47',
           transactionFee: '0.19',
           networkFee: '0.28',
@@ -95,7 +95,7 @@ const serve = async (
           exchangeRate: '0.9315',
         },
       ],
-      requested: { destinationCurrencyCode: 'USDC_ASSETHUB', sourceAmount: '20', fiat: 'USD' },
+      requested: { destinationCurrencyCode: 'USDC_DOT', sourceAmount: '20', fiat: 'USD' },
     }),
     transaction: async () => ({ transaction: { id: 'tx-1', status: 'PENDING' } }),
     ...overrides,
@@ -117,7 +117,7 @@ describe('logging', () => {
       {
         quote: async () => ({
           quotes: [],
-          requested: { destinationCurrencyCode: 'USDC_ASSETHUB', sourceAmount: '20', fiat: 'USD' },
+          requested: { destinationCurrencyCode: 'USDC_DOT', sourceAmount: '20', fiat: 'USD' },
         }),
       },
       sink,
@@ -158,7 +158,7 @@ describe('logging', () => {
           get: async () => undefined,
           list: async () => [],
           cancel: async () => undefined,
-          supported: async () => ({ country: 'US', fiat: 'USD', crypto: 'DOT_ASSETHUB', methods: [] }),
+          supported: async () => ({ country: 'US', fiat: 'USD', crypto: 'DOT', methods: [] }),
           supportedCountries: async () => [],
           supportedCorridors: async () => [],
     offrampCorridors: async () => [],
@@ -167,7 +167,7 @@ describe('logging', () => {
           offrampReturn: async () => undefined,
           quote: async () => ({
             quotes: [],
-            requested: { destinationCurrencyCode: 'USDC_ASSETHUB', sourceAmount: '20', fiat: 'USD' },
+            requested: { destinationCurrencyCode: 'USDC_DOT', sourceAmount: '20', fiat: 'USD' },
           }),
           transaction: async () => ({ transaction: {} }),
         };
@@ -185,7 +185,7 @@ describe('logging', () => {
         rail: 'meld',
         // No `direction`: a buy's audit line carries none, which is how it stays byte-identical
         // to the lines this service emitted before sell existed.
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: ALICE,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -337,6 +337,23 @@ describe('the fiat code', () => {
     },
   );
 
+  it.each(['DOT', 'dot'])(
+    'refuses %j, a crypto code shaped like a fiat, as a malformed request rather than a crossed leg',
+    async (fiat) => {
+      // Meld's code for DOT is three letters. Taken as the fiat leg it would reach the leg guard in
+      // `client.ts`, which answers a mapping fault, a 500, for what is the caller's typo.
+      const response = await (await serve()).inject({
+        method: 'POST',
+        url: '/quote',
+        headers: DEV_HEADERS,
+        payload: { ...quoteRequestBody(), fiat },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({ error: { tag: 'Other' } });
+    },
+  );
+
   it('still accepts a lowercase code, which the caller may legitimately send', async () => {
     const response = await (await serve()).inject({
       method: 'POST',
@@ -422,7 +439,7 @@ describe('the direction discriminator', () => {
       {
         quote: async (...args: unknown[]) => {
           seen?.(args[0]);
-          return { quotes: [], requested: { destinationCurrencyCode: 'DOT_ASSETHUB', sourceAmount: '20', fiat: 'GBP' } };
+          return { quotes: [], requested: { destinationCurrencyCode: 'DOT', sourceAmount: '20', fiat: 'GBP' } };
         },
       },
     );
@@ -1016,7 +1033,7 @@ describe('the consumer contract', () => {
       payload: {
         country: 'US',
         fiat: 'USD',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         sourceAmount: '20',
         paymentMethodType: 'CREDIT_DEBIT_CARD',
       },
@@ -1441,7 +1458,7 @@ describe('POST /session', () => {
 
   it('returns the enumerated failure and no operator detail', async () => {
     const app = await serve(async () => {
-      throw reject({ tag: 'BelowMinimum' }, '9.99 is below the 10.00 minimum for USDC_ASSETHUB');
+      throw reject({ tag: 'BelowMinimum' }, '9.99 is below the 10.00 minimum for USDC_DOT');
     });
 
     const response = await app.inject({
@@ -1587,7 +1604,7 @@ describe('the funding surface', () => {
         direction: 'buy',
         status: 'transaction_seen',
         providerStatus: 'SUCCEEDED',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: ALICE,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -2070,12 +2087,33 @@ describe("Meld's own limit code, which the service used to discard", () => {
   });
 });
 
+describe('GET /assets', () => {
+  it("lists each asset this deployment names, under Meld's current code for it", async () => {
+    const built = await serve(undefined, config({ assets: { 'dot@assethub': 'DOT', 'usdc@assethub': 'USDC_DOT', 'usdc@solana': 'USDC_SOLANA' } }));
+    const response = await built.inject({ method: 'GET', url: '/assets', headers: DEV_HEADERS });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      assets: [
+        { asset: 'dot@assethub', code: 'DOT', chain: 'assethub', deliverable: true },
+        { asset: 'usdc@assethub', code: 'USDC_DOT', chain: 'assethub', deliverable: true },
+        { asset: 'usdc@solana', code: 'USDC_SOLANA', chain: 'solana', deliverable: false },
+      ],
+    });
+  });
+
+  it('is behind the caller gate, like every other route but /health', async () => {
+    const response = await (await serve()).inject({ method: 'GET', url: '/assets' });
+    expect(response.statusCode).toBe(401);
+  });
+});
+
 describe('the discovery routes', () => {
   it('GET /supported returns the corridor for the (country, fiat, crypto)', async () => {
     const built = await serve();
     const response = await built.inject({
       method: 'GET',
-      url: '/supported?country=US&destinationCurrencyCode=DOT_ASSETHUB',
+      url: '/supported?country=US&destinationCurrencyCode=DOT',
       headers: DEV_HEADERS,
     });
 
@@ -2087,7 +2125,7 @@ describe('the discovery routes', () => {
     const built = await serve();
     const response = await built.inject({
       method: 'GET',
-      url: '/supported/countries?destinationCurrencyCode=DOT_ASSETHUB',
+      url: '/supported/countries?destinationCurrencyCode=DOT',
       headers: DEV_HEADERS,
     });
 
@@ -2102,7 +2140,7 @@ describe('the discovery routes', () => {
     const built = await serve(undefined, config(), { supportedCorridors: async () => corridors });
     const response = await built.inject({
       method: 'GET',
-      url: '/supported/corridors?destinationCurrencyCode=DOT_ASSETHUB',
+      url: '/supported/corridors?destinationCurrencyCode=DOT',
       headers: DEV_HEADERS,
     });
 
@@ -2114,7 +2152,7 @@ describe('the discovery routes', () => {
     const built = await serve();
     const response = await built.inject({
       method: 'GET',
-      url: '/supported/corridors?destinationCurrencyCode=DOT_ASSETHUB&country=BR',
+      url: '/supported/corridors?destinationCurrencyCode=DOT&country=BR',
       headers: DEV_HEADERS,
     });
 
@@ -2134,7 +2172,7 @@ describe('the discovery routes', () => {
             min: '10',
             max: '5000',
             currency: 'BRL',
-            lanes: [{ code: 'USDT_SOLANA', chain: 'solana', min: '10', max: '5000', currency: 'BRL' }],
+            lanes: [{ asset: 'usdt@solana', code: 'USDT_SOLANA', chain: 'solana', min: '10', max: '5000', currency: 'BRL' }],
           },
         ],
       },

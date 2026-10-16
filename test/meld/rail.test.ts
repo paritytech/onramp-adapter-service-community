@@ -117,7 +117,7 @@ describe('MeldRail', () => {
       direction: 'sell',
       countryCode: 'GB',
       sourceCurrencyCode: 'GBP',
-      destinationCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'DOT',
       cryptoAmount: '12.3456789012',
       paymentMethodType: 'PAYOUT_TO_BANK',
     });
@@ -125,7 +125,7 @@ describe('MeldRail', () => {
     expect(quoteSell).toHaveBeenCalledWith({
       countryCode: 'GB',
       // The port's `destinationCurrencyCode`, which is Meld's *source* on a sell.
-      cryptoCurrencyCode: 'DOT_ASSETHUB',
+      cryptoCurrencyCode: 'DOT',
       // The port's `sourceCurrencyCode`, which is Meld's *destination* on a sell.
       fiatCurrencyCode: 'GBP',
       cryptoAmount: '12.3456789012',
@@ -152,7 +152,7 @@ describe('MeldRail', () => {
     // a stray one and this seam is where it would have to be invented.
     expect(createWidgetSession).toHaveBeenCalledWith({
       direction: 'sell',
-      cryptoCurrencyCode: 'DOT_ASSETHUB',
+      cryptoCurrencyCode: 'DOT',
       fiatCurrencyCode: 'GBP',
       cryptoAmount: '12.3456789012',
       countryCode: 'GB',
@@ -190,7 +190,7 @@ describe('MeldRail', () => {
       direction: 'buy',
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       paymentMethodType: 'CREDIT_DEBIT_CARD',
     });
@@ -199,7 +199,7 @@ describe('MeldRail', () => {
       direction: 'buy',
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       paymentMethodType: 'CREDIT_DEBIT_CARD',
     });
@@ -224,7 +224,7 @@ describe('MeldRail', () => {
       // Stated on a buy too, not defaulted. The client reads `sessionType` off this field and
       // nothing else, so a buy that failed to name its direction would not silently stay a buy.
       direction: 'buy',
-      destinationCode: 'USDC_ASSETHUB',
+      destinationCode: 'USDC_DOT',
       walletAddress: '5x...',
       sourceAmount: '25.00',
       sourceCurrency: 'USD',
@@ -378,7 +378,7 @@ describe('MeldRail.observation', () => {
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: '12.3456789012',
-        sourceCurrencyCode: 'DOT_ASSETHUB',
+        sourceCurrencyCode: 'DOT',
         cryptoDetails: { destinationWalletAddress: '1DepositAddress' },
       });
 
@@ -389,7 +389,7 @@ describe('MeldRail.observation', () => {
       expect(seen?.deposit).toEqual({
         address: '1DepositAddress',
         amount: '12.3456789012',
-        currency: 'DOT_ASSETHUB',
+        currency: 'DOT',
       });
     });
 
@@ -398,7 +398,7 @@ describe('MeldRail.observation', () => {
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: '12.3456789012',
-        sourceCurrencyCode: 'DOT_ASSETHUB',
+        sourceCurrencyCode: 'DOT',
         cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
       };
       const pending = sellClient(found);
@@ -407,7 +407,7 @@ describe('MeldRail.observation', () => {
       expect(seen?.deposit).toEqual({
         address: '1DepositAddress',
         amount: '12.3456789012',
-        currency: 'DOT_ASSETHUB',
+        currency: 'DOT',
       });
 
       const sessionless = sellClient(found);
@@ -427,7 +427,7 @@ describe('MeldRail.observation', () => {
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: '12.3456789012',
-        sourceCurrencyCode: 'DOT_ASSETHUB',
+        sourceCurrencyCode: 'DOT',
         cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
       });
       transactionBySession.mockRejectedValue(failure);
@@ -439,7 +439,7 @@ describe('MeldRail.observation', () => {
       expect(seen).toEqual({
         id: 'tx-1',
         status: 'PENDING',
-        deposit: { address: '1DepositAddress', amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        deposit: { address: '1DepositAddress', amount: '12.3456789012', currency: 'DOT' },
       });
     });
 
@@ -455,7 +455,7 @@ describe('MeldRail.observation', () => {
     });
 
     it('prefers the address under its 2025-03-04 name, and reads the old one without it', async () => {
-      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT_ASSETHUB' };
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT' };
       // Both present for one account: the new name's spelling is the one disclosed.
       const both = sellClient(undefined, {
         id: 'tx-1',
@@ -519,7 +519,7 @@ describe('MeldRail.observation', () => {
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: null,
-        sourceCurrencyCode: 'DOT_ASSETHUB',
+        sourceCurrencyCode: 'DOT',
         cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
       });
 
@@ -548,18 +548,18 @@ describe('MeldRail.observation', () => {
         id: 'tx-1',
         status: 'PENDING',
         sourceAmount: '11',
-        sourceCurrencyCode: 'USDT_ASSETHUB',
+        sourceCurrencyCode: 'USDT_DOT',
         cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
       });
 
       const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
 
-      expect(seen?.deposit).toEqual({ address: '1DepositAddress', amount: '11', currency: 'USDT_ASSETHUB' });
+      expect(seen?.deposit).toEqual({ address: '1DepositAddress', amount: '11', currency: 'USDT_DOT' });
     });
 
     it('reads a blank field as absent', async () => {
       // A blank new name would otherwise shadow the old one, and a blank amount would pass as one.
-      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT_ASSETHUB' };
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT' };
       const fallback = sellClient({
         id: 'tx-1',
         status: 'PENDING',
@@ -581,7 +581,7 @@ describe('MeldRail.observation', () => {
     });
 
     it('discloses nothing when the two address fields name different accounts', async () => {
-      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT_ASSETHUB' };
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT' };
       const split = sellClient({
         id: 'tx-1',
         status: 'PENDING',

@@ -78,8 +78,8 @@ const SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT = `CONSTRAINT supported_corridors
 /**
  * The current shape of `supported_corridors`: one row per (crypto, direction, country), which is
  * what `upsertCorridor`'s `ON CONFLICT` target and `readCorridors`' predicate both assume from the
- * day this ships. Without `direction` in the key, a sell refresh pass upserting `(DOT_ASSETHUB,
- * GB)` would silently overwrite the buy row for the same corridor -- the two are different
+ * day this ships. Without `direction` in the key, a sell refresh pass upserting `(DOT, GB)`
+ * would silently overwrite the buy row for the same corridor -- the two are different
  * questions to Meld (different category, different route argument order; see
  * `meld/discovery.ts`), and this table must not fold their answers into one slot.
  *

@@ -15,16 +15,17 @@ import type { FundingRecord } from '../src/funding/types.js';
 import { MeldHttpError } from '../src/meld/client.js';
 import { mintChallenge } from '../src/personhood/challenge.js';
 import { mintToken } from '../src/personhood/token.js';
-import { buildPersonhood, start, verifyKey } from '../src/startup.js';
+import { buildPersonhood, start, verifyAssetCodes, verifyKey } from '../src/startup.js';
 import { upstreamUnavailable } from '../src/contract.js';
 import type { Config } from '../src/config.js';
-import { config, createRequest, fakeSocket, fundingRecord, personhoodConfig, rawConfig, withSocket } from './fixtures.js';
+import { TEST_ASSETS, config, createRequest, fakeSocket, fundingRecord, personhoodConfig, rawConfig, withSocket } from './fixtures.js';
 
-/** Just the two levels `verifyKey` uses, so a plain object substitutes for pino. */
+/** Just the levels `verifyKey` uses, so a plain object substitutes for pino. */
 const recorder = () => {
   const warn = vi.fn();
   const info = vi.fn();
-  return { warn, info, log: { warn, info } as unknown as FastifyBaseLogger };
+  const error = vi.fn();
+  return { warn, info, error, log: { warn, info, error } as unknown as FastifyBaseLogger };
 };
 
 describe('verifyKey', () => {
@@ -32,11 +33,24 @@ describe('verifyKey', () => {
     // Any answer means the request arrived and was rejected: a wrong key, a wrong path, wrong
     // parameters. None of those improve on their own, so serving buyers would be worse than
     // refusing to start.
-    const { log, warn } = recorder();
+    const { log, warn, error } = recorder();
     const meld = { verifyCredentials: () => Promise.reject(new MeldHttpError(401)) };
 
     await expect(verifyKey(meld, config(), log)).rejects.toBeInstanceOf(MeldHttpError);
     expect(warn).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith({ probe: 'USD->USDC_DOT in US', status: 401 }, expect.stringMatching(/the key/));
+  });
+
+  it('names the probe code and Meld\'s own code when Meld refuses it, as it does a renamed code', async () => {
+    const { log, error } = recorder();
+    const meld = { verifyCredentials: () => Promise.reject(new MeldHttpError(400, 'INVALID_QUERY_PARAMETER')) };
+    const cfg = config({ assets: { ...TEST_ASSETS, 'usdc@assethub': 'USDC_ASSETHUB' } });
+
+    await expect(verifyKey(meld, cfg, log)).rejects.toBeInstanceOf(MeldHttpError);
+    expect(error).toHaveBeenCalledWith(
+      { probe: 'USD->USDC_ASSETHUB in US', status: 400, code: 'INVALID_QUERY_PARAMETER' },
+      expect.stringMatching(/no longer knows/),
+    );
   });
 
   it('warns and continues when Meld cannot be reached', async () => {
@@ -60,7 +74,7 @@ describe('verifyKey', () => {
     await expect(verifyKey(meld, config(), log)).resolves.toBeUndefined();
     expect(warn.mock.calls[0]?.[1]).toMatch(/offered no quotes/i);
     expect(warn.mock.calls[0]?.[1]).toContain('The key is proven; the probe corridor may not be one Meld serves.');
-    expect(warn.mock.calls[0]?.[0]).toMatchObject({ probe: 'USD->USDC_ASSETHUB in US' });
+    expect(warn.mock.calls[0]?.[0]).toMatchObject({ probe: 'USD->USDC_DOT in US' });
     expect(info).not.toHaveBeenCalled();
   });
 
@@ -86,10 +100,101 @@ describe('verifyKey', () => {
     expect(params).toMatchObject({
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       paymentMethodType: 'CREDIT_DEBIT_CARD',
     });
+  });
+});
+
+describe('verifyAssetCodes', () => {
+  /** A Meld whose quote answers per destination code, echoing the code unless told otherwise. */
+  const meldAnswering = (answer: (code: string) => Promise<{ destinationCurrencyCode: string }[]>) => {
+    const quote = vi.fn((params: { destinationCurrencyCode: string }) => answer(params.destinationCurrencyCode));
+    return { quote: quote as unknown as Parameters<typeof verifyAssetCodes>[0]['quote'], calls: quote };
+  };
+  const echo = (code: string) => Promise.resolve([{ destinationCurrencyCode: code }]);
+
+  it('asks Meld for every configured code in the boot probe corridor, and passes when each is known', async () => {
+    const { log, warn, info } = recorder();
+    const meld = meldAnswering(echo);
+
+    await expect(verifyAssetCodes(meld, config(), log)).resolves.toBeUndefined();
+    expect(meld.calls.mock.calls.map(([p]) => p.destinationCurrencyCode).sort()).toEqual(
+      ['DOT', 'USDC_ARBITRUM', 'USDC_DOT', 'USDC_SOLANA', 'USDT_DOT', 'USDT_SOLANA'],
+    );
+    expect(meld.calls.mock.calls[0]?.[0]).toMatchObject({
+      countryCode: 'US',
+      sourceCurrencyCode: 'USD',
+      sourceAmount: '20',
+      paymentMethodType: 'CREDIT_DEBIT_CARD',
+    });
+    expect(info).toHaveBeenCalledWith({ codes: 6 }, 'Meld knows every configured asset code.');
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('stops the boot naming every code Meld refuses, as it refused DOT_ASSETHUB after the rename', async () => {
+    // Meld answers a code it does not know `400 INVALID_QUERY_PARAMETER`. Serving it would refuse
+    // every buyer of the asset, one at a time, with nothing in the boot log saying why.
+    const { log } = recorder();
+    const stale = new Set(['DOT_ASSETHUB', 'USDT_ASSETHUB']);
+    const meld = meldAnswering((code) =>
+      stale.has(code) ? Promise.reject(new MeldHttpError(400, 'INVALID_QUERY_PARAMETER')) : echo(code),
+    );
+    const cfg = config({ assets: { ...TEST_ASSETS, 'dot@assethub': 'DOT_ASSETHUB', 'usdt@assethub': 'USDT_ASSETHUB' } });
+
+    const failure = verifyAssetCodes(meld, cfg, log);
+    await expect(failure).rejects.toThrow(/Meld does not know these asset codes/);
+    await expect(failure).rejects.toThrow(/assets\.dot@assethub: Meld refused "DOT_ASSETHUB" \(HTTP 400 INVALID_QUERY_PARAMETER\)/);
+    await expect(failure).rejects.toThrow(/assets\.usdt@assethub: Meld refused "USDT_ASSETHUB" \(HTTP 400 INVALID_QUERY_PARAMETER\)/);
+  });
+
+  it.each([
+    ['no offer in the corridor', new MeldHttpError(400, 'NO_VALID_QUOTES')],
+    ['a 400 that does not name the code', new MeldHttpError(400)],
+    ['a rate limit', new MeldHttpError(429)],
+    ['Meld down', new MeldHttpError(503)],
+  ])('warns and continues when Meld answers a code with %s', async (_, refusal) => {
+    // None of these says the code is unknown, and a pod that refused to start on them could not
+    // come back up during a Meld incident.
+    const { log, warn, info } = recorder();
+    const meld = meldAnswering((code) => (code === 'USDC_SOLANA' ? Promise.reject(refusal) : echo(code)));
+
+    await expect(verifyAssetCodes(meld, config(), log)).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ asset: 'usdc@solana', code: 'USDC_SOLANA', status: refusal.status }),
+      expect.stringMatching(/did not price/),
+    );
+    expect(info).toHaveBeenCalled();
+  });
+
+  it('stops the boot when Meld prices a different asset than the one asked for', async () => {
+    // Threat model T4: Meld has resolved an unrecognised code to Bitcoin. A quote that comes back
+    // for another code is that fallback, caught before it can reach a locked checkout.
+    const { log } = recorder();
+    const meld = meldAnswering((code) => (code === 'DOT' ? Promise.resolve([{ destinationCurrencyCode: 'BTC' }]) : echo(code)));
+
+    await expect(verifyAssetCodes(meld, config(), log)).rejects.toThrow(
+      /assets\.dot@assethub: Meld priced "BTC" when asked for "DOT"/,
+    );
+  });
+
+  it('warns and continues on a code with no offers, or when Meld cannot be reached', async () => {
+    // Neither says anything about the code: the corridor may be dry for it, or Meld briefly down.
+    const { log, warn, info } = recorder();
+    const meld = meldAnswering((code) => {
+      if (code === 'USDC_SOLANA') return Promise.resolve([]);
+      if (code === 'USDT_SOLANA') return Promise.reject(upstreamUnavailable('connect ECONNREFUSED'));
+      return echo(code);
+    });
+
+    await expect(verifyAssetCodes(meld, config(), log)).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith({ asset: 'usdc@solana', code: 'USDC_SOLANA' }, expect.stringMatching(/no quotes/));
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ asset: 'usdt@solana', code: 'USDT_SOLANA', detail: expect.stringContaining('ECONNREFUSED') }),
+      expect.stringMatching(/Could not reach Meld/),
+    );
+    expect(info).toHaveBeenCalled();
   });
 });
 
