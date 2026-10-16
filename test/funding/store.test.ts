@@ -101,7 +101,7 @@ describe('FundingStore', () => {
       await withStore(async (store) => {
         await store.create(sell({ status: 'session_opened' }));
         await store.update('funding-1', 'session_opened', 1_700_000_000_100, {
-          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
         });
 
         expect(await store.cancel('alias-abc', 'app.dot', 'funding-1', 1_700_000_000_200)).toBeUndefined();
@@ -938,7 +938,7 @@ describe('FundingStore', () => {
       await withStore(async (store) => {
         await store.create(inFlight);
         const updated = await store.update('funding-1', 'transaction_seen', 1_700_000_000_150, {
-          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
         });
 
         expect(updated?.status).toBe('transaction_seen');
@@ -948,7 +948,7 @@ describe('FundingStore', () => {
         const persisted = await store.byId('funding-1');
         expect(persisted?.deposit_address).toBe(ALICE);
         expect(persisted?.deposit_amount).toBe('12.3456789012');
-        expect(persisted?.deposit_currency).toBe('DOT_ASSETHUB');
+        expect(persisted?.deposit_currency).toBe('DOT');
         expect(persisted?.deposit_observed_at).toBe(1_700_000_000_150);
       });
     });
@@ -961,11 +961,11 @@ describe('FundingStore', () => {
       await withStore(async (store) => {
         await store.create(sell({ status: 'transaction_seen' }));
         await store.update('funding-1', 'transaction_seen', 1_700_000_000_100, {
-          deposit: { address: ALICE, amount: '1.0', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '1.0', currency: 'DOT' },
         });
 
         const conflicted = await store.update('funding-1', 'settled', 1_700_000_000_200, {
-          deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' },
+          deposit: { address: BOB, amount: '1.0', currency: 'DOT' },
         });
 
         // The unrelated, legitimate transition still applied.
@@ -982,10 +982,10 @@ describe('FundingStore', () => {
       await withStore(async (store) => {
         await store.create(sell({ status: 'transaction_seen' }));
         await store.update('funding-1', 'transaction_seen', 1_700_000_000_100, {
-          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
         });
         await store.update('funding-1', 'transaction_seen', 1_700_000_000_200, {
-          deposit: { address: ALICE, amount: '12.3', currency: 'DOT_ASSETHUB' },
+          deposit: { address: ALICE, amount: '12.3', currency: 'DOT' },
         });
 
         const persisted = await store.byId('funding-1');
@@ -1093,12 +1093,12 @@ describe('the supported-corridors cache', () => {
 
   it('inserts a corridor and reads it back, scoped by crypto and name-sorted', async () => {
     await withStore(async (store) => {
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'US', name: 'United States', fiat: 'USD', methods: [pix] });
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'US', name: 'United States', fiat: 'USD', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
       // A different crypto's row must not leak into this read.
-      await store.upsertCorridor({ destination_currency_code: 'USDC_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'USDC_DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
 
-      const rows = await store.readCorridors('DOT_ASSETHUB', 'buy');
+      const rows = await store.readCorridors('DOT', 'buy');
       expect(rows.map((r) => r.country)).toEqual(['BR', 'US']);
       expect(rows[0]).toMatchObject({ country: 'BR', direction: 'buy', name: 'Brazil', fiat: 'BRL', methods: [pix] });
       expect(typeof rows[0]?.updated_at).toBe('number');
@@ -1107,14 +1107,14 @@ describe('the supported-corridors cache', () => {
 
   it('updates an existing row on conflict rather than duplicating it, and refreshes updated_at', async () => {
     await withStore(async (store) => {
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
-      const first = (await store.readCorridors('DOT_ASSETHUB', 'buy'))[0]?.updated_at ?? 0;
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      const first = (await store.readCorridors('DOT', 'buy'))[0]?.updated_at ?? 0;
 
       // A gap so the second stamp is a later millisecond; drop `updated_at = EXCLUDED.updated_at`
       // from the ON CONFLICT SET and this row's timestamp would stay frozen at `first`.
       await new Promise((resolve) => setTimeout(resolve, 3));
       await store.upsertCorridor({
-        destination_currency_code: 'DOT_ASSETHUB',
+        destination_currency_code: 'DOT',
         direction: 'buy',
         country: 'BR',
         name: 'Brasil',
@@ -1122,7 +1122,7 @@ describe('the supported-corridors cache', () => {
         methods: [{ ...pix, min: '20' }],
       });
 
-      const rows = await store.readCorridors('DOT_ASSETHUB', 'buy');
+      const rows = await store.readCorridors('DOT', 'buy');
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({ name: 'Brasil', methods: [{ ...pix, min: '20' }] });
       expect(rows[0]?.updated_at).toBeGreaterThan(first);
@@ -1131,17 +1131,17 @@ describe('the supported-corridors cache', () => {
 
   it('returns an empty list for a crypto with no cached corridors', async () => {
     await withStore(async (store) => {
-      expect(await store.readCorridors('DOT_ASSETHUB', 'buy')).toEqual([]);
+      expect(await store.readCorridors('DOT', 'buy')).toEqual([]);
     });
   });
 
   it('hides rows older than the freshness cutoff, so a stale cache ages out', async () => {
     await withStore(async (store) => {
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
 
       // A cutoff in the past keeps the just-written row; one in the future hides it.
-      expect((await store.readCorridors('DOT_ASSETHUB', 'buy', 0)).map((r) => r.country)).toEqual(['BR']);
-      expect(await store.readCorridors('DOT_ASSETHUB', 'buy', Date.now() + 60_000)).toEqual([]);
+      expect((await store.readCorridors('DOT', 'buy', 0)).map((r) => r.country)).toEqual(['BR']);
+      expect(await store.readCorridors('DOT', 'buy', Date.now() + 60_000)).toEqual([]);
     });
   });
 
@@ -1152,11 +1152,11 @@ describe('the supported-corridors cache', () => {
   it('keeps a buy and a sell corridor for the same (crypto, country) as separate rows', async () => {
     await withStore(async (store) => {
       const payout = { paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' as const, min: '7', max: '18550', currency: 'GBP' };
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [pix] });
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'sell', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [payout] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [pix] });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'sell', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [payout] });
 
-      const buy = await store.readCorridors('DOT_ASSETHUB', 'buy');
-      const sell = await store.readCorridors('DOT_ASSETHUB', 'sell');
+      const buy = await store.readCorridors('DOT', 'buy');
+      const sell = await store.readCorridors('DOT', 'sell');
       expect(buy).toHaveLength(1);
       expect(sell).toHaveLength(1);
       expect(buy[0]?.methods).toEqual([pix]);
@@ -1164,8 +1164,8 @@ describe('the supported-corridors cache', () => {
 
       // Re-upserting the buy row must not touch the sell row (and vice versa): distinct conflict
       // targets, not a shared one that happens to look right today.
-      await store.upsertCorridor({ destination_currency_code: 'DOT_ASSETHUB', direction: 'buy', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [{ ...pix, min: '99' }] });
-      expect((await store.readCorridors('DOT_ASSETHUB', 'sell'))[0]?.methods).toEqual([payout]);
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'GB', name: 'United Kingdom', fiat: 'GBP', methods: [{ ...pix, min: '99' }] });
+      expect((await store.readCorridors('DOT', 'sell'))[0]?.methods).toEqual([payout]);
     });
   });
 });

@@ -18,7 +18,7 @@
     "api_version": "2025-01-01",
     "timeout_ms": 8000,
     "boot_probe": {
-      "destination_code": "DOT_ASSETHUB",
+      "asset": "dot@assethub",
       "source_amount": "20",
       "source_currency": "USD",
       "country_code": "US",
@@ -47,21 +47,28 @@
       "token_ttl_s": 300
     }
   },
+  "assets": {
+    "dot@assethub": "DOT",
+    "usdt@assethub": "USDT_DOT",
+    "usdc@assethub": "USDC_DOT",
+    "usdc@arbitrum": "USDC_ARBITRUM",
+    "usdc@solana": "USDC_SOLANA"
+  },
   "limits": [
     {
-      "code": "DOT_ASSETHUB",
+      "asset": "dot@assethub",
       "min": "10.00",
       "max": "2000.00",
       "currency": "USD"
     },
     {
-      "code": "USDC_ASSETHUB",
+      "asset": "usdc@assethub",
       "min": "10.00",
       "max": "2000.00",
       "currency": "USD"
     },
     {
-      "code": "USDT_ASSETHUB",
+      "asset": "usdt@assethub",
       "min": "10.00",
       "max": "2000.00",
       "currency": "USD"
@@ -109,12 +116,10 @@
     "routes_interval_ms": 7200000,
     "sell_routes_interval_ms": 43200000,
     "offramp_lanes": [
-      { "code": "USDT_ASSETHUB", "chain": "assethub" },
-      { "code": "USDT_STATEMINT", "chain": "assethub" },
-      { "code": "DOT_ASSETHUB", "chain": "assethub" },
-      { "code": "DOT_STATEMINT", "chain": "assethub" },
-      { "code": "USDC_ARBITRUM", "chain": "arbitrum" },
-      { "code": "USDC_SOLANA", "chain": "solana" }
+      { "asset": "usdt@assethub" },
+      { "asset": "dot@assethub" },
+      { "asset": "usdc@arbitrum" },
+      { "asset": "usdc@solana" }
     ]
   }
 }

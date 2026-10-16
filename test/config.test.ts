@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { loadConfig, originAllowed, parseConfig, toOriginMatcher } from '../src/config.js';
-import { personhoodConfig, rawConfig } from './fixtures.js';
+import { TEST_ASSETS, personhoodConfig, rawConfig } from './fixtures.js';
 
 /** The personhood auth block, merged into a single-mode config for the tests. */
 const personhoodBlock = (): Record<string, unknown> => ({
@@ -603,13 +603,79 @@ describe('parseConfig', () => {
     expect(parseConfig(rawConfig({ server })).server.trusted_proxy_cidrs).toEqual([]);
   });
 
-  it('refuses limits naming a destination the catalog does not have', () => {
-    // Configuration cannot widen the accepted asset set. Adding a destination is a code
-    // change with a test, because DOT and DOT_ASSETHUB are different chains and the wrong
-    // answer looks plausible.
-    expect(() =>
-      parseConfig(rawConfig({ limits: [{ code: 'BTC', min: '10', max: '20', currency: 'USD' }] })),
-    ).toThrow(/Unknown destination code "BTC"/);
+  it('refuses limits naming an asset the catalog does not have, or one no buyer receives', () => {
+    // Configuration cannot widen the accepted asset set: adding an asset is a code change with a
+    // test. Naming one is configuration, so a Meld code in place of an asset id is refused too.
+    const limits = (asset: string) => () =>
+      parseConfig(rawConfig({ limits: [{ asset, min: '10', max: '20', currency: 'USD' }] }));
+    expect(limits('btc@bitcoin')).toThrow(/limits\.0\.asset/);
+    expect(limits('DOT')).toThrow(/limits\.0\.asset/);
+    expect(limits('usdc@solana')).toThrow(/"usdc@solana" is never delivered to a buyer/);
+    expect(() => parseConfig(rawConfig({ limits: [{ code: 'DOT', min: '10', max: '20', currency: 'USD' }] }))).toThrow(
+      /Unrecognized key/,
+    );
+  });
+
+  describe('assets', () => {
+    const withAssets = (assets: unknown, overrides: Record<string, unknown> = {}) => () =>
+      parseConfig(rawConfig({ assets, ...overrides }));
+
+    it('resolves every asset reference to the code it names, once', () => {
+      const cfg = parseConfig(
+        rawConfig({
+          assets: { 'usdc@assethub': 'USDC_RENAMED', 'usdc@solana': 'USDC_SOLANA' },
+          supported: { enabled: false, offramp_lanes: [{ asset: 'usdc@assethub' }, { asset: 'usdc@solana' }] },
+        }),
+      );
+      expect(cfg.limits.map((l) => [l.asset, l.code])).toEqual([['usdc@assethub', 'USDC_RENAMED']]);
+      expect(cfg.meld.boot_probe).toMatchObject({ asset: 'usdc@assethub', destination_code: 'USDC_RENAMED' });
+      expect(cfg.supported.offramp_lanes).toEqual([
+        { asset: 'usdc@assethub', code: 'USDC_RENAMED', chain: 'assethub' },
+        { asset: 'usdc@solana', code: 'USDC_SOLANA', chain: 'solana' },
+      ]);
+    });
+
+    it('is required, with no default, because a wrong code is a wrong purchase', () => {
+      const raw = rawConfig() as Record<string, unknown>;
+      delete raw.assets;
+      expect(() => parseConfig(raw)).toThrow(/assets/);
+    });
+
+    it('refuses an unknown asset id, a malformed code and one code for two assets', () => {
+      expect(withAssets({ ...TEST_ASSETS, 'btc@bitcoin': 'BTC' })).toThrow(/assets/);
+      expect(withAssets({ ...TEST_ASSETS, 'usdc@assethub': 'usdc_dot' })).toThrow(/uppercase letters/);
+      expect(withAssets({ ...TEST_ASSETS, 'usdc@assethub': 'USDC DOT' })).toThrow(/uppercase letters/);
+      expect(withAssets({ ...TEST_ASSETS, 'usdt@assethub': 'DOT' })).toThrow(
+        /assets\.usdt@assethub: Meld code "DOT" is already the code for "dot@assethub"/,
+      );
+    });
+
+    it('refuses a limit, probe or lane naming an asset it gives no code', () => {
+      const unnamed = { 'dot@assethub': 'DOT' };
+      expect(withAssets(unnamed)).toThrow(/limits\.0\.asset: "usdc@assethub" has no Meld code: add it to "assets"/);
+      expect(withAssets(unnamed)).toThrow(/meld\.boot_probe\.asset: "usdc@assethub" has no Meld code/);
+      expect(
+        withAssets(unnamed, {
+          limits: [],
+          meld: { ...(rawConfig().meld as Record<string, unknown>), boot_probe: { ...((rawConfig().meld as Record<string, unknown>).boot_probe as Record<string, unknown>), asset: 'dot@assethub' } },
+          supported: { enabled: false, offramp_lanes: [{ asset: 'usdt@solana' }] },
+        }),
+      ).toThrow(/supported\.offramp_lanes\.0\.asset: "usdt@solana" has no Meld code/);
+    });
+
+    it('names, in the shipped chart and example, every asset with the codes Meld uses today', () => {
+      // Meld renamed DOT_ASSETHUB to DOT, USDT_ASSETHUB to USDT_DOT and USDC_ASSETHUB to USDC_DOT,
+      // and retired the *_STATEMINT aliases. The chart is what deploys, so it is read here.
+      const helm = readFileSync('helm/values.yaml', 'utf8');
+      expect(helm).toMatch(/^ {2}dot@assethub: DOT$/m);
+      expect(helm).toMatch(/^ {2}usdt@assethub: USDT_DOT$/m);
+      expect(helm).toMatch(/^ {2}usdc@assethub: USDC_DOT$/m);
+      // Comments may name the old codes, to explain the rename; no value may.
+      const values = helm.replace(/#.*$/gm, '');
+      expect(values).not.toMatch(/_ASSETHUB|_STATEMINT/);
+      const example = parseConfig(JSON.parse(readFileSync('config.example.json', 'utf8')));
+      expect(example.assets).toMatchObject({ 'dot@assethub': 'DOT', 'usdt@assethub': 'USDT_DOT', 'usdc@assethub': 'USDC_DOT' });
+    });
   });
 
   it('defaults session creation to enabled when the flag is omitted', () => {
@@ -629,7 +695,7 @@ describe('parseConfig', () => {
           api_key: { mode: 'file', path: '/run/secrets/meld' },
           api_version: '2025-01-01',
           boot_probe: {
-            destination_code: 'USDC_ASSETHUB',
+            asset: 'usdc@assethub',
             source_amount: '20',
             source_currency: 'USD',
             country_code: 'US',
@@ -650,13 +716,13 @@ describe('parseConfig', () => {
     ['an empty string', ''],
   ])('refuses a limit amount with %s', (_label, min) => {
     expect(() =>
-      parseConfig(rawConfig({ limits: [{ code: 'USDC_ASSETHUB', min, max: '2000.00', currency: 'USD' }] })),
+      parseConfig(rawConfig({ limits: [{ asset: 'usdc@assethub', min, max: '2000.00', currency: 'USD' }] })),
     ).toThrow(/Invalid configuration/);
   });
 
   it('accepts a whole-number limit amount', () => {
     expect(() =>
-      parseConfig(rawConfig({ limits: [{ code: 'USDC_ASSETHUB', min: '10', max: '2000', currency: 'USD' }] })),
+      parseConfig(rawConfig({ limits: [{ asset: 'usdc@assethub', min: '10', max: '2000', currency: 'USD' }] })),
     ).not.toThrow();
   });
 
@@ -666,7 +732,7 @@ describe('parseConfig', () => {
     ['leading whitespace', ' USD'],
   ])('refuses a currency with %s', (_label, currency) => {
     expect(() =>
-      parseConfig(rawConfig({ limits: [{ code: 'USDC_ASSETHUB', min: '10.00', max: '20.00', currency }] })),
+      parseConfig(rawConfig({ limits: [{ asset: 'usdc@assethub', min: '10.00', max: '20.00', currency }] })),
     ).toThrow(/Invalid configuration/);
   });
 
@@ -674,13 +740,13 @@ describe('parseConfig', () => {
     // Boots happily and then refuses every amount, which reads as an outage rather than a
     // typo, so it must not boot.
     expect(() =>
-      parseConfig(rawConfig({ limits: [{ code: 'USDC_ASSETHUB', min: '2000.00', max: '10.00', currency: 'USD' }] })),
+      parseConfig(rawConfig({ limits: [{ asset: 'usdc@assethub', min: '2000.00', max: '10.00', currency: 'USD' }] })),
     ).toThrow(/Minimum 2000.00 exceeds maximum 10.00/);
   });
 
   it('accepts a range where the minimum equals the maximum', () => {
     expect(() =>
-      parseConfig(rawConfig({ limits: [{ code: 'USDC_ASSETHUB', min: '50.00', max: '50.00', currency: 'USD' }] })),
+      parseConfig(rawConfig({ limits: [{ asset: 'usdc@assethub', min: '50.00', max: '50.00', currency: 'USD' }] })),
     ).not.toThrow();
   });
 
@@ -712,15 +778,16 @@ describe('parseConfig', () => {
     expect(parse(['loopback'])).not.toThrow();
   });
 
-  it('serves DOT_ASSETHUB, which is the destination the consumer defaults to', () => {
+  it('serves DOT, which is the destination the consumer defaults to', () => {
     // The example config must be able to create the default session: a catalog destination with
     // no configured limits is refused RegionUnavailable, so omitting DOT made the documented
     // example fail on its first session create.
     const example = JSON.parse(readFileSync('config.example.json', 'utf8')) as Record<string, unknown>;
     const cfg = parseConfig(example);
 
-    expect(cfg.limits.map((l) => l.code)).toContain('DOT_ASSETHUB');
-    expect(cfg.meld.boot_probe.destination_code).toBe('DOT_ASSETHUB');
+    expect(cfg.limits.map((l) => l.asset)).toContain('dot@assethub');
+    expect(cfg.meld.boot_probe.asset).toBe('dot@assethub');
+    expect(cfg.meld.boot_probe.destination_code).toBe('DOT');
   });
 
   it('keeps the shipped worker deadline in step with the config default', () => {
@@ -760,29 +827,26 @@ describe('parseConfig', () => {
     expect(parseConfig({ ...example, worker }).worker.session_max_age_ms).toBe(72 * 3_600_000);
   });
 
-  it('serves the same destination codes the catalog recognises', () => {
-    // The three ASSETHUB codes are owned by `catalog.ts` and repeated in the example
-    // config, the Helm values and the fixtures. `parseConfig` validates limits against
-    // `DESTINATIONS`, so the example and the chart both fail loudly on drift; this asserts
-    // the two files that boot real deployments agree with the catalog through the real validator,
-    // rather than leaning on a string scan of YAML.
+  it('serves the same destinations the catalog recognises', () => {
+    // The three Asset Hub assets are owned by `catalog.ts` and named in the example config, the
+    // Helm values and the fixtures. `parseConfig` validates limits against `ASSETS`, so the example
+    // and the chart both fail loudly on drift; this asserts the two files that boot real
+    // deployments agree with the catalog through the real validator.
     const example = JSON.parse(readFileSync('config.example.json', 'utf8')) as Record<string, unknown>;
     const parsed = parseConfig(example);
-    // The example lists all three catalog destinations. Each is validated against `DESTINATIONS`
-    // by `parseConfig`, so an unknown code here would fail at parse; this records the agreed set.
-    expect(parsed.limits.map((l) => l.code)).toEqual(
-      expect.arrayContaining(['DOT_ASSETHUB', 'USDC_ASSETHUB', 'USDT_ASSETHUB']),
+    expect(parsed.limits.map((l) => l.asset)).toEqual(
+      expect.arrayContaining(['dot@assethub', 'usdc@assethub', 'usdt@assethub']),
     );
     expect(parsed.limits).toHaveLength(3);
 
     const helm = readFileSync('helm/values.yaml', 'utf8');
-    expect(helm).toMatch(/destination_code:\s*DOT_ASSETHUB/);
-    expect(helm).toMatch(/- code:\s*DOT_ASSETHUB/);
-    // `USDC_ASSETHUB` is what regions without DOT are sold (1 Sep meeting), and it is enabled by
+    expect(helm).toMatch(/boot_probe:\s*\n\s*asset:\s*dot@assethub/);
+    expect(helm).toMatch(/- asset:\s*dot@assethub/);
+    // `usdc@assethub` is what regions without DOT are sold (1 Sep meeting), and it is enabled by
     // presence in this list: a destination the catalog knows and the values omit is refused as
     // `RegionUnavailable`, which is a silent refusal rather than an error at boot. The chart gate
     // catches a malformed entry and cannot catch a missing one, so the assertion has to be here.
-    expect(helm).toMatch(/- code:\s*USDC_ASSETHUB/);
+    expect(helm).toMatch(/- asset:\s*usdc@assethub/);
   });
 
   it('accepts more than one destination', () => {
@@ -791,8 +855,8 @@ describe('parseConfig', () => {
     const cfg = parseConfig(
       rawConfig({
         limits: [
-          { code: 'USDC_ASSETHUB', min: '10.00', max: '2000.00', currency: 'USD' },
-          { code: 'DOT_ASSETHUB', min: '25.00', max: '500.00', currency: 'USD' },
+          { asset: 'usdc@assethub', min: '10.00', max: '2000.00', currency: 'USD' },
+          { asset: 'dot@assethub', min: '25.00', max: '500.00', currency: 'USD' },
         ],
       }),
     );
@@ -854,7 +918,7 @@ describe('parseConfig', () => {
       catalog_interval_ms: 24 * 3_600_000,
       routes_interval_ms: 2 * 3_600_000,
       sell_routes_interval_ms: 12 * 3_600_000,
-      offramp_lanes: [{ code: 'DOT_ASSETHUB', chain: 'assethub' }],
+      offramp_lanes: [{ asset: 'dot@assethub', code: 'DOT', chain: 'assethub' }],
     };
     const omitted = rawConfig() as Record<string, unknown>;
     delete omitted.supported;
@@ -865,33 +929,28 @@ describe('parseConfig', () => {
   describe('supported.offramp_lanes', () => {
     const lanes = (value: unknown) => () => parseConfig(rawConfig({ supported: { offramp_lanes: value } }));
 
-    it('accepts an ordered list of delivered and sell-only codes', () => {
+    it('accepts an ordered list of delivered and sell-only assets, each with its code and chain', () => {
       const value = [
-        { code: 'DOT_ASSETHUB', chain: 'assethub' },
-        { code: 'DOT_STATEMINT', chain: 'assethub' },
-        { code: 'USDT_STATEMINT', chain: 'assethub' },
-        { code: 'USDC_ARBITRUM', chain: 'arbitrum' },
-        { code: 'USDT_SOLANA', chain: 'solana' },
+        { asset: 'usdt@assethub' },
+        { asset: 'dot@assethub' },
+        { asset: 'usdc@arbitrum' },
+        { asset: 'usdt@solana' },
       ];
-      expect(lanes(value)()['supported'].offramp_lanes).toEqual(value);
+      expect(lanes(value)()['supported'].offramp_lanes).toEqual([
+        { asset: 'usdt@assethub', code: 'USDT_DOT', chain: 'assethub' },
+        { asset: 'dot@assethub', code: 'DOT', chain: 'assethub' },
+        { asset: 'usdc@arbitrum', code: 'USDC_ARBITRUM', chain: 'arbitrum' },
+        { asset: 'usdt@solana', code: 'USDT_SOLANA', chain: 'solana' },
+      ]);
     });
 
-    it('refuses an empty list, an unknown code, a duplicate and an unknown key', () => {
+    it('refuses an empty list, an unknown asset, a duplicate and an unknown key', () => {
       expect(lanes([])).toThrow();
-      expect(lanes([{ code: 'BTC', chain: 'bitcoin' }])).toThrow(/Unknown offramp lane code/);
-      expect(
-        lanes([
-          { code: 'USDT_SOLANA', chain: 'solana' },
-          { code: 'USDT_SOLANA', chain: 'solana' },
-        ]),
-      ).toThrow(/Duplicate/);
-      expect(lanes([{ code: 'USDT_SOLANA', chain: 'solana', extra: 1 }])).toThrow();
-      expect(lanes([{ code: 'USDT_SOLANA' }])).toThrow();
-    });
-
-    it('refuses a chain that does not match the code', () => {
-      expect(lanes([{ code: 'USDC_SOLANA', chain: 'assethub' }])).toThrow(/not "assethub"/);
-      expect(lanes([{ code: 'DOT_STATEMINT', chain: 'solana' }])).toThrow(/chain/);
+      expect(lanes([{ asset: 'btc@bitcoin' }])).toThrow(/offramp_lanes\.0\.asset/);
+      expect(lanes([{ asset: 'usdt@solana' }, { asset: 'usdt@solana' }])).toThrow(/Duplicate offramp lane "usdt@solana"/);
+      expect(lanes([{ asset: 'usdt@solana', extra: 1 }])).toThrow();
+      // The old shape: the chain now comes from the asset and the code from `assets`.
+      expect(lanes([{ code: 'USDT_SOLANA', chain: 'solana' }])).toThrow();
     });
   });
 
@@ -1030,31 +1089,31 @@ describe('parseConfig', () => {
     );
   });
 
-  it('refuses a boot probe naming a destination the catalog does not have', () => {
-    // Meld resolves an unrecognised destination code to Bitcoin rather than refusing it, so a
-    // typo here returns BTC quotes and the probe reports "Meld credentials accepted" for a
-    // corridor this deployment does not serve. The probe moves no money, which makes it false
-    // confidence rather than a wrong purchase, and false confidence at boot is precisely what
-    // the probe exists to rule out.
-    const meld = { ...(rawConfig().meld as Record<string, unknown>) };
-    meld.boot_probe = { ...(meld.boot_probe as Record<string, unknown>), destination_code: 'USDC_ASSETHB' };
-
-    expect(() => parseConfig(rawConfig({ meld }))).toThrow(
-      /Unknown destination code\. The boot probe must name one this service delivers\./,
-    );
+  it('refuses a boot probe naming an asset the catalog does not have, or one no buyer receives', () => {
+    // A probe on an asset this deployment does not deliver would report "Meld credentials
+    // accepted" for a corridor it does not serve: false confidence at boot, which is precisely
+    // what the probe exists to rule out.
+    const probe = (asset: string) => () => {
+      const meld = { ...(rawConfig().meld as Record<string, unknown>) };
+      meld.boot_probe = { ...(meld.boot_probe as Record<string, unknown>), asset };
+      return parseConfig(rawConfig({ meld }));
+    };
+    expect(probe('usdc@assethb')).toThrow(/boot_probe\.asset/);
+    expect(probe('usdc@solana')).toThrow(/The boot probe must name an asset this service delivers to a buyer\./);
   });
 
-  it.each(['USDC_ASSETHUB', 'USDT_ASSETHUB', 'DOT_ASSETHUB'])(
-    'accepts the catalog destination %s as the boot probe corridor',
-    (code) => {
-      // The check is against the catalog, not against the configured `limits`: the probe proves
-      // the credential, and an operator may prove it on a corridor they have not priced yet.
-      const meld = { ...(rawConfig().meld as Record<string, unknown>) };
-      meld.boot_probe = { ...(meld.boot_probe as Record<string, unknown>), destination_code: code };
+  it.each([
+    ['usdc@assethub', 'USDC_DOT'],
+    ['usdt@assethub', 'USDT_DOT'],
+    ['dot@assethub', 'DOT'],
+  ])('accepts the catalog destination %s as the boot probe corridor, sent as %s', (asset, code) => {
+    // The check is against the catalog, not against the configured `limits`: the probe proves
+    // the credential, and an operator may prove it on a corridor they have not priced yet.
+    const meld = { ...(rawConfig().meld as Record<string, unknown>) };
+    meld.boot_probe = { ...(meld.boot_probe as Record<string, unknown>), asset };
 
-      expect(parseConfig(rawConfig({ meld })).meld.boot_probe.destination_code).toBe(code);
-    },
-  );
+    expect(parseConfig(rawConfig({ meld })).meld.boot_probe.destination_code).toBe(code);
+  });
 
   it.each(['ws://people:9944', 'http://people:9944'])(
     'refuses an unauthenticated People-chain RPC (%s) outside development',
@@ -1154,17 +1213,17 @@ describe('parseConfig', () => {
       parseConfig(
         rawConfig({
           limits: [
-            { code: 'USDC_ASSETHUB', min: '10.00', max: '20.00', currency: 'USD' },
-            { code: 'USDC_ASSETHUB', min: '30.00', max: '40.00', currency: 'USD' },
+            { asset: 'usdc@assethub', min: '10.00', max: '20.00', currency: 'USD' },
+            { asset: 'usdc@assethub', min: '30.00', max: '40.00', currency: 'USD' },
           ],
         }),
       ),
-    ).toThrow(/Duplicate limits for "USDC_ASSETHUB"/);
+    ).toThrow(/Duplicate limits for "usdc@assethub"/);
   });
 
   it('refuses a lowercase currency, because the request currency is upper-cased to match', () => {
     expect(() =>
-      parseConfig(rawConfig({ limits: [{ code: 'USDC_ASSETHUB', min: '10.00', max: '20.00', currency: 'usd' }] })),
+      parseConfig(rawConfig({ limits: [{ asset: 'usdc@assethub', min: '10.00', max: '20.00', currency: 'usd' }] })),
     ).toThrow(/Invalid configuration/);
   });
 
@@ -1183,7 +1242,7 @@ describe('parseConfig', () => {
           api_key: { mode: 'env', var: 'K' },
           api_version: '2025-01-01',
           boot_probe: {
-            destination_code: 'USDC_ASSETHUB',
+            asset: 'usdc@assethub',
             source_amount: '20',
             source_currency: 'USD',
             country_code: 'US',

@@ -130,7 +130,7 @@ describe('Onramp.quote', () => {
     const { service } = build(meld);
 
     await service.quote({
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       fiat: 'usd',
       country: 'US',
@@ -143,7 +143,7 @@ describe('Onramp.quote', () => {
       direction: 'buy',
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       paymentMethodType: 'CREDIT_DEBIT_CARD',
     });
@@ -154,7 +154,7 @@ describe('Onramp.quote', () => {
     const { service } = build(meld);
 
     const result = await service.quote({
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       fiat: 'usd',
       country: 'US',
@@ -162,7 +162,7 @@ describe('Onramp.quote', () => {
     });
 
     expect(result.requested).toEqual({
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       fiat: 'USD',
     });
@@ -192,7 +192,7 @@ describe('Onramp.quote', () => {
     const { service } = build(meld);
 
     await service.quote({
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '999999',
       fiat: 'USD',
       country: 'US',
@@ -267,7 +267,7 @@ describe('Onramp.quote', () => {
 
     const failure = await failureOf(() =>
       service.quote({
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         sourceAmount: '20',
         fiat: 'EUR',
         country: 'DE',
@@ -284,11 +284,11 @@ describe('Onramp.quote', () => {
     const meld = new FakeMeld();
     // A configured deployment, just not for this destination: the schema requires at least one
     // limit, and "in the catalog but not served here" is what `RegionUnavailable` means.
-    const { service } = build(meld, config({ limits: [{ code: 'DOT_ASSETHUB', min: '10.00', max: '2000.00', currency: 'USD' }] }));
+    const { service } = build(meld, config({ limits: [{ asset: 'dot@assethub', min: '10.00', max: '2000.00', currency: 'USD' }] }));
 
     const failure = await failureOf(() =>
       service.quote({
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         sourceAmount: '20',
         fiat: 'USD',
         country: 'US',
@@ -312,7 +312,7 @@ describe('Onramp.quote', () => {
     const { service } = build(meld);
 
     const answered = await service.quote({
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       fiat: 'USD',
       country: 'US',
@@ -331,7 +331,7 @@ describe('Onramp.quote', () => {
     expect(
       (
         await service.quote({
-          destinationCurrencyCode: 'USDC_ASSETHUB',
+          destinationCurrencyCode: 'USDC_DOT',
           sourceAmount: '20',
           fiat: 'USD',
           country: 'US',
@@ -351,7 +351,7 @@ describe('Onramp.quote', () => {
     const service = new Onramp(config(), registry(meld, chainflip), audit, funding, meld, () => NOW, () => 'funding-1');
 
     await service.quote({
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       fiat: 'USD',
       country: 'US',
@@ -368,7 +368,7 @@ describe('Onramp.quote', () => {
     const svc = new Onramp(config(), registry(meld), audit, onlyMeld, meld, () => NOW, () => 'funding-1');
     const failure = await failureOf(() =>
       svc.quote({
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         sourceAmount: '20',
         fiat: 'USD',
         country: 'US',
@@ -410,7 +410,7 @@ describe('Onramp.create', () => {
 
   it('hands the rail every term of the request, translated', async () => {
     // Nothing asserted the shape of this call. Four independent constant substitutions in
-    // `Onramp.createSession` (`destinationCode: 'DOT_ASSETHUB'`, `sourceAmount: '1.00'`,
+    // `Onramp.createSession` (`destinationCode: 'DOT'`, `sourceAmount: '1.00'`,
     // `countryCode: ''`, `paymentMethodType: 'SEPA'`) each survived all 861 tests, because the
     // durable row and the response `pinned` are built from separate expressions and so constrain
     // this one not at all. Every term here decides what the buyer is actually charged and where
@@ -1078,7 +1078,7 @@ describe('Onramp.create', () => {
         requestId: REQUEST_ID,
         rail: 'meld',
         providerSessionId: 'meld-1',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: ALICE,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -1104,7 +1104,7 @@ describe('Onramp.create', () => {
         productId: 'app.dot',
         requestId: REQUEST_ID,
         rail: 'meld',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: ALICE,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -1144,7 +1144,7 @@ describe('Onramp.create', () => {
         requestId: REQUEST_ID,
         rail: 'meld',
         direction: 'sell',
-        destinationCurrencyCode: 'DOT_ASSETHUB',
+        destinationCurrencyCode: 'DOT',
         cryptoAmount: '12.3456789012',
         fiat: 'GBP',
         reason: 'Other',
@@ -1197,7 +1197,7 @@ describe('Onramp.create', () => {
         productId: 'app.dot',
         requestId: REQUEST_ID,
         rail: 'meld',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: ALICE,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -1252,7 +1252,7 @@ describe('Onramp.create', () => {
       [{ destinationCurrencyCode: 'NOT_REAL' }, 'WrongAssetOrChain'],
       [{ sourceAmount: '9.99' }, 'BelowMinimum'],
       [{ sourceAmount: '2000.01' }, 'AboveMaximum'],
-      [{ destinationCurrencyCode: 'DOT_ASSETHUB' }, 'RegionUnavailable'],
+      [{ destinationCurrencyCode: 'DOT' }, 'RegionUnavailable'],
       [{ walletAddress: 'not-an-address' }, 'Other'],
     ] as const) {
       const { service, funding } = build(new FakeMeld());
@@ -1267,7 +1267,7 @@ describe('Onramp.create', () => {
   describe('refuses before spending anything', () => {
     it.each([
       ['an unknown destination code', { destinationCurrencyCode: 'NOT_REAL' }, 'WrongAssetOrChain'],
-      ['a destination with no configured limits', { destinationCurrencyCode: 'DOT_ASSETHUB' }, 'RegionUnavailable'],
+      ['a destination with no configured limits', { destinationCurrencyCode: 'DOT' }, 'RegionUnavailable'],
       ['an amount below the minimum', { sourceAmount: '9.99' }, 'BelowMinimum'],
       ['an amount above the maximum', { sourceAmount: '2000.01' }, 'AboveMaximum'],
       ['an unconfigured currency', { fiat: 'EUR' }, 'Other'],
@@ -1350,7 +1350,7 @@ describe('Onramp.create', () => {
           // service emitted before sell existed; only a sell carries the new keys. `toEqual`
           // rather than `toMatchObject` is what makes that assertable: an added key fails here.
           providerSessionId: 'meld-1',
-          destinationCurrencyCode: 'USDC_ASSETHUB',
+          destinationCurrencyCode: 'USDC_DOT',
           // The normalised address, because that is what the rail was actually given.
           walletAddress: ALICE,
           sourceAmount: '25.00',
@@ -1707,7 +1707,7 @@ describe('cancelling a request', () => {
     // A self-loop update: the row need not have reached `transaction_seen` for the disclosure to
     // matter, which is the point (see `FundingStore.cancel`).
     await funding.update(opened.fundingRequestId, 'session_opened', NOW + 1, {
-      deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+      deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
     });
 
     const failure = await failureOf(() => service.cancel(SUBJECT, opened.fundingRequestId, REQUEST_ID, NOW + 5));
@@ -1762,7 +1762,7 @@ describe('cancelling a request', () => {
     );
     await funding.update(opened.fundingRequestId, 'transaction_seen', NOW + 1, {
       providerTransactionId: 'tx-1',
-      deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+      deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
     });
     await funding.update(opened.fundingRequestId, 'failed', NOW + 2, { providerStatus: 'FAILED' });
 
@@ -2044,7 +2044,7 @@ describe('a sell request', () => {
 
     expect(meld.calls[0]).toEqual({
       direction: 'sell',
-      destinationCode: 'DOT_ASSETHUB',
+      destinationCode: 'DOT',
       cryptoAmount: '12.3456789012',
       fiat: 'GBP',
       countryCode: 'GB',
@@ -2058,8 +2058,8 @@ describe('a sell request', () => {
   });
 
   it('does not run the fiat limit gate, which would compare crypto against fiat', async () => {
-    // The configured limits cover USDC_ASSETHUB in USD and nothing else, so a buy of
-    // DOT_ASSETHUB is `RegionUnavailable` before any rail call. A sell of the same corridor must
+    // The configured limits cover USDC_DOT in USD and nothing else, so a buy of
+    // DOT is `RegionUnavailable` before any rail call. A sell of the same corridor must
     // not be refused by that gate: the bound is fiat, the committed amount is crypto, and the
     // comparison is minor units of two different things. The sell's bound is the provider's,
     // applied upstream at session time and returned as the same BelowMinimum/AboveMaximum tags.
@@ -2067,7 +2067,7 @@ describe('a sell request', () => {
     const { service } = build(meld);
 
     const buyRefusal = await failureOf(() =>
-      service.createSession(SUBJECT, createRequest({ destinationCurrencyCode: 'DOT_ASSETHUB' }), REQUEST_ID),
+      service.createSession(SUBJECT, createRequest({ destinationCurrencyCode: 'DOT' }), REQUEST_ID),
     );
     expect(buyRefusal.tag).toBe('RegionUnavailable');
     expect(meld.calls).toHaveLength(0);
@@ -2099,7 +2099,7 @@ describe('a sell request', () => {
     const row = await funding.byId(created.fundingRequestId);
 
     expect(created.pinned).toEqual({
-      destinationCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'DOT',
       cryptoAmount: '12.3456789012',
       fiat: 'GBP',
       country: 'GB',
@@ -2158,7 +2158,7 @@ describe('a sell request', () => {
 
     const answer = await service.quote({
       direction: 'sell',
-      destinationCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'DOT',
       cryptoAmount: '12.3456789012',
       fiat: 'GBP',
       country: 'GB',
@@ -2166,7 +2166,7 @@ describe('a sell request', () => {
     });
 
     expect(answer.requested).toEqual({
-      destinationCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'DOT',
       cryptoAmount: '12.3456789012',
       fiat: 'GBP',
     });
@@ -2179,7 +2179,7 @@ describe('a sell request', () => {
 
     await service.quote({
       direction: 'sell',
-      destinationCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'DOT',
       cryptoAmount: '12.3456789012',
       fiat: 'gbp',
       country: 'GB',
@@ -2193,7 +2193,7 @@ describe('a sell request', () => {
       direction: 'sell',
       countryCode: 'GB',
       sourceCurrencyCode: 'GBP',
-      destinationCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'DOT',
       cryptoAmount: '12.3456789012',
       paymentMethodType: 'PAYOUT_TO_BANK',
     });
@@ -2201,7 +2201,7 @@ describe('a sell request', () => {
 
   it('does not run the fiat limit gate on a sell quote either', async () => {
     // The mirror of the session-side case above, and it matters more now that a sell is served:
-    // the configured limits cover USDC_ASSETHUB in USD only, so this corridor has no fiat bound
+    // the configured limits cover USDC_DOT in USD only, so this corridor has no fiat bound
     // at all, and applying one would compare DOT against GBP in minor units. A sell's floor and
     // ceiling are the provider's, at quote time.
     const meld = new FakeMeld();
@@ -2209,7 +2209,7 @@ describe('a sell request', () => {
 
     const answer = await service.quote({
       direction: 'sell',
-      destinationCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'DOT',
       cryptoAmount: '0.0000000001',
       fiat: 'GBP',
       country: 'GB',
@@ -2230,7 +2230,7 @@ describe('a sell request', () => {
 
     await expect(
       service.quote({
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         fiat: 'USD',
         country: 'US',
         paymentMethodType: 'CREDIT_DEBIT_CARD',
@@ -2429,7 +2429,7 @@ describe('the reservation invariant', () => {
   });
 
   it.each([
-    ['a different destination', { destinationCurrencyCode: 'DOT_ASSETHUB' }],
+    ['a different destination', { destinationCurrencyCode: 'DOT' }],
     ['a different fiat', { fiat: 'EUR' }],
   ])('refuses a key reused with %s', async (_label, change) => {
     // These two need a deployment that actually serves more than one destination and currency:
@@ -2440,9 +2440,9 @@ describe('the reservation invariant', () => {
       meld,
       config({
         limits: [
-          { code: 'USDC_ASSETHUB', min: '10.00', max: '2000.00', currency: 'USD' },
-          { code: 'USDC_ASSETHUB', min: '10.00', max: '2000.00', currency: 'EUR' },
-          { code: 'DOT_ASSETHUB', min: '10.00', max: '2000.00', currency: 'USD' },
+          { asset: 'usdc@assethub', min: '10.00', max: '2000.00', currency: 'USD' },
+          { asset: 'usdc@assethub', min: '10.00', max: '2000.00', currency: 'EUR' },
+          { asset: 'dot@assethub', min: '10.00', max: '2000.00', currency: 'USD' },
         ],
       }),
     );

@@ -165,7 +165,7 @@ describe('createWidgetSession', () => {
     expect(body).toEqual({
       sessionType: 'BUY',
       sessionData: {
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: '1abc',
         sourceAmount: '25.00',
         sourceCurrencyCode: 'USD',
@@ -204,7 +204,7 @@ describe('createWidgetSession', () => {
     expect(JSON.parse(sentInit(fetchMock).body as string)).toEqual({
       sessionType: 'SELL',
       sessionData: {
-        sourceCurrencyCode: 'DOT_ASSETHUB',
+        sourceCurrencyCode: 'DOT',
         destinationCurrencyCode: 'GBP',
         sourceAmount: '12.3456789012',
         countryCode: 'GB',
@@ -258,7 +258,7 @@ describe('createWidgetSession', () => {
     const fetchMock = stub(200, session);
     await client().createWidgetSession({
       ...sellParams(),
-      cryptoCurrencyCode: 'USDC_ASSETHUB',
+      cryptoCurrencyCode: 'USDC_DOT',
       fiatCurrencyCode: 'EUR',
       countryCode: 'DE',
       paymentMethodType: 'SEPA',
@@ -549,7 +549,7 @@ describe('quote', () => {
     expect(sentBody(fetchMock)).toEqual({
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       paymentMethodType: 'CREDIT_DEBIT_CARD',
     });
@@ -566,7 +566,7 @@ describe('quote', () => {
 
     expect(sentBody(fetchMock)).toEqual({
       countryCode: 'GB',
-      sourceCurrencyCode: 'DOT_ASSETHUB',
+      sourceCurrencyCode: 'DOT',
       destinationCurrencyCode: 'GBP',
       // `sourceAmount`, still mandatory, and crypto-denominated: a sell quote answers "what does
       // this much crypto fetch", never "how much must I sell to receive 500".
@@ -661,7 +661,7 @@ describe('quote', () => {
           sourceAmount: 21.47,
           sourceCurrencyCode: 'USD',
           destinationAmount: 20,
-          destinationCurrencyCode: 'USDC_ASSETHUB',
+          destinationCurrencyCode: 'USDC_DOT',
           totalFee: 1.47,
           transactionFee: 0.19,
           networkFee: 0.28,
@@ -693,7 +693,7 @@ describe('quote', () => {
     stubRaw(
       200,
       `{"quotes":[{"serviceProvider":"P","sourceAmount":${literal},"sourceCurrencyCode":"USD",` +
-        `"destinationAmount":"1","destinationCurrencyCode":"USDC_ASSETHUB"}]}`,
+        `"destinationAmount":"1","destinationCurrencyCode":"USDC_DOT"}]}`,
     );
 
     const [offer] = await client().quote(probe());
@@ -710,7 +710,7 @@ describe('quote', () => {
           sourceAmount: 1,
           sourceCurrencyCode: 'USD',
           destinationAmount: 1,
-          destinationCurrencyCode: 'USDC_ASSETHUB',
+          destinationCurrencyCode: 'USDC_DOT',
           rampIntelligence: { rampScore: 21.66 },
         },
       ],
@@ -733,7 +733,7 @@ describe('quote', () => {
       200,
       `{"quotes":[{"serviceProvider":"TRANSAK","sourceAmount":${sourceAmount},` +
         `"sourceCurrencyCode":"USD","destinationAmount":${sourceAmount},` +
-        `"destinationCurrencyCode":"DOT_ASSETHUB","totalFee":${totalFee}}]}`,
+        `"destinationCurrencyCode":"DOT","totalFee":${totalFee}}]}`,
     );
 
     const [offer] = await client().quote(probe());
@@ -751,7 +751,7 @@ describe('quote', () => {
           sourceAmount: '20',
           sourceCurrencyCode: 'USD',
           destinationAmount: '19.5',
-          destinationCurrencyCode: 'USDC_ASSETHUB',
+          destinationCurrencyCode: 'USDC_DOT',
         },
         { serviceProvider: 'PARTIAL', sourceCurrencyCode: 'USD' },
         {
@@ -759,7 +759,7 @@ describe('quote', () => {
           sourceAmount: '21',
           sourceCurrencyCode: 'USD',
           destinationAmount: '19.4',
-          destinationCurrencyCode: 'USDC_ASSETHUB',
+          destinationCurrencyCode: 'USDC_DOT',
         },
       ],
     });
@@ -796,7 +796,7 @@ describe('the guard on the legs, before anything is sent', () => {
     const fetchMock = stub(200, { quotes: [] });
 
     await expect(
-      client().quoteSell({ ...sellProbe(), cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'DOT_ASSETHUB' }),
+      client().quoteSell({ ...sellProbe(), cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'DOT' }),
     ).rejects.toThrow(/legs are crossed/);
     neverSent(fetchMock);
   });
@@ -807,13 +807,13 @@ describe('the guard on the legs, before anything is sent', () => {
     const fetchMock = stub(200, { quotes: [] });
 
     await expect(
-      client().quote({ ...probe(), sourceCurrencyCode: 'DOT_ASSETHUB', destinationCurrencyCode: 'USD' }),
+      client().quote({ ...probe(), sourceCurrencyCode: 'DOT', destinationCurrencyCode: 'USD' }),
     ).rejects.toThrow(/legs are crossed/);
     neverSent(fetchMock);
   });
 
   it.each([
-    ['both crypto', { cryptoCurrencyCode: 'DOT_ASSETHUB', fiatCurrencyCode: 'USDC_ASSETHUB' }],
+    ['both crypto', { cryptoCurrencyCode: 'DOT', fiatCurrencyCode: 'USDC_DOT' }],
     ['both fiat', { cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'USD' }],
   ])('refuses a sell naming %s, which the source check alone would not see', async (_label, legs) => {
     // The "both crypto" case passes the source test and is still unsendable. The "both fiat"
@@ -831,7 +831,7 @@ describe('the guard on the legs, before anything is sent', () => {
     const fetchMock = stub(200, { quotes: [] });
 
     await expect(
-      client().quote({ ...probe(), sourceCurrencyCode: 'DOT_ASSETHUB', destinationCurrencyCode: 'USDC_ASSETHUB' }),
+      client().quote({ ...probe(), sourceCurrencyCode: 'DOT', destinationCurrencyCode: 'USDC_DOT' }),
     ).rejects.toThrow(/legs are crossed/);
     neverSent(fetchMock);
   });
@@ -857,8 +857,8 @@ describe('the guard on the legs, before anything is sent', () => {
 
     const crossed =
       direction === 'sell'
-        ? client().createWidgetSession({ ...sellParams(), cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'DOT_ASSETHUB' })
-        : client().createWidgetSession({ ...params(), sourceCurrency: 'DOT_ASSETHUB', destinationCode: 'USD' });
+        ? client().createWidgetSession({ ...sellParams(), cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'DOT' })
+        : client().createWidgetSession({ ...params(), sourceCurrency: 'DOT', destinationCode: 'USD' });
 
     await expect(crossed).rejects.toThrow(/legs are crossed/);
     neverSent(fetchMock);
@@ -872,7 +872,7 @@ describe('the guard on the legs, before anything is sent', () => {
     stub(200, { quotes: [] });
 
     const error = await client()
-      .quoteSell({ ...sellProbe(), cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'DOT_ASSETHUB' })
+      .quoteSell({ ...sellProbe(), cryptoCurrencyCode: 'GBP', fiatCurrencyCode: 'DOT' })
       .catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(Error);
@@ -1090,7 +1090,7 @@ describe('verifyCredentials', () => {
           sourceAmount: '20',
           sourceCurrencyCode: 'USD',
           destinationAmount: '19.5',
-          destinationCurrencyCode: 'USDC_ASSETHUB',
+          destinationCurrencyCode: 'USDC_DOT',
         },
       ],
     });
@@ -1122,7 +1122,7 @@ describe('verifyCredentials', () => {
 
 const params = (): BuyWidgetSessionParams => ({
   direction: 'buy',
-  destinationCode: 'USDC_ASSETHUB',
+  destinationCode: 'USDC_DOT',
   walletAddress: '1abc',
   sourceAmount: '25.00',
   sourceCurrency: 'USD',
@@ -1134,14 +1134,14 @@ const params = (): BuyWidgetSessionParams => ({
 /**
  * The sell counterpart, named by leg rather than by Meld's field.
  *
- * The same corridor read the other way round: `DOT_ASSETHUB` is what is sold and `GBP` is what
+ * The same corridor read the other way round: `DOT` is what is sold and `GBP` is what
  * comes back. The amount carries ten fraction digits, which is DOT's own precision and more than
  * the fiat validator can express, so a test that sees it survive to the wire has seen something
  * `sourceAmount` could not have carried.
  */
 const sellParams = (): SellWidgetSessionParams => ({
   direction: 'sell',
-  cryptoCurrencyCode: 'DOT_ASSETHUB',
+  cryptoCurrencyCode: 'DOT',
   fiatCurrencyCode: 'GBP',
   cryptoAmount: '12.3456789012',
   countryCode: 'GB',
@@ -1152,7 +1152,7 @@ const sellParams = (): SellWidgetSessionParams => ({
 const probe = () => ({
   countryCode: 'US',
   sourceCurrencyCode: 'USD',
-  destinationCurrencyCode: 'USDC_ASSETHUB',
+  destinationCurrencyCode: 'USDC_DOT',
   sourceAmount: '20',
   paymentMethodType: 'CREDIT_DEBIT_CARD',
 });
@@ -1160,7 +1160,7 @@ const probe = () => ({
 /** The sell counterpart of `probe`: crypto in, fiat out, priced from the crypto. */
 const sellProbe = () => ({
   countryCode: 'GB',
-  cryptoCurrencyCode: 'DOT_ASSETHUB',
+  cryptoCurrencyCode: 'DOT',
   fiatCurrencyCode: 'GBP',
   cryptoAmount: '12.3456789012',
   paymentMethodType: 'PAYOUT_TO_BANK',
@@ -1287,7 +1287,7 @@ describe('discovery reads', () => {
   it('publicGet omits the key (global scope) yet still returns the parsed body', async () => {
     const fetchMock = stub(200, { ok: true });
     const body = await client().publicGet(
-      '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT_ASSETHUB',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT',
     );
     expect(sentMethod(fetchMock)).toBe('GET');
     expect((sentInit(fetchMock).headers as Record<string, string>).authorization).toBeUndefined();

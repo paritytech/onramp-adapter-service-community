@@ -18,6 +18,7 @@ import { FundingStore } from './funding/store.js';
 import { startWorker, type RailObservation } from './funding/worker.js';
 import { startSupportedRefresh, type RefreshJob } from './supported/refresh.js';
 import { MeldClient, MeldHttpError } from './meld/client.js';
+import { AssetCatalog, installCatalog, type AssetId } from './meld/catalog.js';
 import { MeldDiscovery } from './meld/discovery.js';
 import { Onramp } from './onramp.js';
 import { MeldRail } from './meld/rail.js';
@@ -29,17 +30,22 @@ import { validateWithCommitment } from './personhood/verifiablejs.js';
 import { resolveSecret } from './secret.js';
 import { buildServer } from './server.js';
 
-// The cryptos the supported-corridors refresh enumerates; DOT only in v1, the table is crypto-keyed so more are additive.
-const SUPPORTED_REFRESH_CRYPTOS = ['DOT_ASSETHUB'];
+// The assets the supported-corridors refresh enumerates; DOT only in v1, the table is crypto-keyed so more are additive.
+const SUPPORTED_REFRESH_ASSETS: readonly AssetId[] = ['dot@assethub'];
 
 /**
- * Every job the refresh walks: both directions for each configured crypto, plus a sell job per
- * offramp lane. A job that finds no provider writes nothing, which is not a failure.
+ * Every job the refresh walks: both directions for each refreshed asset this deployment names
+ * (under its configured code), plus a sell job per offramp lane. A job that finds no provider
+ * writes nothing, which is not a failure.
  */
-export function refreshJobs(lanes: readonly { code: string }[]): RefreshJob[] {
-  const jobs: RefreshJob[] = SUPPORTED_REFRESH_CRYPTOS.flatMap((crypto) =>
-    DIRECTIONS.map((direction) => ({ crypto, direction })),
-  );
+export function refreshJobs(
+  lanes: readonly { code: string }[],
+  assets: Readonly<Partial<Record<AssetId, string>>>,
+): RefreshJob[] {
+  const jobs: RefreshJob[] = SUPPORTED_REFRESH_ASSETS.flatMap((asset) => {
+    const crypto = assets[asset];
+    return crypto === undefined ? [] : DIRECTIONS.map((direction) => ({ crypto, direction }));
+  });
   for (const { code } of lanes) {
     if (!jobs.some((j) => j.crypto === code && j.direction === 'sell')) {
       jobs.push({ crypto: code, direction: 'sell' });
@@ -79,6 +85,8 @@ export async function start(
   observations?: Readonly<Partial<Record<RailName, RailObservation>>>,
 ): Promise<ServerHandle> {
   const cfg = await loadConfig(configPath);
+  // Before anything can resolve a code: every lookup in `meld/catalog.ts` reads this.
+  installCatalog(new AssetCatalog(cfg.assets));
   const apiKey = await resolveSecret(cfg.meld.api_key);
 
   const meld = new MeldClient(cfg.meld.base_url, apiKey, cfg.meld.api_version, cfg.meld.timeout_ms);
@@ -198,6 +206,7 @@ export async function start(
   //
 
     await verifyKey(meld, cfg, app.log);
+    await verifyAssetCodes(meld, cfg, app.log);
     await app.listen({ port: cfg.server.port, host: cfg.server.host });
 
   // The worker advances in-flight requests even when no SPA is open. Observation dispatch is per
@@ -253,7 +262,7 @@ export async function start(
       ? startSupportedRefresh(
           discovery,
           funding,
-          refreshJobs(cfg.supported.offramp_lanes),
+          refreshJobs(cfg.supported.offramp_lanes, cfg.assets),
           {
             catalogMs: cfg.supported.catalog_interval_ms,
             routesMs: cfg.supported.routes_interval_ms,
@@ -344,6 +353,71 @@ export async function verifyKey(
     if (error instanceof MeldHttpError) throw error;
     log.warn({ detail: String(error) }, 'Could not reach Meld at boot; the key is unverified.');
   }
+}
+
+/**
+ * Ask Meld for every configured asset code before the port opens, so a renamed code stops the
+ * rollout naming itself instead of refusing every buyer of that asset.
+ *
+ * One buy quote per code, in the boot probe's corridor (country, fiat, amount, method). A buy
+ * quote is the probe because Meld prices a buy of every code it knows, sell-only ones included,
+ * and answers an unknown one `400 INVALID_QUERY_PARAMETER`, where its routes endpoint answers an
+ * unknown code and an unrouted one alike with `[]` (verified against api-sb.meld.io).
+ *
+ * The outcomes follow `verifyKey`'s split, per code:
+ *
+ *   Meld answered with an error status: fatal. The code is not one Meld knows (Meld renamed
+ *     `DOT_ASSETHUB` to `DOT` with no deprecation period), and serving it would refuse every
+ *     buyer or seller of the asset.
+ *   Meld priced a different code: fatal. That is the Bitcoin fallback of threat model T4, which
+ *     the quote would otherwise have carried into a locked checkout.
+ *   No offers, or Meld could not be reached: warn and continue. Either says nothing about the
+ *     code: the corridor may be dry for it, or Meld briefly down.
+ *
+ * Every code is asked and every problem reported at once, like the config.
+ */
+export async function verifyAssetCodes(
+  meld: Pick<MeldClient, 'quote'>,
+  cfg: Config,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  const probe = cfg.meld.boot_probe;
+  const named = Object.entries(cfg.assets);
+  const answers = await Promise.allSettled(
+    named.map(([, code]) =>
+      meld.quote({
+        countryCode: probe.country_code,
+        sourceCurrencyCode: probe.source_currency,
+        destinationCurrencyCode: code,
+        sourceAmount: probe.source_amount,
+        paymentMethodType: probe.payment_method_type,
+      }),
+    ),
+  );
+  const problems: string[] = [];
+  answers.forEach((answer, i) => {
+    const [asset, code] = named[i] ?? ['', ''];
+    if (answer.status === 'rejected') {
+      const error: unknown = answer.reason;
+      if (error instanceof MeldHttpError) {
+        const why = `HTTP ${String(error.status)}${error.code === undefined ? '' : ` ${error.code}`}`;
+        problems.push(`  assets.${asset}: Meld refused "${code}" (${why}); it may have been renamed.`);
+      } else {
+        log.warn({ asset, code, detail: String(error) }, 'Could not reach Meld to check an asset code; it is unverified.');
+      }
+      return;
+    }
+    const other = answer.value.find((q) => q.destinationCurrencyCode !== code);
+    if (other !== undefined) {
+      problems.push(`  assets.${asset}: Meld priced "${other.destinationCurrencyCode}" when asked for "${code}".`);
+    } else if (answer.value.length === 0) {
+      log.warn({ asset, code }, 'Meld offered no quotes for an asset code in the boot probe corridor; it is unverified.');
+    }
+  });
+  if (problems.length > 0) {
+    throw new Error(`Meld does not know these asset codes:\n${problems.join('\n')}`);
+  }
+  log.info({ codes: named.length }, 'Meld knows every configured asset code.');
 }
 
 /**

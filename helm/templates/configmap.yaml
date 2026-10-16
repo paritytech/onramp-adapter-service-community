@@ -66,6 +66,7 @@ data:
           "token_ttl_s": {{ int (.Values.auth.personhood.token_ttl_s | default 300) }}
         }
       },
+      "assets": {{ toJson .Values.assets }},
       "limits": {{ toJson .Values.limits }},
       "allowed_products": {{ toJson .Values.allowed_products }},
       "cors": {{ toJson (dict "allowed_origins" ((index (.Values.cors | default (dict)) "allowed_origins") | default list)) }},

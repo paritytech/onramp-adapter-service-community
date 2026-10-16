@@ -17,7 +17,7 @@
 import { base58Decode, decodeAddress, encodeAddress } from '@polkadot/util-crypto';
 
 import { reject } from './contract.js';
-import { isOfframpOnly } from './meld/catalog.js';
+import { chainOf } from './meld/catalog.js';
 
 /** Polkadot Asset Hub. Passed explicitly at every call site; never defaulted. */
 const POLKADOT_SS58_PREFIX = 0;
@@ -76,11 +76,11 @@ export function normalizeAddress(input: string): string {
  * equal rather than looking like a changed address.
  */
 export function canonicalizeDisclosedAddress(input: string, code: string): string | undefined {
-  // Sell-only codes on other chains take that chain's format; `*_STATEMINT` falls through to SS58.
-  if (isOfframpOnly(code)) {
-    if (code.endsWith('_ARBITRUM')) return evmAddress(input);
-    if (code.endsWith('_SOLANA')) return solanaAddress(input);
-  }
+  // Codes on other chains take that chain's format. Everything else is SS58, including a code a
+  // since-renamed config no longer names: every code this service has retired was Asset Hub's.
+  const chain = chainOf(code);
+  if (chain === 'arbitrum') return evmAddress(input);
+  if (chain === 'solana') return solanaAddress(input);
   // `decodeAddress('')` throws, but spelling the empty case out here rather than relying on that
   // is what stops a future, more permissive base58 decoder from ever making an empty string look
   // like a valid, if peculiar, account.

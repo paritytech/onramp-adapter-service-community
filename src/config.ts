@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises';
 import { compile } from '@fastify/proxy-addr';
 import { z } from 'zod';
 
-import { DESTINATIONS, chainOf, isSellable } from './meld/catalog.js';
+import { ASSETS, ASSET_IDS, type AssetId } from './meld/catalog.js';
 import { MINOR_UNIT_DECIMAL, toMinorUnits } from './money.js';
 
 /** Shared so the refinement below can re-test it; see the guard in `limit`. */
@@ -136,12 +136,24 @@ const secretSource = z.discriminatedUnion('mode', [
   z.object({ mode: z.literal('env'), var: z.string().min(1) }).strict(),
 ]);
 
+/** An asset by this service's own name for it; see `meld/catalog.ts`. */
+const assetId = z.enum(ASSET_IDS);
+
+/**
+ * Meld's current code for an asset. Uppercase letters, digits and `_`, which is every code Meld has
+ * shipped; anything else is a typo that would otherwise reach a locked checkout field.
+ */
+const meldCode = z.string().regex(/^[A-Z0-9_]{2,32}$/, 'A Meld code is uppercase letters, digits and "_".');
+
+/** Refuse an asset no buyer may receive, for the fields that name a buy's destination. */
+const deliverable = (asset: AssetId): boolean => ASSETS[asset].deliverable;
+
 /**
  * Per-destination limits. Rules about a single limit live here, not on the root schema.
  */
 const limit = z
   .object({
-    code: z.string().min(1),
+    asset: assetId,
     min: decimal,
     max: decimal,
     /** Canonical uppercase ISO 4217, because the request currency is upper-cased to match. */
@@ -149,11 +161,11 @@ const limit = z
   })
   .strict()
   .superRefine((entry, ctx) => {
-    if (!DESTINATIONS.some((d) => d.code === entry.code)) {
+    if (!deliverable(entry.asset)) {
       ctx.addIssue({
         code: 'custom',
-        path: ['code'],
-        message: `Unknown destination code "${entry.code}". Adding a destination is a code change.`,
+        path: ['asset'],
+        message: `"${entry.asset}" is never delivered to a buyer, so it has no buy limits.`,
       });
     }
 
@@ -170,7 +182,7 @@ const limit = z
       ctx.addIssue({
         code: 'custom',
         path: ['min'],
-        message: `Minimum ${entry.min} exceeds maximum ${entry.max} for "${entry.code}".`,
+        message: `Minimum ${entry.min} exceeds maximum ${entry.max} for "${entry.asset}".`,
       });
     }
   });
@@ -232,16 +244,14 @@ const configSchema = z
         boot_probe: z
           .object({
             /**
-             * From the same catalog the routes are held to.
+             * An asset this service delivers, sent under the code `assets` names it by.
              *
-             * Meld resolves an unrecognised destination code to Bitcoin rather than refusing
-             * it (see `meld/catalog.ts`), so a typo here returns BTC quotes and the probe reports
-             * "Meld credentials accepted" for a corridor this deployment does not serve. The
-             * probe moves no money, which makes it false confidence rather than a wrong purchase,
-             * and false confidence at boot is exactly what the probe exists to rule out.
+             * By asset rather than by code, so a Meld rename is the one edit in `assets`. The
+             * same corridor (country, fiat, amount) also carries the per-code check at boot that
+             * every configured code is one Meld knows; see `verifyAssetCodes` in `startup.ts`.
              */
-            destination_code: z.string().refine((code) => DESTINATIONS.some((d) => d.code === code), {
-              message: 'Unknown destination code. The boot probe must name one this service delivers.',
+            asset: assetId.refine(deliverable, {
+              message: 'The boot probe must name an asset this service delivers to a buyer.',
             }),
             source_amount: z.string().min(1),
             source_currency: z.string().length(3),
@@ -352,6 +362,16 @@ const configSchema = z
      *     closed and every code refuses.
      */
     limits: z.array(limit).default([]),
+    /**
+     * What Meld calls each asset, by this service's own name for it (`dot@assethub: DOT`).
+     *
+     * The only place a Meld code is written down. Meld renames codes (`DOT_ASSETHUB` is now `DOT`),
+     * so the name is configuration and the asset is code: `limits`, `meld.boot_probe` and
+     * `supported.offramp_lanes` all name assets, and a rename is this one line. Required, with no
+     * default, because a wrong code is a wrong purchase; every code listed is asked of Meld at boot.
+     * An asset left out is not served at all.
+     */
+    assets: z.partialRecord(assetId, meldCode),
     /**
      * Product ids permitted to spend the key.
      *
@@ -555,35 +575,20 @@ const configSchema = z
           .max(7 * 86_400_000)
           .default(12 * 3_600_000),
         /**
-         * Sell lanes behind `GET /supported/offramp*`, in preference order. Codes must be sellable
-         * (Meld resolves a typo to Bitcoin) and `chain` must match the code.
+         * Sell lanes behind `GET /supported/offramp*`, in preference order, by asset. The chain
+         * comes from the asset and the code from `assets`.
          */
         offramp_lanes: z
-          .array(z.object({ code: z.string().min(1), chain: z.string().min(1) }).strict())
+          .array(z.object({ asset: assetId }).strict())
           .min(1)
-          .default([{ code: 'DOT_ASSETHUB', chain: 'assethub' }])
+          .default([{ asset: 'dot@assethub' }])
           .superRefine((lanes, ctx) => {
             const seen = new Set<string>();
             lanes.forEach((lane, index) => {
-              if (!isSellable(lane.code)) {
-                ctx.addIssue({
-                  code: 'custom',
-                  path: [index, 'code'],
-                  message: `Unknown offramp lane code "${lane.code}". Adding a code is a code change.`,
-                });
+              if (seen.has(lane.asset)) {
+                ctx.addIssue({ code: 'custom', path: [index, 'asset'], message: `Duplicate offramp lane "${lane.asset}".` });
               }
-              const expected = chainOf(lane.code);
-              if (expected !== undefined && expected !== lane.chain) {
-                ctx.addIssue({
-                  code: 'custom',
-                  path: [index, 'chain'],
-                  message: `Offramp lane "${lane.code}" is on chain "${expected}", not "${lane.chain}".`,
-                });
-              }
-              if (seen.has(lane.code)) {
-                ctx.addIssue({ code: 'custom', path: [index, 'code'], message: `Duplicate offramp lane code "${lane.code}".` });
-              }
-              seen.add(lane.code);
+              seen.add(lane.asset);
             });
           }),
       })
@@ -894,25 +899,80 @@ const configSchema = z
     }
 
     // Only the cross-entry rule belongs here; per-limit rules live on `limit` above. A limit is
-    // keyed by (code, currency): a destination may be offered in several fiats (a card buyer pays
+    // keyed by (asset, currency): a destination may be offered in several fiats (a card buyer pays
     // USD, a SEPA buyer pays EUR), each with its own bounds. A second entry for the same
-    // (code, currency) is silently ignored by lookup, so refuse that rather than pick one.
+    // (asset, currency) is silently ignored by lookup, so refuse that rather than pick one.
     const seen = new Set<string>();
     for (const [i, entry] of cfg.limits.entries()) {
-      const key = `${entry.code}:${entry.currency}`;
+      const key = `${entry.asset}:${entry.currency}`;
       if (seen.has(key)) {
         ctx.addIssue({
           code: 'custom',
-          path: ['limits', i, 'code'],
-          message: `Duplicate limits for "${entry.code}" in ${entry.currency}.`,
+          path: ['limits', i, 'asset'],
+          message: `Duplicate limits for "${entry.asset}" in ${entry.currency}.`,
         });
       }
       seen.add(key);
     }
+
+    // Two assets under one code would make a deposit or a quote mean either of them.
+    const owners = new Map<string, string>();
+    for (const [asset, code] of Object.entries(cfg.assets)) {
+      const first = owners.get(code);
+      if (first !== undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['assets', asset],
+          message: `Meld code "${code}" is already the code for "${first}".`,
+        });
+      } else {
+        owners.set(code, asset);
+      }
+    }
+
+    // Every asset the config refers to has to be named, or there is no code to send for it.
+    const named = (asset: AssetId, path: (string | number)[]): void => {
+      if (cfg.assets[asset] === undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path,
+          message: `"${asset}" has no Meld code: add it to "assets".`,
+        });
+      }
+    };
+    cfg.limits.forEach((entry, i) => {
+      named(entry.asset, ['limits', i, 'asset']);
+    });
+    named(cfg.meld.boot_probe.asset, ['meld', 'boot_probe', 'asset']);
+    cfg.supported.offramp_lanes.forEach((lane, i) => {
+      named(lane.asset, ['supported', 'offramp_lanes', i, 'asset']);
+    });
+  })
+  // Resolve every asset reference to the code it is sent under, once, so nothing downstream reads
+  // `assets` itself. Runs only on a config the refinements above passed, so every lookup hits.
+  .transform((cfg) => {
+    // `?? ''` only satisfies the type: zod skips a transform on a config with issues.
+    const codeOf = (asset: AssetId): string => cfg.assets[asset] ?? '';
+    return {
+      ...cfg,
+      limits: cfg.limits.map((entry) => ({ ...entry, code: codeOf(entry.asset) })),
+      meld: {
+        ...cfg.meld,
+        boot_probe: { ...cfg.meld.boot_probe, destination_code: codeOf(cfg.meld.boot_probe.asset) },
+      },
+      supported: {
+        ...cfg.supported,
+        offramp_lanes: cfg.supported.offramp_lanes.map((lane) => ({
+          asset: lane.asset,
+          code: codeOf(lane.asset),
+          chain: ASSETS[lane.asset].chain,
+        })),
+      },
+    };
   });
 
 /** The validated configuration. Every consumer takes this, never the raw parsed JSON. */
-export type Config = z.infer<typeof configSchema>;
+export type Config = z.output<typeof configSchema>;
 
 /**
  * Parse and validate, or throw with every problem at once.

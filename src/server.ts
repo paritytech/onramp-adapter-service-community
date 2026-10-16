@@ -42,6 +42,7 @@ import {
   type ErrorResponse,
   fundingListQuery,
 } from './contract.js';
+import { AssetCatalog } from './meld/catalog.js';
 import { toCorridorDto } from './meld/discovery.js';
 import { toFundingRequestDto } from './funding/types.js';
 import { MeldHttpError } from './meld/client.js';
@@ -290,6 +291,14 @@ export async function buildServer(
    * removes the amplifier without touching the exemption.
    */
   app.get('/health', { logLevel: 'silent' }, async () => ({ status: 'ok' }));
+
+  // What Meld calls each asset this deployment serves, by this service's own name for it. A client
+  // sends these codes on /quote and /session rather than writing its own copy of them, so a Meld
+  // rename is one config edit here and no client release. Static for the life of the process.
+  const assets = new AssetCatalog(cfg.assets)
+    .all()
+    .map(({ asset, code, chain, deliverable }) => ({ asset, code, chain, deliverable }));
+  app.get('/assets', asCaller, async () => ({ assets }));
 
   /** Spends a Meld call but no money, which is why boot uses it as the credential probe. */
   app.post('/quote', asCaller, async (request, reply) =>

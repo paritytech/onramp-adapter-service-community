@@ -356,7 +356,7 @@ describe('the v5 -> v6 migration', () => {
       schema,
       'INSERT INTO funding_requests (id, subject_alias, product_id, destination_currency_code, ' +
         'wallet_address, source_amount, fiat, payment_method_type, rail, status, status_history, ' +
-        "created_at, updated_at) VALUES ('bought', 'alias-abc', 'app.dot', 'USDC_ASSETHUB', " +
+        "created_at, updated_at) VALUES ('bought', 'alias-abc', 'app.dot', 'USDC_DOT', " +
         "'0x0', '25.00', 'USD', 'CREDIT_DEBIT_CARD', 'meld', 'settled', '[]', 1, 1)",
     );
     return schema;
@@ -538,7 +538,7 @@ describe('the per-direction term constraints', () => {
       const sold = await store.byId('sold');
       expect(sold).toMatchObject({
         direction: 'sell',
-        destination_currency_code: 'DOT_ASSETHUB',
+        destination_currency_code: 'DOT',
         crypto_amount: '12.3456789012',
         fiat: 'GBP',
       });
@@ -584,7 +584,7 @@ describe('the real migration chain', () => {
         schema,
         "INSERT INTO funding_requests (id, subject_alias, product_id, destination_currency_code, " +
           "wallet_address, source_amount, fiat, payment_method_type, rail, status, status_history, " +
-          "created_at, updated_at) VALUES ('older', 'alias-abc', 'app.dot', 'USDC_ASSETHUB', " +
+          "created_at, updated_at) VALUES ('older', 'alias-abc', 'app.dot', 'USDC_DOT', " +
           "'0x0', '25.00', 'USD', 'CREDIT_DEBIT_CARD', 'meld', 'settled', '[]', 1, 1)",
       );
 
@@ -612,26 +612,26 @@ describe('the real migration chain', () => {
       // v5's table is reachable through the store, not just present: the upsert and read prove the
       // migration landed somewhere the code can use.
       await store.upsertCorridor({
-        destination_currency_code: 'DOT_ASSETHUB',
+        destination_currency_code: 'DOT',
         direction: 'buy',
         country: 'BR',
         name: 'Brazil',
         fiat: 'BRL',
         methods: [{ paymentMethodType: 'PIX', category: 'bank', min: '10', max: '5000', currency: 'BRL' }],
       });
-      expect((await store.readCorridors('DOT_ASSETHUB', 'buy')).map((c) => c.country)).toEqual(['BR']);
+      expect((await store.readCorridors('DOT', 'buy')).map((c) => c.country)).toEqual(['BR']);
       // v8: a sell corridor for the same (crypto, country) lands beside the buy row rather than
       // over it -- the migration's whole point.
       await store.upsertCorridor({
-        destination_currency_code: 'DOT_ASSETHUB',
+        destination_currency_code: 'DOT',
         direction: 'sell',
         country: 'BR',
         name: 'Brazil',
         fiat: 'BRL',
         methods: [{ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank', min: '5', max: '1000', currency: 'BRL' }],
       });
-      expect((await store.readCorridors('DOT_ASSETHUB', 'buy')).map((c) => c.country)).toEqual(['BR']);
-      expect((await store.readCorridors('DOT_ASSETHUB', 'sell')).map((c) => c.country)).toEqual(['BR']);
+      expect((await store.readCorridors('DOT', 'buy')).map((c) => c.country)).toEqual(['BR']);
+      expect((await store.readCorridors('DOT', 'sell')).map((c) => c.country)).toEqual(['BR']);
       // v6: the pre-existing row is a buy, because it could not have been anything else, and the
       // column's DEFAULT is what says so without a backfill.
       expect(carried?.direction).toBe('buy');
@@ -647,10 +647,10 @@ describe('the real migration chain', () => {
       // v7: a deposit-address disclosure conflict is reachable through `store.update`, not just
       // present in the table, and the accepted address is left exactly as it was.
       await store.update('sold', 'transaction_seen', 2, {
-        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT' },
       });
       await store.update('sold', 'transaction_seen', 3, {
-        deposit: { address: BOB, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        deposit: { address: BOB, amount: '12.3456789012', currency: 'DOT' },
       });
       const disputed = await store.byId('sold');
       expect(disputed?.deposit_address).toBe(ALICE);

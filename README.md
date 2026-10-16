@@ -45,8 +45,10 @@ never holds a key that can move anyone's funds.
 
 ## Which network
 
-The shipped example points at **Paseo**, Polkadot's public test network, and the destination codes
-(`DOT_ASSETHUB`, `USDC_ASSETHUB`, `USDT_ASSETHUB`) settle on Asset Hub. Nothing is pinned to
+The shipped example points at **Paseo**, Polkadot's public test network, and the destinations
+(`dot@assethub`, `usdc@assethub`, `usdt@assethub`, which Meld currently calls `DOT`, `USDC_DOT` and
+`USDT_DOT`) settle on Asset Hub. Meld's codes are configuration (`assets`), not code, so when Meld
+renames one the fix is a config edit; the pod refuses to boot on a code Meld no longer knows. Nothing is pinned to
 Paseo, so retargeting is a config change. Do it deliberately: a mainnet destination means a real
 card charge buying real tokens.
 

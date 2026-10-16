@@ -254,8 +254,8 @@ these assets is onboarded, the same code starts returning it, without a deploy.
 
 ### Offramp lanes
 
-A sell can settle through more than one crypto lane (USDT or DOT on Asset Hub, each under either of
-Meld's codes for it, or a stablecoin sold after a Chainflip swap). `supported.offramp_lanes` lists the lanes in preference order, and the two
+A sell can settle through more than one crypto lane (USDT or DOT on Asset Hub, or a stablecoin sold
+after a Chainflip swap). `supported.offramp_lanes` lists the lanes in preference order, and the two
 `/supported/offramp*` routes answer "what can a seller in this country use" without the caller
 picking a lane first.
 
@@ -266,7 +266,9 @@ payout method.
 
 Merge rule, per country: the set of countries is the union across lanes. For each
 `paymentMethodType`, the method lists **every** configured lane (in configuration order) whose corridor
-offers it, as `lanes: [{code, chain, min, max, currency}]`, each with that lane's own limits. The method's
+offers it, as `lanes: [{asset, code, chain, min, max, currency}]`, each with that lane's own limits. `asset`
+is this service's own name for the lane's asset, which a Meld rename does not change; `code` is what a quote
+or session for the lane must send. The method's
 own `min` is the smallest lane `min` and its `max` the largest lane `max` (compared as exact decimals, the
 original text is returned), and its `currency` is the country fiat. `name` and `fiat` come from the first
 lane that has the country. Methods are ordered by first sight across lanes in configuration order. A client
@@ -280,8 +282,8 @@ picks a lane from `lanes` and checks the amount against that lane's limits.
   "max": "5000",
   "currency": "BRL",
   "lanes": [
-    { "code": "DOT_ASSETHUB", "chain": "assethub", "min": "10", "max": "3000", "currency": "BRL" },
-    { "code": "USDC_ARBITRUM", "chain": "arbitrum", "min": "5", "max": "5000", "currency": "BRL" }
+    { "asset": "dot@assethub", "code": "DOT", "chain": "assethub", "min": "10", "max": "3000", "currency": "BRL" },
+    { "asset": "usdc@arbitrum", "code": "USDC_ARBITRUM", "chain": "arbitrum", "min": "5", "max": "5000", "currency": "BRL" }
   ]
 }
 ```
@@ -290,14 +292,35 @@ picks a lane from `lanes` and checks the amount against that lane's limits.
 rule as `GET /supported/corridors` except that sell rows age out after three *sell* routes passes (`supported.sell_routes_interval_ms`, 12h by default) rather than three buy passes; `GET /supported/offramp` asks Meld live, one `corridorForCountry`
 per lane in sell direction.
 
-The sell-only codes `USDT_SOLANA`, `USDC_SOLANA`, `USDC_ARBITRUM`, `DOT_STATEMINT` and `USDT_STATEMINT` are
-accepted wherever `direction=sell` is, and refused with `WrongAssetOrChain` on every buy path. `DOT_STATEMINT`
-and `USDT_STATEMINT` are Meld's older codes for DOT and USDT on Polkadot Asset Hub (Statemint was Asset Hub's
-name), which some providers, Onramp Money among them, buy only under those codes. The disclosed deposit address is validated per code: a
-`*_SOLANA` sell discloses a base58 32-byte address, stored and compared exactly as given (case-sensitive), not
-SS58-normalised; `USDC_ARBITRUM` discloses an EVM address (`0x` plus 40 hex), stored lowercased so comparisons are
-case-insensitive; the `*_STATEMINT` codes disclose an Asset Hub address, SS58-normalised like `DOT_ASSETHUB`. Anything
+The sell-only codes (`USDT_SOLANA`, `USDC_SOLANA`, `USDC_ARBITRUM` in the shipped config) are
+accepted wherever `direction=sell` is, and refused with `WrongAssetOrChain` on every buy path. The disclosed
+deposit address is validated per chain: a Solana sell discloses a base58 32-byte address, stored and compared
+exactly as given (case-sensitive), not SS58-normalised; an Arbitrum sell discloses an EVM address (`0x` plus 40
+hex), stored lowercased so comparisons are case-insensitive; an Asset Hub sell discloses an SS58 address,
+normalised to the Polkadot prefix. Anything
 else for that code is recorded as malformed and never disclosed.
+
+## `GET /assets`
+
+What Meld calls each asset this deployment serves, by this service's own name for it. Behind the
+caller gate like every route but `/health`. Static for the life of the process, so a client reads
+it once and sends the `code` it names on `/quote`, `/session` and the `/supported*` routes, rather
+than keeping its own copy of Meld's codes: when Meld renames one, the operator edits `assets` and
+no client release follows.
+
+```json
+{
+  "assets": [
+    { "asset": "dot@assethub", "code": "DOT", "chain": "assethub", "deliverable": true },
+    { "asset": "usdt@assethub", "code": "USDT_DOT", "chain": "assethub", "deliverable": true },
+    { "asset": "usdc@assethub", "code": "USDC_DOT", "chain": "assethub", "deliverable": true },
+    { "asset": "usdc@solana", "code": "USDC_SOLANA", "chain": "solana", "deliverable": false },
+    { "asset": "usdc@arbitrum", "code": "USDC_ARBITRUM", "chain": "arbitrum", "deliverable": false }
+  ]
+}
+```
+
+`deliverable` is whether a buyer may receive it; the others are sold only.
 
 ## `POST /quote`
 
@@ -315,7 +338,7 @@ pay. Omitting it is a local `MALFORMED_REQUEST`, before any upstream call.
 {
   "country": "US",
   "fiat": "USD",
-  "destinationCurrencyCode": "USDC_ASSETHUB",
+  "destinationCurrencyCode": "USDC_DOT",
   "sourceAmount": "21.47",
   "paymentMethodType": "CREDIT_DEBIT_CARD"
 }
@@ -332,7 +355,7 @@ breakdown is complete:
       "sourceAmount": "21.47",
       "sourceCurrencyCode": "USD",
       "destinationAmount": "20",
-      "destinationCurrencyCode": "USDC_ASSETHUB",
+      "destinationCurrencyCode": "USDC_DOT",
       "exchangeRate": "0.9315",
       "totalFee": "1.47",
       "transactionFee": "0.19",
@@ -340,7 +363,7 @@ breakdown is complete:
       "partnerFee": "1.00"
     }
   ],
-  "requested": { "destinationCurrencyCode": "USDC_ASSETHUB", "sourceAmount": "21.47", "fiat": "USD" }
+  "requested": { "destinationCurrencyCode": "USDC_DOT", "sourceAmount": "21.47", "fiat": "USD" }
 }
 ```
 
@@ -352,7 +375,7 @@ first.
 ```json
 {
   "quotes": [ /* ... */ ],
-  "requested": { "destinationCurrencyCode": "DOT_ASSETHUB", "cryptoAmount": "12.3456789012", "fiat": "GBP" }
+  "requested": { "destinationCurrencyCode": "DOT", "cryptoAmount": "12.3456789012", "fiat": "GBP" }
 }
 ```
 
@@ -401,7 +424,7 @@ guarantee about what the provider's widget will allow.
   "idempotencyKey": "<caller-prefix>-<uuid-v4>",
   "country": "US",
   "fiat": "USD",
-  "destinationCurrencyCode": "USDC_ASSETHUB",
+  "destinationCurrencyCode": "USDC_DOT",
   "sourceAmount": "21.47",
   "walletAddress": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
   "paymentMethodType": "CREDIT_DEBIT_CARD",
@@ -419,7 +442,7 @@ and no `walletAddress`:
   "direction": "sell",
   "country": "GB",
   "fiat": "GBP",
-  "destinationCurrencyCode": "DOT_ASSETHUB",
+  "destinationCurrencyCode": "DOT",
   "cryptoAmount": "12.3456789012",
   "paymentMethodType": "PAYOUT_TO_BANK",
   "serviceProvider": "TRANSAK"
@@ -452,7 +475,7 @@ Rejected as `REDIRECT_NOT_ALLOWED`, locally.
   "widgetUrl": "https://meldcrypto.com/?sessionId=...",
   "expiresAt": 1800000000000,
   "pinned": {
-    "destinationCurrencyCode": "USDC_ASSETHUB",
+    "destinationCurrencyCode": "USDC_DOT",
     "walletAddress": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
     "sourceAmount": "21.47",
     "fiat": "USD",
@@ -561,7 +584,7 @@ for another caller's alike.
   "direction": "buy",
   "status": "transaction_seen",
   "providerStatus": "PENDING",
-  "destinationCurrencyCode": "USDC_ASSETHUB",
+  "destinationCurrencyCode": "USDC_DOT",
   "walletAddress": "15oF4u...",
   "sourceAmount": "21.47",
   "fiat": "USD",
@@ -585,7 +608,7 @@ On a sell whose provider has disclosed a deposit address, the object also carrie
 "deposit": {
   "address": "1CounterpartyDepositAddressXXXXXXXXXXXXXXXXX",
   "amount": "12.3456789012",
-  "currency": "DOT_ASSETHUB",
+  "currency": "DOT",
   "observedAt": 1800000000200
 }
 ```
