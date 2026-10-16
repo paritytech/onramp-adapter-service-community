@@ -68,6 +68,20 @@ function asHexString(value: unknown, what: string): string {
   return value;
 }
 
+// A hex quantity to a bigint, rejecting "0x" and non-hex so a malformed RPC reply is a typed
+// ChainUnavailableError (mapped to 502/503) rather than a raw `BigInt('0x')` throw behind a 500.
+function hexToBigInt(value: unknown, what: string): bigint {
+  const hex = asHexString(value, what);
+  if (!/^0x[0-9a-fA-F]+$/.test(hex)) {
+    throw new ChainUnavailableError(`rpc ${what}: not a hex quantity, got ${JSON.stringify(value)}`);
+  }
+  return BigInt(hex);
+}
+
+// A sanity ceiling on the gas price the operator will sign for: a real Arbitrum fee is orders of
+// magnitude below this, so a larger one is a misbehaving or hostile RPC, not a fee to pay.
+const MAX_SANE_FEE_WEI = 1_000_000_000_000n; // 1000 gwei
+
 /** One SaleVault on one chain, read and written by the operator. */
 export class SaleVaultClient {
   readonly operatorAddress: string;
@@ -127,18 +141,31 @@ export class SaleVaultClient {
     return this.send(encodeWithdrawDust(amount));
   }
 
+  /** The receipt of a broadcast transaction, or null when it is not yet mined (or was dropped). */
+  async receipt(txHash: string): Promise<{ status: boolean } | null> {
+    const r = (await this.rpc('eth_getTransactionReceipt', [txHash])) as { status?: string } | null;
+    if (r === null || r === undefined) return null;
+    return { status: r.status === '0x1' };
+  }
+
   // Build, sign and broadcast an EIP-1559 call to the contract.
   private async send(data: string): Promise<string> {
-    const [nonceHex, baseFeeHex, tipHex] = await Promise.all([
+    const [nonceHex, baseFee, tipHex] = await Promise.all([
       this.rpc('eth_getTransactionCount', [this.operatorAddress, 'pending']),
       this.baseFee(),
       this.rpc('eth_maxPriorityFeePerGas', []),
     ]);
-    const tip = BigInt(asHexString(tipHex, 'maxPriorityFeePerGas'));
-    const baseFee = BigInt(baseFeeHex);
+    const tip = hexToBigInt(tipHex, 'maxPriorityFeePerGas');
+    // Refuse to sign against a gas price the RPC reports beyond any real fee: a hostile or broken
+    // RPC returning a huge base fee or tip would otherwise drain the operator's gas on one send.
+    if (baseFee > MAX_SANE_FEE_WEI || tip > MAX_SANE_FEE_WEI) {
+      throw new ChainUnavailableError(
+        `rpc gas price beyond the sane ceiling: baseFee ${baseFee.toString()}, tip ${tip.toString()}`,
+      );
+    }
     const tx: Eip1559Tx = {
       chainId: this.cfg.chainId,
-      nonce: BigInt(asHexString(nonceHex, 'getTransactionCount')),
+      nonce: hexToBigInt(nonceHex, 'getTransactionCount'),
       maxPriorityFeePerGas: tip,
       maxFeePerGas: baseFee * 2n + tip, // headroom for the base fee moving between now and inclusion
       gasLimit: await this.estimateGas(data),
@@ -151,9 +178,9 @@ export class SaleVaultClient {
     return signed.hash;
   }
 
-  private async baseFee(): Promise<string> {
+  private async baseFee(): Promise<bigint> {
     const block = (await this.rpc('eth_getBlockByNumber', ['latest', false])) as { baseFeePerGas?: string } | null;
-    return block?.baseFeePerGas ?? '0x0';
+    return block?.baseFeePerGas === undefined ? 0n : hexToBigInt(block.baseFeePerGas, 'baseFeePerGas');
   }
 
   private async estimateGas(data: string): Promise<bigint> {
@@ -161,6 +188,6 @@ export class SaleVaultClient {
       { from: this.operatorAddress, to: this.cfg.contract, data },
     ]);
     // A 20% cushion over the estimate, so a slightly heavier path still fits.
-    return (BigInt(asHexString(estimate, 'estimateGas')) * 12n) / 10n;
+    return (hexToBigInt(estimate, 'estimateGas') * 12n) / 10n;
   }
 }

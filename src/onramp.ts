@@ -48,7 +48,7 @@ import {
 import { toMinorUnits } from './money.js';
 import type { Corridor, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
 import { saleRef } from './salevault/abi.js';
-import type { SaleVaultClient } from './salevault/chain.js';
+import { ChainUnavailableError, type SaleVaultClient } from './salevault/chain.js';
 
 /** Just the store surface onramp touches, injectable in a test. */
 export type FundingPort = Pick<
@@ -62,7 +62,10 @@ export type FundingPort = Pick<
   | 'cancel'
   | 'readCorridors'
   | 'readVaultSale'
-  | 'upsertVaultSale'
+  | 'touchVaultSale'
+  | 'claimVaultReturn'
+  | 'setVaultReturnTx'
+  | 'releaseVaultReturn'
 >;
 
 /** One corridor as the bulk endpoint serves it: the stored row without the internal keys. */
@@ -75,6 +78,10 @@ export interface SupportedCorridorDto {
 
 /** The on-chain `Sale.Status` ordinals, as labels, indexed by the ordinal the contract returns. */
 const SALE_STATUS_LABELS = ['none', 'paid', 'held', 'returned'] as const;
+
+/** How long a claimed return may sit unmined before a read releases it for a re-send: well past an
+ *  Arbitrum inclusion, so only a dropped broadcast (not a slow one) is ever re-sent. */
+const SALE_RETURN_RESEND_MS = 600_000;
 
 /** One off-ramp sale as the sale routes serve it: the on-chain state plus our own return record. */
 export interface OfframpSaleDto {
@@ -312,23 +319,45 @@ export class Onramp {
     const record = await this.funding.byAlias(id, subject.alias, subject.productId);
     if (record === undefined) return undefined;
     const vault = this.requireSaleVault('offrampSale');
-    const ref = saleRef(id);
-    const sale = await vault.sale(ref);
-    const prev = await this.funding.readVaultSale(id);
-    // The vault flips to Returned inside the return transaction, so a read that sees it settles our own record.
-    const returnStatus: VaultReturnStatus =
-      sale.status === 3 ? 'returned' : (prev?.return_status ?? 'none');
-    await this.funding.upsertVaultSale({
-      funding_request_id: id,
-      chain: this.cfg.sale_vault?.chain ?? '',
-      contract: vault.contractAddress,
-      ref,
-      contract_status: sale.status,
-      held: sale.held.toString(),
-      return_status: returnStatus,
-      return_tx: prev?.return_tx ?? null,
+    return this.onChain(async () => {
+      const ref = saleRef(id);
+      const sale = await vault.sale(ref);
+      // The vault flips to Returned inside the return transaction, so a read that sees it settles the
+      // row. The write never lowers return_status, so a poll that raced a return claim cannot undo it.
+      const returned = sale.status === 3;
+      await this.funding.touchVaultSale({
+        funding_request_id: id,
+        chain: this.cfg.sale_vault?.chain ?? '',
+        contract: vault.contractAddress,
+        ref,
+        contract_status: sale.status,
+        held: sale.held.toString(),
+        returned,
+      });
+      const row = await this.funding.readVaultSale(id);
+      // A return that broadcast but never mined leaves the sale Held with return_status 'returning'.
+      // Once it is stale and the tx is still not on chain, release the claim so a fresh POST re-sends
+      // it. Re-sending is safe: the contract refuses a second return on a sale that is no longer Held.
+      if (
+        row?.return_status === 'returning' &&
+        row.return_tx !== null &&
+        sale.status === 2 &&
+        this.clock() - row.updated_at > SALE_RETURN_RESEND_MS &&
+        (await vault.receipt(row.return_tx)) === null
+      ) {
+        await this.funding.releaseVaultReturn(id);
+        const released = await this.funding.readVaultSale(id);
+        return this.saleDto(id, ref, sale, released?.return_status ?? 'none', released?.return_tx ?? null, vault.contractAddress);
+      }
+      return this.saleDto(
+        id,
+        ref,
+        sale,
+        row?.return_status ?? (returned ? 'returned' : 'none'),
+        row?.return_tx ?? null,
+        vault.contractAddress,
+      );
     });
-    return this.saleDto(id, ref, sale, returnStatus, prev?.return_tx ?? null, vault.contractAddress);
   }
 
   // Return a held sale to its own on-chain home, funds cannot be redirected. 404 unknown, 409 if not Held.
@@ -336,37 +365,60 @@ export class Onramp {
     const record = await this.funding.byAlias(id, subject.alias, subject.productId);
     if (record === undefined) return undefined;
     const vault = this.requireSaleVault('offrampReturn');
-    const ref = saleRef(id);
-    const prev = await this.funding.readVaultSale(id);
-    // A return already in flight is not broadcast again, so a retried tap cannot sign a second one.
-    if (prev !== undefined && prev.return_status !== 'none') {
-      const current = await vault.sale(ref);
-      return this.saleDto(id, ref, current, prev.return_status, prev.return_tx, vault.contractAddress);
-    }
-    const sale = await vault.sale(ref);
-    if (sale.status !== 2) {
-      throw reject(
-        {
-          tag: 'Other',
-          value: { code: 'SALE_NOT_RETURNABLE', message: 'That sale has nothing held to return.', fundingRequestId: id },
-        },
-        `offrampReturn on sale ${id} with on-chain status ${String(sale.status)}, not Held`,
-        409,
-      );
-    }
-    // cfParameters empty: a plain xSwapToken back to Asset Hub, no CCM or broker leg.
-    const returnTx = await vault.returnHeld(ref, '0x');
-    await this.funding.upsertVaultSale({
-      funding_request_id: id,
-      chain: this.cfg.sale_vault?.chain ?? '',
-      contract: vault.contractAddress,
-      ref,
-      contract_status: sale.status,
-      held: sale.held.toString(),
-      return_status: 'returning',
-      return_tx: returnTx,
+    return this.onChain(async () => {
+      const ref = saleRef(id);
+      const sale = await vault.sale(ref);
+      const chain = this.cfg.sale_vault?.chain ?? '';
+      // Already returned on chain: settle the row and report it rather than 409.
+      if (sale.status === 3) {
+        await this.funding.touchVaultSale({
+          funding_request_id: id,
+          chain,
+          contract: vault.contractAddress,
+          ref,
+          contract_status: sale.status,
+          held: sale.held.toString(),
+          returned: true,
+        });
+        const row = await this.funding.readVaultSale(id);
+        return this.saleDto(id, ref, sale, 'returned', row?.return_tx ?? null, vault.contractAddress);
+      }
+      if (sale.status !== 2) {
+        throw reject(
+          {
+            tag: 'Other',
+            value: { code: 'SALE_NOT_RETURNABLE', message: 'That sale has nothing held to return.', fundingRequestId: id },
+          },
+          `offrampReturn on sale ${id} with on-chain status ${String(sale.status)}, not Held`,
+          409,
+        );
+      }
+      // Claim the return before signing, so a retried or concurrent tap cannot broadcast a second one.
+      const claimed = await this.funding.claimVaultReturn({
+        funding_request_id: id,
+        chain,
+        contract: vault.contractAddress,
+        ref,
+        contract_status: sale.status,
+        held: sale.held.toString(),
+      });
+      if (!claimed) {
+        const row = await this.funding.readVaultSale(id);
+        const current = await vault.sale(ref);
+        return this.saleDto(id, ref, current, row?.return_status ?? 'returning', row?.return_tx ?? null, vault.contractAddress);
+      }
+      let returnTx: string;
+      try {
+        // cfParameters empty: a plain xSwapToken back to Asset Hub, no CCM or broker leg.
+        returnTx = await vault.returnHeld(ref, '0x');
+      } catch (error) {
+        // The broadcast never left, so release the claim and let the return be re-sent.
+        await this.funding.releaseVaultReturn(id);
+        throw error;
+      }
+      await this.funding.setVaultReturnTx(id, returnTx);
+      return this.saleDto(id, ref, sale, 'returning', returnTx, vault.contractAddress);
     });
-    return this.saleDto(id, ref, sale, 'returning', returnTx, vault.contractAddress);
   }
 
   /** The configured SaleVault client, or a 503 that names the missing configuration rather than crashing. */
@@ -379,6 +431,23 @@ export class Onramp {
       );
     }
     return this.saleVault;
+  }
+
+  /** Run a chain operation, turning an unreachable or erroring RPC into a 503 the caller can retry,
+   *  rather than a bare 500 (a malformed reply or transport failure surfaces as ChainUnavailableError). */
+  private async onChain<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (error) {
+      if (error instanceof ChainUnavailableError) {
+        throw reject(
+          { tag: 'Other', value: { code: 'SALE_VAULT_CHAIN_UNAVAILABLE', message: 'The sale vault chain is unavailable.' } },
+          error.message,
+          503,
+        );
+      }
+      throw error;
+    }
   }
 
   /** One sale view, shared by the read and the return paths so the two cannot drift apart. */

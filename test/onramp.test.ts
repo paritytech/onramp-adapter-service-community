@@ -13,7 +13,7 @@ import { railRefusal } from '../src/meld/refusal.js';
 import { TERMINAL_STATES } from '../src/funding/state.js';
 import { toFundingRequestDto } from '../src/funding/types.js';
 import { Onramp, type FundingPort } from '../src/onramp.js';
-import type { SaleVaultClient } from '../src/salevault/chain.js';
+import { ChainUnavailableError, type SaleVaultClient } from '../src/salevault/chain.js';
 import type { FundingRail, MeldTransactionReader, RailBuySession, RailQuote, RailName, RailRegistry, RailSession, RailSessionInput, RailTransaction } from '../src/rail.js';
 import {
   ALICE,
@@ -535,7 +535,10 @@ describe('Onramp.create', () => {
       list: async () => [],
       readCorridors: async () => [],
       readVaultSale: async () => undefined,
-      upsertVaultSale: async () => undefined,
+      touchVaultSale: async () => undefined,
+      claimVaultReturn: async () => true,
+      setVaultReturnTx: async () => undefined,
+      releaseVaultReturn: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), new FakeAudit(), funding, meld, () => NOW, () => 'funding-1');
 
@@ -570,7 +573,10 @@ describe('Onramp.create', () => {
       list: async () => [],
       readCorridors: async () => [],
       readVaultSale: async () => undefined,
-      upsertVaultSale: async () => undefined,
+      touchVaultSale: async () => undefined,
+      claimVaultReturn: async () => true,
+      setVaultReturnTx: async () => undefined,
+      releaseVaultReturn: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), audit, funding, meld, () => NOW, () => 'funding-1');
 
@@ -1179,7 +1185,10 @@ describe('Onramp.create', () => {
         list: (alias, product, limit) => funding.list(alias, product, limit),
         readCorridors: (code, direction) => funding.readCorridors(code, direction),
         readVaultSale: (id) => funding.readVaultSale(id),
-        upsertVaultSale: (row) => funding.upsertVaultSale(row),
+        touchVaultSale: (row) => funding.touchVaultSale(row),
+        claimVaultReturn: (row) => funding.claimVaultReturn(row),
+        setVaultReturnTx: (id, tx) => funding.setVaultReturnTx(id, tx),
+        releaseVaultReturn: (id) => funding.releaseVaultReturn(id),
         // Rejects, not throws: a synchronous throw is caught whether or not the call is
         // awaited, so it would go green against a missing `await`.
         update: () => Promise.reject(new Error('database is locked')),
@@ -2610,7 +2619,10 @@ describe('recording a refusal is best-effort', () => {
       list: async () => [],
       readCorridors: async () => [],
       readVaultSale: async () => undefined,
-      upsertVaultSale: async () => undefined,
+      touchVaultSale: async () => undefined,
+      claimVaultReturn: async () => true,
+      setVaultReturnTx: async () => undefined,
+      releaseVaultReturn: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), audit, broken, meld, () => NOW);
 
@@ -2660,13 +2672,20 @@ describe('the off-ramp SaleVault surface', () => {
     ...over,
   });
 
-  // A structural stand-in for the client: onramp only reads `sale`, `returnHeld` and the address.
-  const stubVault = (over: Partial<{ sale: () => Promise<SaleRead>; returnHeld: () => Promise<string> }> = {}) =>
+  // A structural stand-in for the client: onramp reads `sale`, `returnHeld`, `receipt` and the address.
+  const stubVault = (
+    over: Partial<{
+      sale: () => Promise<SaleRead>;
+      returnHeld: () => Promise<string>;
+      receipt: () => Promise<{ status: boolean } | null>;
+    }> = {},
+  ) =>
     ({
       contractAddress: CONTRACT,
       operatorAddress: `0x${'3e'.repeat(20)}`,
       sale: async () => sale(),
       returnHeld: async () => `0x${'cd'.repeat(32)}`,
+      receipt: async () => null,
       ...over,
     }) as unknown as SaleVaultClient;
 
@@ -2796,5 +2815,63 @@ describe('the off-ramp SaleVault surface', () => {
   it('answers 404 (undefined) for a return on an unknown request', async () => {
     const { service } = withVault(stubVault({ sale: async () => sale({ status: 2 }) }));
     expect(await service.offrampReturn(SUBJECT, 'missing')).toBeUndefined();
+  });
+
+  it('settles and reports a return without broadcasting when the chain already shows Returned', async () => {
+    let called = 0;
+    const vault = stubVault({ sale: async () => sale({ status: 3, held: 0n }) });
+    (vault as unknown as { returnHeld: () => Promise<string> }).returnHeld = async () => {
+      called += 1;
+      return `0x${'cd'.repeat(32)}`;
+    };
+    const funding = fakeStore();
+    const service = new Onramp(config(), registry(new FakeMeld()), new FakeAudit(), funding, new FakeMeld(), () => NOW, () => 'f', undefined, vault);
+    await funding.create(fundingRecord({ id: 'funding-1' }));
+
+    const dto = await service.offrampReturn(SUBJECT, 'funding-1');
+    expect(dto?.returnStatus).toBe('returned');
+    expect(called).toBe(0);
+    expect((await funding.readVaultSale('funding-1'))?.return_status).toBe('returned');
+  });
+
+  it('releases the claim and rethrows when the return broadcast fails, so it can be re-sent', async () => {
+    const vault = stubVault({ sale: async () => sale({ status: 2, held: 80n }) });
+    (vault as unknown as { returnHeld: () => Promise<string> }).returnHeld = async () => {
+      throw new Error('rpc down');
+    };
+    const funding = fakeStore();
+    const service = new Onramp(config(), registry(new FakeMeld()), new FakeAudit(), funding, new FakeMeld(), () => NOW, () => 'f', undefined, vault);
+    await funding.create(fundingRecord({ id: 'funding-1' }));
+
+    await expect(service.offrampReturn(SUBJECT, 'funding-1')).rejects.toThrow('rpc down');
+    // The claim is released rather than stuck at 'returning', so a fresh attempt can re-send it.
+    expect((await funding.readVaultSale('funding-1'))?.return_status).toBe('none');
+  });
+
+  it('maps an unreachable chain to a 503 rather than a bare 500', async () => {
+    const { service, funding } = withVault(
+      stubVault({
+        sale: async () => {
+          throw new ChainUnavailableError('rpc down');
+        },
+      }),
+    );
+    await funding.create(fundingRecord({ id: 'funding-1' }));
+    const failure = await failureOf(() => service.offrampSale(SUBJECT, 'funding-1'));
+    expect(failure).toMatchObject({ value: { code: 'SALE_VAULT_CHAIN_UNAVAILABLE' } });
+  });
+
+  it('releases a stale return whose broadcast never mined, so a read lets it be re-sent', async () => {
+    const vault = stubVault({ sale: async () => sale({ status: 2, held: 80n }), receipt: async () => null });
+    const funding = fakeStore();
+    const service = new Onramp(config(), registry(new FakeMeld()), new FakeAudit(), funding, new FakeMeld(), () => NOW, () => 'f', undefined, vault);
+    await funding.create(fundingRecord({ id: 'funding-1' }));
+    // A claimed-and-broadcast return whose tx never mined (its row is stamped far in the past).
+    await funding.claimVaultReturn({ funding_request_id: 'funding-1', chain: '', contract: CONTRACT, ref: `0x${'00'.repeat(32)}`, contract_status: 2, held: '80' });
+    await funding.setVaultReturnTx('funding-1', `0x${'cd'.repeat(32)}`);
+
+    const dto = await service.offrampSale(SUBJECT, 'funding-1');
+    expect(dto?.returnStatus).toBe('none');
+    expect((await funding.readVaultSale('funding-1'))?.return_status).toBe('none');
   });
 });

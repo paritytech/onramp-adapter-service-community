@@ -103,6 +103,51 @@ describe('SaleVaultClient', () => {
     const client = SaleVaultClient.create(CFG, () => KEY, sendRpc());
     expect((await client.withdrawDust(100n)).startsWith('0x')).toBe(true);
   });
+
+  it('prices a send on the block base fee when the block carries one', async () => {
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'eth_getTransactionCount') return '0x7';
+      if (method === 'eth_maxPriorityFeePerGas') return '0x3b9aca00';
+      if (method === 'eth_getBlockByNumber') return { baseFeePerGas: '0x3b9aca00' };
+      if (method === 'eth_estimateGas') return '0x186a0';
+      if (method === 'eth_sendRawTransaction') return '0xtxid';
+      return '0x0';
+    });
+    const client = SaleVaultClient.create(CFG, () => KEY, rpc);
+    expect((await client.withdrawDust(100n)).startsWith('0x')).toBe(true);
+  });
+
+  it('rejects a send when the RPC answers with an empty, non-quantity hex', async () => {
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'eth_maxPriorityFeePerGas') return '0x'; // valid 0x prefix, but no digits
+      if (method === 'eth_getTransactionCount') return '0x7';
+      if (method === 'eth_getBlockByNumber') return null;
+      return '0x186a0';
+    });
+    const client = SaleVaultClient.create(CFG, () => KEY, rpc);
+    await expect(client.withdrawDust(100n)).rejects.toThrow(/hex quantity/);
+  });
+
+  it('refuses to sign against a gas price beyond the sane ceiling', async () => {
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'eth_getTransactionCount') return '0x7';
+      if (method === 'eth_maxPriorityFeePerGas') return '0x3b9aca00';
+      // 2000 gwei base fee: a hostile or broken RPC, far beyond any real Arbitrum fee.
+      if (method === 'eth_getBlockByNumber') return { baseFeePerGas: `0x${(2_000_000_000_000n).toString(16)}` };
+      return '0x186a0';
+    });
+    const client = SaleVaultClient.create(CFG, () => KEY, rpc);
+    await expect(client.withdrawDust(100n)).rejects.toThrow(/sane ceiling/);
+  });
+
+  it('reads a receipt: success, failure, or null while pending', async () => {
+    const mined = SaleVaultClient.create(CFG, () => KEY, vi.fn(async () => ({ status: '0x1' })));
+    expect(await mined.receipt('0xdead')).toEqual({ status: true });
+    const reverted = SaleVaultClient.create(CFG, () => KEY, vi.fn(async () => ({ status: '0x0' })));
+    expect(await reverted.receipt('0xdead')).toEqual({ status: false });
+    const pending = SaleVaultClient.create(CFG, () => KEY, vi.fn(async () => null));
+    expect(await pending.receipt('0xdead')).toBeNull();
+  });
 });
 
 describe('fetchTransport', () => {

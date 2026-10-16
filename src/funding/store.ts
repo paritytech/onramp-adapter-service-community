@@ -796,6 +796,84 @@ export class FundingStore {
     );
   }
 
+  // Claim the return of a held sale before broadcasting it, atomically: inserts the row at
+  // 'returning', or moves an existing one to 'returning' ONLY while it is still 'none'. Returns true
+  // to the single caller that won the claim; a concurrent or repeated tap gets false and must not
+  // broadcast, so two requests cannot sign the same nonce twice. return_tx is set afterwards.
+  async claimVaultReturn(row: {
+    funding_request_id: string;
+    chain: string;
+    contract: string;
+    ref: string;
+    contract_status: number;
+    held: string;
+  }): Promise<boolean> {
+    const now = Date.now();
+    const result = await this.pool.query(
+      'INSERT INTO vault_sales (funding_request_id, chain, contract, ref, contract_status, held, ' +
+        "return_status, return_tx, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, 'returning', NULL, $7, $7) " +
+        'ON CONFLICT (funding_request_id) DO UPDATE SET ' +
+        'chain = EXCLUDED.chain, contract = EXCLUDED.contract, ref = EXCLUDED.ref, ' +
+        'contract_status = EXCLUDED.contract_status, held = EXCLUDED.held, ' +
+        "return_status = 'returning', return_tx = NULL, updated_at = EXCLUDED.updated_at " +
+        "WHERE vault_sales.return_status = 'none'",
+      [row.funding_request_id, row.chain, row.contract, row.ref, row.contract_status, row.held, now],
+    );
+    return result.rowCount === 1;
+  }
+
+  // Record the broadcast return's transaction hash on the claimed row.
+  async setVaultReturnTx(fundingRequestId: string, returnTx: string): Promise<void> {
+    await this.pool.query(
+      "UPDATE vault_sales SET return_tx = $2, updated_at = $3 WHERE funding_request_id = $1 AND return_status = 'returning'",
+      [fundingRequestId, returnTx, Date.now()],
+    );
+  }
+
+  // Release a claim whose broadcast never left, so the return can be re-sent. Only the just-claimed
+  // state (returning, no tx yet) is released; a return already on chain is left alone.
+  async releaseVaultReturn(fundingRequestId: string): Promise<void> {
+    await this.pool.query(
+      "UPDATE vault_sales SET return_status = 'none', return_tx = NULL, updated_at = $2 " +
+        "WHERE funding_request_id = $1 AND return_status = 'returning' AND return_tx IS NULL",
+      [fundingRequestId, Date.now()],
+    );
+  }
+
+  // The read path's write: refresh the on-chain fields and, when the chain shows the sale Returned,
+  // settle return_status to 'returned'. It never lowers return_status, so a poll that raced a return
+  // claim cannot write a 'returning' row back to 'none'.
+  async touchVaultSale(row: {
+    funding_request_id: string;
+    chain: string;
+    contract: string;
+    ref: string;
+    contract_status: number;
+    held: string;
+    returned: boolean;
+  }): Promise<void> {
+    const now = Date.now();
+    await this.pool.query(
+      'INSERT INTO vault_sales (funding_request_id, chain, contract, ref, contract_status, held, ' +
+        'return_status, return_tx, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $8) ' +
+        'ON CONFLICT (funding_request_id) DO UPDATE SET ' +
+        'chain = EXCLUDED.chain, contract = EXCLUDED.contract, ref = EXCLUDED.ref, ' +
+        'contract_status = EXCLUDED.contract_status, held = EXCLUDED.held, updated_at = EXCLUDED.updated_at, ' +
+        "return_status = CASE WHEN $9 THEN 'returned' ELSE vault_sales.return_status END",
+      [
+        row.funding_request_id,
+        row.chain,
+        row.contract,
+        row.ref,
+        row.contract_status,
+        row.held,
+        row.returned ? 'returned' : 'none',
+        now,
+        row.returned,
+      ],
+    );
+  }
+
   // The off-ramp SaleVault row for a funding request, or undefined when none has been written yet.
   async readVaultSale(fundingRequestId: string): Promise<VaultSaleRow | undefined> {
     const result = await this.pool.query<VaultSaleRow>(

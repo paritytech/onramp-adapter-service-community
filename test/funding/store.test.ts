@@ -1228,6 +1228,69 @@ describe('the off-ramp SaleVault state', () => {
       expect(await store.readVaultSale('missing')).toBeUndefined();
     });
   });
+
+  const claim = {
+    chain: 'arbitrum-sepolia',
+    contract: base.contract,
+    ref: base.ref,
+    contract_status: 2,
+    held: '80',
+  };
+
+  it('claimVaultReturn claims once, refuses a second, and setVaultReturnTx records the hash', async () => {
+    await withStore(async (store) => {
+      expect(await store.claimVaultReturn({ funding_request_id: 'sold-c', ...claim })).toBe(true);
+      // A second claim while it is returning is refused, so no second broadcast signs the same nonce.
+      expect(await store.claimVaultReturn({ funding_request_id: 'sold-c', ...claim })).toBe(false);
+      await store.setVaultReturnTx('sold-c', `0x${'ab'.repeat(32)}`);
+      expect(await store.readVaultSale('sold-c')).toMatchObject({
+        return_status: 'returning',
+        return_tx: `0x${'ab'.repeat(32)}`,
+        contract_status: 2,
+        held: '80',
+      });
+    });
+  });
+
+  it('releaseVaultReturn frees a claim that never broadcast, and leaves one with a tx alone', async () => {
+    await withStore(async (store) => {
+      await store.claimVaultReturn({ funding_request_id: 'sold-r', ...claim });
+      await store.releaseVaultReturn('sold-r');
+      expect((await store.readVaultSale('sold-r'))?.return_status).toBe('none');
+      // Re-claimable after a release, since nothing ever left.
+      expect(await store.claimVaultReturn({ funding_request_id: 'sold-r', ...claim })).toBe(true);
+      // Once a tx is on the row, release does not undo it.
+      await store.setVaultReturnTx('sold-r', `0x${'cd'.repeat(32)}`);
+      await store.releaseVaultReturn('sold-r');
+      expect((await store.readVaultSale('sold-r'))?.return_status).toBe('returning');
+    });
+  });
+
+  it('touchVaultSale refreshes read fields, settles returned, and never lowers return_status', async () => {
+    await withStore(async (store) => {
+      await store.touchVaultSale({ funding_request_id: 'sold-t', ...claim, returned: false });
+      expect((await store.readVaultSale('sold-t'))?.return_status).toBe('none');
+      await store.claimVaultReturn({ funding_request_id: 'sold-t', ...claim });
+      await store.setVaultReturnTx('sold-t', `0x${'ef'.repeat(32)}`);
+      // A poll that has not seen the chain settle must not write 'returning' back to 'none'.
+      await store.touchVaultSale({ funding_request_id: 'sold-t', ...claim, returned: false });
+      expect((await store.readVaultSale('sold-t'))?.return_status).toBe('returning');
+      // Once the chain shows Returned, the row settles, keeping the recorded tx.
+      await store.touchVaultSale({ funding_request_id: 'sold-t', ...claim, contract_status: 3, held: '0', returned: true });
+      expect(await store.readVaultSale('sold-t')).toMatchObject({
+        return_status: 'returned',
+        return_tx: `0x${'ef'.repeat(32)}`,
+        contract_status: 3,
+      });
+    });
+  });
+
+  it('touchVaultSale writes a fresh row straight to returned when the chain already shows it', async () => {
+    await withStore(async (store) => {
+      await store.touchVaultSale({ funding_request_id: 'sold-tr', ...claim, contract_status: 3, held: '0', returned: true });
+      expect((await store.readVaultSale('sold-tr'))?.return_status).toBe('returned');
+    });
+  });
 });
 
 describe('closing the store', () => {

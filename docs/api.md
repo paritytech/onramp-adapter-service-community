@@ -15,8 +15,10 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
-| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{code, chain, min, max, currency}]}]}]}`. No query parameters (strict). See "Offramp lanes" below. |
-| `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
+| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{code, chain, min, max, currency}]}]}]}`. When a SaleVault lane is configured, a `vault: {chain, chainId, contract}` field names the deployment-wide SaleVault the app's Chainflip CCM must deliver to. No query parameters (strict). See "Offramp lanes" and "The off-ramp SaleVault" below. |
+| `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`, plus the same `vault` field when configured. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
+| `GET /offramp/sale/:fundingRequestId` | none (reads the SaleVault on chain) | The on-chain SaleVault state of one of the caller's off-ramp sales, scoped by alias: `{sale: {fundingRequestId, chain, contract, ref, status, recipient, amount, home, held, returnStatus, returnTx}}`. `status` is the contract's `Sale.Status` (`none`/`paid`/`held`/`returned`); `returnStatus` is this service's own record of a return (`none`/`returning`/`returned`). 404 for an unknown or another caller's request; 503 when no vault is configured or the chain is unreachable. See "The off-ramp SaleVault" below. |
+| `POST /offramp/returns/:fundingRequestId` | none (operator-signs the SaleVault) | Return a held sale to its own Asset Hub home, operator-signed. Empty body. The return is claimed before it is broadcast, so a retried or concurrent tap cannot sign two; 409 only when the sale has nothing held to return (not in the `held` state), 404 for an unknown request, 503 when no vault is configured or the chain is unreachable. The response is the same `{sale: {...}}` shape as the read. |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
 | `GET /transaction/:id` | `GET /payments/transactions/{id}` | Status, projected onto the five fields this service declares. |
@@ -298,6 +300,25 @@ name), which some providers, Onramp Money among them, buy only under those codes
 SS58-normalised; `USDC_ARBITRUM` discloses an EVM address (`0x` plus 40 hex), stored lowercased so comparisons are
 case-insensitive; the `*_STATEMINT` codes disclose an Asset Hub address, SS58-normalised like `DOT_ASSETHUB`. Anything
 else for that code is recorded as malformed and never disclosed.
+
+### The off-ramp SaleVault
+
+On the Arbitrum lane a sale's Chainflip egress can be delivered to a **SaleVault** contract rather than
+straight to the provider, so the exact promised amount is paid and any shortfall is held for the seller
+rather than lost. The vault is deployment-wide: `GET /supported/offramp*` carry its `{chain, chainId,
+contract}` as a `vault` field, which the app reads to target its CCM. The CCM message the app encodes
+(`ref`, provider recipient, committed amount, the seller's Asset Hub home) is 128 bytes; `ref =
+keccak256(fundingRequestId)`.
+
+Two routes read and drive the vault for one of the caller's own sales, keyed by `fundingRequestId`:
+
+- `GET /offramp/sale/:fundingRequestId` reads the on-chain `Sale` (status, recipient, amount, home,
+  held) and this service's return record, persisting the refreshed state. A return that was broadcast
+  but never mined is released on a read once it is stale, so a fresh return can re-send it.
+- `POST /offramp/returns/:fundingRequestId` returns a **held** sale to its Asset Hub home, signed by the
+  operator. The return is claimed in the store before it is broadcast, so a retried or concurrent tap
+  cannot sign two; a broadcast that never leaves releases the claim so it can be re-sent. `held` funds
+  can only ever leave to the sale's own home, never to the operator.
 
 ## `POST /quote`
 

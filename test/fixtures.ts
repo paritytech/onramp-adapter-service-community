@@ -452,6 +452,56 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       const row = vaultSales.get(fundingRequestId);
       return row === undefined ? undefined : structuredClone(row);
     },
+    claimVaultReturn: async (row: {
+      funding_request_id: string;
+      chain: string;
+      contract: string;
+      ref: string;
+      contract_status: number;
+      held: string;
+    }) => {
+      const previous = vaultSales.get(row.funding_request_id);
+      if (previous !== undefined && previous.return_status !== 'none') return false;
+      vaultSales.set(row.funding_request_id, {
+        ...structuredClone(row),
+        return_status: 'returning',
+        return_tx: null,
+        created_at: previous?.created_at ?? 1_000,
+        updated_at: 2_000,
+      });
+      return true;
+    },
+    setVaultReturnTx: async (fundingRequestId: string, returnTx: string) => {
+      const row = vaultSales.get(fundingRequestId);
+      if (row !== undefined && row.return_status === 'returning') {
+        vaultSales.set(fundingRequestId, { ...row, return_tx: returnTx, updated_at: 2_000 });
+      }
+    },
+    releaseVaultReturn: async (fundingRequestId: string) => {
+      const row = vaultSales.get(fundingRequestId);
+      if (row !== undefined && row.return_status === 'returning' && row.return_tx === null) {
+        vaultSales.set(fundingRequestId, { ...row, return_status: 'none', return_tx: null, updated_at: 2_000 });
+      }
+    },
+    touchVaultSale: async (row: {
+      funding_request_id: string;
+      chain: string;
+      contract: string;
+      ref: string;
+      contract_status: number;
+      held: string;
+      returned: boolean;
+    }) => {
+      const { returned, ...fields } = row;
+      const previous = vaultSales.get(row.funding_request_id);
+      vaultSales.set(row.funding_request_id, {
+        ...structuredClone(fields),
+        return_status: returned ? 'returned' : (previous?.return_status ?? 'none'),
+        return_tx: previous?.return_tx ?? null,
+        created_at: previous?.created_at ?? 1_000,
+        updated_at: 2_000,
+      });
+    },
     close: async () => undefined,
   };
 }
