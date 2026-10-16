@@ -97,8 +97,9 @@ auth:
 # What Meld calls each asset, by this service's own name for it. The only place a Meld code is
 # written: `limits`, `meld.boot_probe` and `supported.offramp_lanes` name assets, so when Meld
 # renames a code (it renamed DOT_ASSETHUB to DOT and USDT_ASSETHUB to USDT_DOT) this is the one
-# edit. Every code here is asked of Meld at boot and the pod refuses to start on one Meld does not
-# know. An asset left out is not served. The asset names are fixed in `src/meld/catalog.ts`.
+# edit. Every code here is asked of Meld at boot and the pod refuses to start on one Meld answers
+# as unknown (400 INVALID_QUERY_PARAMETER); a busy or down Meld only warns. An asset left out
+# is not served. The asset names are fixed in `src/meld/catalog.ts`.
 assets:
   dot@assethub: DOT
   usdt@assethub: USDT_DOT

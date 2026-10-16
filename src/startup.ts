@@ -379,13 +379,15 @@ export async function verifyKey(
  *
  * The outcomes follow `verifyKey`'s split, per code:
  *
- *   Meld answered with an error status: fatal. The code is not one Meld knows (Meld renamed
- *     `DOT_ASSETHUB` to `DOT` with no deprecation period), and serving it would refuse every
- *     buyer or seller of the asset.
+ *   Meld answered `400 INVALID_QUERY_PARAMETER`: fatal. The code is not one Meld knows (Meld
+ *     renamed `DOT_ASSETHUB` to `DOT` with no deprecation period), and serving it would refuse
+ *     every buyer or seller of the asset.
  *   Meld priced a different code: fatal. That is the Bitcoin fallback of threat model T4, which
  *     the quote would otherwise have carried into a locked checkout.
- *   No offers, or Meld could not be reached: warn and continue. Either says nothing about the
- *     code: the corridor may be dry for it, or Meld briefly down.
+ *   Any other answer, or Meld could not be reached: warn and continue. None says anything about
+ *     the code. Meld says "no offer" as `400 NO_VALID_QUOTES` (the corridor may be dry for the
+ *     code), and a 429 or a 5xx is Meld busy or down; stopping the boot on those would keep a
+ *     restart or a rollout from coming back up during a Meld incident.
  *
  * Every code is asked and every problem reported at once, like the config.
  */
@@ -412,9 +414,13 @@ export async function verifyAssetCodes(
     const [asset, code] = named[i] ?? ['', ''];
     if (answer.status === 'rejected') {
       const error: unknown = answer.reason;
-      if (error instanceof MeldHttpError) {
-        const why = `HTTP ${String(error.status)}${error.code === undefined ? '' : ` ${error.code}`}`;
-        problems.push(`  assets.${asset}: Meld refused "${code}" (${why}); it may have been renamed.`);
+      if (error instanceof MeldHttpError && error.status === 400 && error.code === 'INVALID_QUERY_PARAMETER') {
+        problems.push(`  assets.${asset}: Meld refused "${code}" (HTTP 400 ${error.code}); it may have been renamed.`);
+      } else if (error instanceof MeldHttpError) {
+        log.warn(
+          { asset, code, status: error.status, ...(error.code === undefined ? {} : { meldCode: error.code }) },
+          'Meld did not price an asset code in the boot probe corridor; it is unverified.',
+        );
       } else {
         log.warn({ asset, code, detail: String(error) }, 'Could not reach Meld to check an asset code; it is unverified.');
       }

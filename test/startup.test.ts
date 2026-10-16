@@ -139,14 +139,33 @@ describe('verifyAssetCodes', () => {
     const { log } = recorder();
     const stale = new Set(['DOT_ASSETHUB', 'USDT_ASSETHUB']);
     const meld = meldAnswering((code) =>
-      stale.has(code) ? Promise.reject(new MeldHttpError(400, code === 'DOT_ASSETHUB' ? 'INVALID_QUERY_PARAMETER' : undefined)) : echo(code),
+      stale.has(code) ? Promise.reject(new MeldHttpError(400, 'INVALID_QUERY_PARAMETER')) : echo(code),
     );
     const cfg = config({ assets: { ...TEST_ASSETS, 'dot@assethub': 'DOT_ASSETHUB', 'usdt@assethub': 'USDT_ASSETHUB' } });
 
     const failure = verifyAssetCodes(meld, cfg, log);
     await expect(failure).rejects.toThrow(/Meld does not know these asset codes/);
     await expect(failure).rejects.toThrow(/assets\.dot@assethub: Meld refused "DOT_ASSETHUB" \(HTTP 400 INVALID_QUERY_PARAMETER\)/);
-    await expect(failure).rejects.toThrow(/assets\.usdt@assethub: Meld refused "USDT_ASSETHUB" \(HTTP 400\)/);
+    await expect(failure).rejects.toThrow(/assets\.usdt@assethub: Meld refused "USDT_ASSETHUB" \(HTTP 400 INVALID_QUERY_PARAMETER\)/);
+  });
+
+  it.each([
+    ['no offer in the corridor', new MeldHttpError(400, 'NO_VALID_QUOTES')],
+    ['a 400 that does not name the code', new MeldHttpError(400)],
+    ['a rate limit', new MeldHttpError(429)],
+    ['Meld down', new MeldHttpError(503)],
+  ])('warns and continues when Meld answers a code with %s', async (_, refusal) => {
+    // None of these says the code is unknown, and a pod that refused to start on them could not
+    // come back up during a Meld incident.
+    const { log, warn, info } = recorder();
+    const meld = meldAnswering((code) => (code === 'USDC_SOLANA' ? Promise.reject(refusal) : echo(code)));
+
+    await expect(verifyAssetCodes(meld, config(), log)).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ asset: 'usdc@solana', code: 'USDC_SOLANA', status: refusal.status }),
+      expect.stringMatching(/did not price/),
+    );
+    expect(info).toHaveBeenCalled();
   });
 
   it('stops the boot when Meld prices a different asset than the one asked for', async () => {
