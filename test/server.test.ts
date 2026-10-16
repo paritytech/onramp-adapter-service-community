@@ -331,6 +331,23 @@ describe('the fiat code', () => {
     },
   );
 
+  it.each(['DOT', 'dot'])(
+    'refuses %j, a crypto code shaped like a fiat, as a malformed request rather than a crossed leg',
+    async (fiat) => {
+      // Meld's code for DOT is three letters. Taken as the fiat leg it would reach the leg guard in
+      // `client.ts`, which answers a mapping fault, a 500, for what is the caller's typo.
+      const response = await (await serve()).inject({
+        method: 'POST',
+        url: '/quote',
+        headers: DEV_HEADERS,
+        payload: { ...quoteRequestBody(), fiat },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({ error: { tag: 'Other' } });
+    },
+  );
+
   it('still accepts a lowercase code, which the caller may legitimately send', async () => {
     const response = await (await serve()).inject({
       method: 'POST',

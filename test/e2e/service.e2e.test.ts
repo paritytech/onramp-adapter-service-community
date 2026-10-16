@@ -903,8 +903,8 @@ describe('the funding journey over real HTTP', () => {
      * a crossed quote fails at this service's own boundary rather than depending on the shape
      * assertion below to notice.
      *
-     * **This is as far as a sell can be taken here.** No provider on the account off-ramps
-     * `*_ASSETHUB`, so the real corridor could not be exercised even against the live sandbox;
+     * **This is as far as a sell can be taken here.** No provider on the account off-ramped
+     * an Asset Hub asset when this was written, so the real corridor could not be exercised even against the live sandbox;
      * and nothing yet reads a deposit address back, so the row correctly stops at
      * `session_opened` and the sale cannot be completed through this service.
      */

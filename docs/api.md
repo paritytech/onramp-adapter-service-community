@@ -61,7 +61,8 @@ endpoint for `CRYPTO_OFFRAMP` (it answers `404` for every country); the substitu
 
 Field names are the caller's, which are mostly Meld's: `country`, `fiat`,
 `destinationCurrencyCode`, `sourceAmount`, `paymentMethodType`. Operator configuration stays
-snake_case.
+snake_case. `fiat` is three letters, any case, and is refused `400` when it names a crypto code
+this deployment serves: Meld's code for DOT is `DOT`, the same shape as a fiat.
 
 ## `direction`: buy and sell
 
