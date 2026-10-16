@@ -350,7 +350,20 @@ export async function verifyKey(
 
     log.info({ offers }, 'Meld credentials accepted.');
   } catch (error) {
-    if (error instanceof MeldHttpError) throw error;
+    if (error instanceof MeldHttpError) {
+      // The error's own message is the status alone. Name the probe and Meld's code, so a 400 for
+      // a code Meld renamed reads as that rather than as a broken key.
+      log.error(
+        {
+          probe: `${probe.source_currency}->${probe.destination_code} in ${probe.country_code}`,
+          status: error.status,
+          ...(error.code === undefined ? {} : { code: error.code }),
+        },
+        'Meld refused the boot probe. A 401 or 403 is the key; a 400 INVALID_QUERY_PARAMETER is ' +
+          'usually a Meld code it no longer knows, which `assets` names.',
+      );
+      throw error;
+    }
     log.warn({ detail: String(error) }, 'Could not reach Meld at boot; the key is unverified.');
   }
 }

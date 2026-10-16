@@ -20,11 +20,12 @@ import { upstreamUnavailable } from '../src/contract.js';
 import type { Config } from '../src/config.js';
 import { TEST_ASSETS, config, createRequest, fakeSocket, fundingRecord, personhoodConfig, rawConfig, withSocket } from './fixtures.js';
 
-/** Just the two levels `verifyKey` uses, so a plain object substitutes for pino. */
+/** Just the levels `verifyKey` uses, so a plain object substitutes for pino. */
 const recorder = () => {
   const warn = vi.fn();
   const info = vi.fn();
-  return { warn, info, log: { warn, info } as unknown as FastifyBaseLogger };
+  const error = vi.fn();
+  return { warn, info, error, log: { warn, info, error } as unknown as FastifyBaseLogger };
 };
 
 describe('verifyKey', () => {
@@ -32,11 +33,24 @@ describe('verifyKey', () => {
     // Any answer means the request arrived and was rejected: a wrong key, a wrong path, wrong
     // parameters. None of those improve on their own, so serving buyers would be worse than
     // refusing to start.
-    const { log, warn } = recorder();
+    const { log, warn, error } = recorder();
     const meld = { verifyCredentials: () => Promise.reject(new MeldHttpError(401)) };
 
     await expect(verifyKey(meld, config(), log)).rejects.toBeInstanceOf(MeldHttpError);
     expect(warn).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith({ probe: 'USD->USDC_DOT in US', status: 401 }, expect.stringMatching(/the key/));
+  });
+
+  it('names the probe code and Meld\'s own code when Meld refuses it, as it does a renamed code', async () => {
+    const { log, error } = recorder();
+    const meld = { verifyCredentials: () => Promise.reject(new MeldHttpError(400, 'INVALID_QUERY_PARAMETER')) };
+    const cfg = config({ assets: { ...TEST_ASSETS, 'usdc@assethub': 'USDC_ASSETHUB' } });
+
+    await expect(verifyKey(meld, cfg, log)).rejects.toBeInstanceOf(MeldHttpError);
+    expect(error).toHaveBeenCalledWith(
+      { probe: 'USD->USDC_ASSETHUB in US', status: 400, code: 'INVALID_QUERY_PARAMETER' },
+      expect.stringMatching(/no longer knows/),
+    );
   });
 
   it('warns and continues when Meld cannot be reached', async () => {
