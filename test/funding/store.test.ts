@@ -1266,6 +1266,20 @@ describe('the off-ramp SaleVault state', () => {
     });
   });
 
+  it('resetStaleVaultReturn frees a broadcast return only when the tx still matches', async () => {
+    await withStore(async (store) => {
+      await store.claimVaultReturn({ funding_request_id: 'sold-s', ...claim });
+      await store.setVaultReturnTx('sold-s', `0x${'cd'.repeat(32)}`);
+      // A reset keyed to a different tx (a stale poll that lost the race) leaves the row alone.
+      await store.resetStaleVaultReturn('sold-s', `0x${'99'.repeat(32)}`);
+      expect((await store.readVaultSale('sold-s'))?.return_status).toBe('returning');
+      // Keyed to the real tx, it frees the row so the return can be re-sent.
+      await store.resetStaleVaultReturn('sold-s', `0x${'cd'.repeat(32)}`);
+      expect((await store.readVaultSale('sold-s'))?.return_status).toBe('none');
+      expect(await store.claimVaultReturn({ funding_request_id: 'sold-s', ...claim })).toBe(true);
+    });
+  });
+
   it('touchVaultSale refreshes read fields, settles returned, and never lowers return_status', async () => {
     await withStore(async (store) => {
       await store.touchVaultSale({ funding_request_id: 'sold-t', ...claim, returned: false });

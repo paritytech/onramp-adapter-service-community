@@ -539,6 +539,7 @@ describe('Onramp.create', () => {
       claimVaultReturn: async () => true,
       setVaultReturnTx: async () => undefined,
       releaseVaultReturn: async () => undefined,
+      resetStaleVaultReturn: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), new FakeAudit(), funding, meld, () => NOW, () => 'funding-1');
 
@@ -577,6 +578,7 @@ describe('Onramp.create', () => {
       claimVaultReturn: async () => true,
       setVaultReturnTx: async () => undefined,
       releaseVaultReturn: async () => undefined,
+      resetStaleVaultReturn: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), audit, funding, meld, () => NOW, () => 'funding-1');
 
@@ -1189,6 +1191,7 @@ describe('Onramp.create', () => {
         claimVaultReturn: (row) => funding.claimVaultReturn(row),
         setVaultReturnTx: (id, tx) => funding.setVaultReturnTx(id, tx),
         releaseVaultReturn: (id) => funding.releaseVaultReturn(id),
+        resetStaleVaultReturn: (id, tx) => funding.resetStaleVaultReturn(id, tx),
         // Rejects, not throws: a synchronous throw is caught whether or not the call is
         // awaited, so it would go green against a missing `await`.
         update: () => Promise.reject(new Error('database is locked')),
@@ -2623,6 +2626,7 @@ describe('recording a refusal is best-effort', () => {
       claimVaultReturn: async () => true,
       setVaultReturnTx: async () => undefined,
       releaseVaultReturn: async () => undefined,
+      resetStaleVaultReturn: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), audit, broken, meld, () => NOW);
 

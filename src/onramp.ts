@@ -66,6 +66,7 @@ export type FundingPort = Pick<
   | 'claimVaultReturn'
   | 'setVaultReturnTx'
   | 'releaseVaultReturn'
+  | 'resetStaleVaultReturn'
 >;
 
 /** One corridor as the bulk endpoint serves it: the stored row without the internal keys. */
@@ -325,6 +326,22 @@ export class Onramp {
       // The vault flips to Returned inside the return transaction, so a read that sees it settles the
       // row. The write never lowers return_status, so a poll that raced a return claim cannot undo it.
       const returned = sale.status === 3;
+      // Read the row as it stood before this poll, so the age of a broadcast return is measured from
+      // when it was sent, not from this read (touchVaultSale refreshes updated_at on every poll).
+      const before = await this.funding.readVaultSale(id);
+      // A return that broadcast but never mined leaves the sale Held with return_status 'returning'.
+      // Once it is stale and the tx is still not on chain, reset the claim so a fresh POST re-sends
+      // it. Re-sending is safe: the contract refuses a second return on a sale that is no longer Held.
+      // The reset is keyed to that exact tx, so a poll that raced a fresh re-send cannot wipe it.
+      if (
+        before?.return_status === 'returning' &&
+        before.return_tx !== null &&
+        sale.status === 2 &&
+        this.clock() - before.updated_at > SALE_RETURN_RESEND_MS &&
+        (await vault.receipt(before.return_tx)) === null
+      ) {
+        await this.funding.resetStaleVaultReturn(id, before.return_tx);
+      }
       await this.funding.touchVaultSale({
         funding_request_id: id,
         chain: this.cfg.sale_vault?.chain ?? '',
@@ -335,20 +352,6 @@ export class Onramp {
         returned,
       });
       const row = await this.funding.readVaultSale(id);
-      // A return that broadcast but never mined leaves the sale Held with return_status 'returning'.
-      // Once it is stale and the tx is still not on chain, release the claim so a fresh POST re-sends
-      // it. Re-sending is safe: the contract refuses a second return on a sale that is no longer Held.
-      if (
-        row?.return_status === 'returning' &&
-        row.return_tx !== null &&
-        sale.status === 2 &&
-        this.clock() - row.updated_at > SALE_RETURN_RESEND_MS &&
-        (await vault.receipt(row.return_tx)) === null
-      ) {
-        await this.funding.releaseVaultReturn(id);
-        const released = await this.funding.readVaultSale(id);
-        return this.saleDto(id, ref, sale, released?.return_status ?? 'none', released?.return_tx ?? null, vault.contractAddress);
-      }
       return this.saleDto(
         id,
         ref,

@@ -840,6 +840,16 @@ export class FundingStore {
     );
   }
 
+  // Reset a broadcast return that went stale without mining, so a fresh POST re-sends it. Keyed to
+  // the exact stale tx, so a poll that raced a re-send (a new claim and tx) leaves that re-send alone.
+  async resetStaleVaultReturn(fundingRequestId: string, staleTx: string): Promise<void> {
+    await this.pool.query(
+      "UPDATE vault_sales SET return_status = 'none', return_tx = NULL, updated_at = $3 " +
+        "WHERE funding_request_id = $1 AND return_status = 'returning' AND return_tx = $2",
+      [fundingRequestId, staleTx, Date.now()],
+    );
+  }
+
   // The read path's write: refresh the on-chain fields and, when the chain shows the sale Returned,
   // settle return_status to 'returned'. It never lowers return_status, so a poll that raced a return
   // claim cannot write a 'returning' row back to 'none'.

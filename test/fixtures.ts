@@ -483,6 +483,12 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
         vaultSales.set(fundingRequestId, { ...row, return_status: 'none', return_tx: null, updated_at: 2_000 });
       }
     },
+    resetStaleVaultReturn: async (fundingRequestId: string, staleTx: string) => {
+      const row = vaultSales.get(fundingRequestId);
+      if (row !== undefined && row.return_status === 'returning' && row.return_tx === staleTx) {
+        vaultSales.set(fundingRequestId, { ...row, return_status: 'none', return_tx: null, updated_at: 2_000 });
+      }
+    },
     touchVaultSale: async (row: {
       funding_request_id: string;
       chain: string;
