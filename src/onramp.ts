@@ -278,12 +278,23 @@ export class Onramp {
       );
     }
     const discovery = this.discovery;
+    // Each lane reads its own route, so one lane's failure (a 429 or a 5xx from Meld) counts as that
+    // lane having no methods rather than failing the whole answer while the others replied. When
+    // every lane fails there is no answer to give, and an empty-but-OK reply would read as "this
+    // country has no sell routes" during a total Meld outage, so the first failure is rethrown.
+    const failures: unknown[] = [];
     const views: LaneCorridor[] = await Promise.all(
-      this.cfg.supported.offramp_lanes.map(async (lane) => {
-        const c = await discovery.corridorForCountry(country, lane.code, 'sell');
-        return { lane, country: c.country, fiat: c.fiat, methods: c.methods };
+      this.cfg.supported.offramp_lanes.map(async (lane): Promise<LaneCorridor> => {
+        try {
+          const c = await discovery.corridorForCountry(country, lane.code, 'sell');
+          return { lane, country: c.country, fiat: c.fiat, methods: c.methods };
+        } catch (error) {
+          failures.push(error);
+          return { lane, country, fiat: '', methods: [] };
+        }
       }),
     );
+    if (failures.length > 0 && failures.length === views.length) throw failures[0];
     const fiat = views.find((v) => v.methods.length > 0)?.fiat ?? views.find((v) => v.fiat !== '')?.fiat ?? '';
     const methods = mergeMethods(views, fiat);
     const vault = this.saleVaultInfo();
@@ -1287,8 +1298,16 @@ export class Onramp {
    * absent or unreachable discovery leaves a sell ungated on both `/quote` and `/session`, which is
    * the pre-existing behaviour (a sell skipped this whole gate before direction-aware discovery
    * existed to check it) rather than a new hole opened by this function.
+   *
+   * One check does not need discovery: the code must be one of `supported.offramp_lanes`. That
+   * list is the deployment's switch for which off-ramp routes exist (the Chainflip swap lanes
+   * among them), so a code taken out of it is refused here as `RegionUnavailable`, before any
+   * rail call, whatever a client asks for.
    */
   private async sellCorridorCheck(code: string, currency: string, country: string, method: string): Promise<void> {
+    if (!this.cfg.supported.offramp_lanes.some((lane) => lane.code === code)) {
+      throw reject({ tag: 'RegionUnavailable' }, `${code} is not a configured offramp lane.`);
+    }
     if (this.discovery === undefined) return;
     await this.corridorMethod(this.discovery, code, currency, country, method, 'sell');
   }

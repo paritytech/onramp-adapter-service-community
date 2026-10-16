@@ -43,6 +43,7 @@
 import { z } from 'zod';
 
 import type { Direction } from '../rail.js';
+import { MeldHttpError } from './client.js';
 
 /** The category each direction reads under. Off-ramp is `CRYPTO_OFFRAMP`, verified live. */
 const CATEGORY: Record<Direction, string> = { buy: 'CRYPTO_ONRAMP', sell: 'CRYPTO_OFFRAMP' };
@@ -473,7 +474,10 @@ export class MeldDiscovery implements Discovery {
     const currencies = hit ?? (await this.readOfframpFiatCatalog());
     const listed = currencies.get(country) ?? [];
     if (listed.length <= 1) return listed[0] ?? '';
-    const local = await this.defaultFiat(country, 'buy');
+    const local = await this.defaultFiat(country, 'buy').catch((error: unknown) => {
+      if (error instanceof MeldHttpError && error.status === 404) return '';
+      throw error;
+    });
     return listed.includes(local) ? local : (listed[0] as string);
   }
 

@@ -259,6 +259,11 @@ Meld's codes for it, or a stablecoin sold after a Chainflip swap). `supported.of
 `/supported/offramp*` routes answer "what can a seller in this country use" without the caller
 picking a lane first.
 
+The list is also the gate: a sell `/quote` or `/session` for a code that is not a configured lane is
+refused `400 RegionUnavailable` before any rail call. Taking the Chainflip swap lanes out of the list
+therefore turns the swap route off for every client, and a country only they routed answers with no
+payout method.
+
 Merge rule, per country: the set of countries is the union across lanes. For each
 `paymentMethodType`, the method lists **every** configured lane (in configuration order) whose corridor
 offers it, as `lanes: [{code, chain, min, max, currency}]`, each with that lane's own limits. The method's
@@ -672,7 +677,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 409 | `Other{ REQUEST_CONCLUDED }` | The key belongs to a request that ended as `expired` or `failed`. On a buy the rail answered and nothing was paid; start a new one with a new key. On a sell, `failed` can follow a deposit the seller already sent (the provider failed or refunded the payout), so this is not a promise that nothing left the seller: read the request before opening another sale for the same funds. (`refused` shares this code but never reaches the path: a refused row holds no key.) |
 | 409 | `Other{ REQUEST_ALREADY_SETTLED }` | The key belongs to a request the buyer **already paid**. Do not start another for it. Split out of `REQUEST_CONCLUDED` because a client cannot act on one code for both: told "start a new one" after a settled purchase, it opens a second payable surface for money already taken. |
 | 409 | `Other{ REQUEST_OUTCOME_UNKNOWN }` | The key belongs to a request that concluded as `unobserved`: we stopped being able to ask the rail and never learned whether the buyer paid. Distinct from **both** other 409 conclusions: `REQUEST_CONCLUDED` says it finished and nothing was paid, `REQUEST_ALREADY_SETTLED` says it finished and *was* paid, this one says nobody knows which. Starting a new request means accepting the risk of paying twice. |
-| 400 | `RegionUnavailable` | A real destination this deployment has not configured. |
+| 400 | `RegionUnavailable` | A real destination this deployment has not configured, or a sell of a code that is not one of `supported.offramp_lanes`. |
 | 400 | `BelowMinimum` / `AboveMaximum` | On a **buy**, outside the effective fiat bounds (Meld's live corridor bound, tightened by a `limits` row when one names that pair), carrying `value: { amount, currency }` in fiat. On a **sell**, the provider's own crypto-denominated bound, refused upstream and carrying **no** `value`; see `direction` above for why a crypto threshold is not put on the wire. |
 | 400 | `Other{ CORRIDOR_UNAVAILABLE }` | A configured `limits` row does not overlap the live corridor bound, so this deployment cannot serve the corridor within its own limits. Refused rather than widened to the upstream bound. |
 | 400 | `Other{ INVALID_ADDRESS }` | Address failed to decode, or is not a 32-byte account. |
