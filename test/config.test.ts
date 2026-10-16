@@ -167,6 +167,55 @@ describe('parseConfig', () => {
     ).not.toThrow();
   });
 
+  it('refuses a plaintext sale_vault rpc_url outside development', () => {
+    // The vault RPC carries the operator's signed transactions, so a plaintext endpoint outside
+    // development leaks them in flight. Modelled on the cors guard above: everything else is valid
+    // so the only refusal is the one being asserted.
+    const personhood = (personhoodConfig().auth as { personhood?: Record<string, unknown> }).personhood ?? {};
+    expect(() =>
+      parseConfig(
+        rawConfig({
+          environment: 'production',
+          auth: { mode: 'personhood', personhood },
+          meld: {
+            ...(rawConfig().meld as Record<string, unknown>),
+            base_url: 'https://api.meld.io',
+            api_key: { mode: 'file', path: '/run/secrets/meld-api-key' },
+          },
+          cors: { allowed_origins: ['https://app.example'] },
+          sale_vault: {
+            chain: 'arbitrum-one',
+            chain_id: 42161,
+            contract: '0x81949127042930F8e7A1723385A2F76213C72ee9',
+            rpc_url: 'http://rpc.example',
+            operator_key: { mode: 'file', path: '/run/secrets/op-key' },
+            min_return: '1',
+            dust_target: '5',
+          },
+        }),
+      ),
+    ).toThrow(/sale_vault.*plaintext/s);
+  });
+
+  it('refuses the zero address as the sale_vault contract', () => {
+    // The zero address is the unset sentinel, and a swap delivered there burns the funds.
+    expect(() =>
+      parseConfig(
+        rawConfig({
+          sale_vault: {
+            chain: 'arbitrum-sepolia',
+            chain_id: 421614,
+            contract: `0x${'0'.repeat(40)}`,
+            rpc_url: 'http://127.0.0.1:1',
+            operator_key: { mode: 'env', var: 'OP_KEY' },
+            min_return: '1',
+            dust_target: '5',
+          },
+        }),
+      ),
+    ).toThrow(/sale_vault.contract.*zero address/s);
+  });
+
   it('refuses a port that could never appear in an Origin header', () => {
     // `:99999` passed the old `\d{1,5}` group, and `URL.parse` returns null for it, so it
     // validated at boot and could never match anything, which is the class the `:443` refinement

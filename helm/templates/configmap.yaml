@@ -5,9 +5,9 @@
   No `| default` on booleans. Helm's `default` treats `false` as empty and substitutes, so
   `session_creation_enabled: false` rendered `true`. The emergency stop for a service spending a
   payment credential could not be switched off. Every key here has a schema default in
-  values.yaml, so the pipe bought nothing and cost that. The two secret sources (meld.api_key and
-  auth.personhood.jwt_key) are emitted as file references
-  {"mode":"file","path":"/run/secrets/<key>"} because the real bytes live in
+  values.yaml, so the pipe bought nothing and cost that. The secret sources (meld.api_key,
+  auth.personhood.jwt_key, and sale_vault.operator_key when the lane is enabled) are emitted as file
+  references {"mode":"file","path":"/run/secrets/<key>"} because the real bytes live in
   mounted Secret files (mounted below in the Deployment at secretMountPath).
   A Secret that is missing makes the process fail at boot on the file read,
   never boot with a default key.
@@ -18,6 +18,10 @@
   but it is a precision trap waiting on a larger value, and a config file nobody can read at a
   glance. `int` renders the integer.
 */ -}}
+{{- /* Enabling the sale vault without its operator-key Secret renders a config that boots to a missing-file read, so fail at render instead. */ -}}
+{{- if and .Values.sale_vault.enabled (not .Values.secrets.saleVaultOperatorKey.existingSecret) }}
+{{- fail "sale_vault.enabled is true but secrets.saleVaultOperatorKey.existingSecret is unset: the operator key would not be mounted." }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -95,5 +99,16 @@ data:
         "routes_interval_ms": {{ int .Values.supported.routes_interval_ms }},
         "sell_routes_interval_ms": {{ int .Values.supported.sell_routes_interval_ms }},
         "offramp_lanes": {{ .Values.supported.offramp_lanes | toJson }}
+      }{{- if .Values.sale_vault.enabled }},
+      {{- /* The off-ramp SaleVault lane. operator_key is a file reference like the other secrets. */}}
+      "sale_vault": {
+        "chain": {{ .Values.sale_vault.chain | quote }},
+        "chain_id": {{ int .Values.sale_vault.chain_id }},
+        "contract": {{ .Values.sale_vault.contract | quote }},
+        "rpc_url": {{ .Values.sale_vault.rpc_url | quote }},
+        "operator_key": { "mode": "file", "path": {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.saleVaultOperatorKey.key | quote }} },
+        "min_return": {{ .Values.sale_vault.min_return | quote }},
+        "dust_target": {{ .Values.sale_vault.dust_target | quote }}
       }
+      {{- end }}
     }

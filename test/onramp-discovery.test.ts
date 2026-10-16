@@ -588,4 +588,30 @@ describe('Onramp offramp discovery', () => {
     const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', undefined);
     await expect(svc.offramp('US')).rejects.toBeInstanceOf(Refusal);
   });
+
+  it('includes the sale vault destination when the off-ramp lane is configured', async () => {
+    // The app reads this to know where its Chainflip CCM must deliver.
+    const withVault = {
+      ...cfg(),
+      sale_vault: {
+        chain: 'arbitrum-sepolia',
+        chain_id: 421614,
+        contract: '0x81949127042930F8e7A1723385A2F76213C72ee9',
+        rpc_url: 'http://127.0.0.1:1',
+        operator_key: { mode: 'env' as const, var: 'OP_KEY' },
+        min_return: '1',
+        dust_target: '5',
+      },
+    };
+    const discovery: Discovery = {
+      ...fakeDiscovery(),
+      corridorForCountry: async (country, code) => ({ country, fiat: 'GBP', crypto: code, methods: [] }),
+    };
+    const svc = new Onramp(withVault, { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', discovery);
+    const out = await svc.offramp('GB');
+    expect(out).toMatchObject({
+      country: 'GB',
+      vault: { chain: 'arbitrum-sepolia', chainId: 421614, contract: '0x81949127042930F8e7A1723385A2F76213C72ee9' },
+    });
+  });
 });

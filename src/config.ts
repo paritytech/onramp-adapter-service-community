@@ -590,6 +590,23 @@ const configSchema = z
       .strict()
       // `.prefault({})` like `cors`/`rate_limit`: an absent block is the documented defaults.
       .prefault({}),
+    // The on-chain SaleVault for the offramp swap lane. Optional, so a deployment that does not run
+    // the contract lane validates without it. Required fields have no default since they move money.
+    sale_vault: z
+      .object({
+        chain: z.string().min(1),
+        // The numeric EVM chain id signed into every transaction, explicit so signing is correct offline.
+        chain_id: z.number().int().positive(),
+        contract: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
+        rpc_url: z.url(),
+        operator_key: secretSource,
+        // The least held amount worth returning, below which a return would cost more gas than it saves.
+        min_return: decimal,
+        // The dust the contract keeps to self-fund its own gas, as the operator wants it maintained.
+        dust_target: decimal,
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((cfg, ctx) => {
@@ -727,6 +744,7 @@ const configSchema = z
       // redaction hooks do nothing for `process.env`, which is the whole reason this loop exists.
       ['store.password', cfg.store.password],
       ...(cfg.auth.personhood === undefined ? [] : [['auth.personhood.jwt_key', cfg.auth.personhood.jwt_key] as const]),
+      ...(cfg.sale_vault === undefined ? [] : [['sale_vault.operator_key', cfg.sale_vault.operator_key] as const]),
     ] as const) {
       if (source.mode === 'env' && cfg.environment !== 'development') {
         ctx.addIssue({
@@ -772,6 +790,28 @@ const configSchema = z
           message: `cors.allowed_origins must use https outside development: "${value}" is plaintext.`,
         });
       }
+    }
+
+    // The sale-vault RPC carries the operator's signed transactions, so it must not be plaintext.
+    if (
+      cfg.sale_vault !== undefined &&
+      cfg.environment !== 'development' &&
+      !cfg.sale_vault.rpc_url.startsWith('https://')
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['sale_vault', 'rpc_url'],
+        message: `sale_vault.rpc_url must use https outside development: "${cfg.sale_vault.rpc_url}" is plaintext.`,
+      });
+    }
+
+    // The zero address is a sentinel for an unset contract, and a swap delivered there burns the funds.
+    if (cfg.sale_vault !== undefined && cfg.sale_vault.contract.toLowerCase() === `0x${'0'.repeat(40)}`) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['sale_vault', 'contract'],
+        message: 'sale_vault.contract must be the deployed SaleVault address, not the zero address.',
+      });
     }
 
     // The store link carries every funding row (aliases, wallet addresses, amounts) and the

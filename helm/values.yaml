@@ -209,6 +209,19 @@ supported:
     # - { code: USDC_ARBITRUM, chain: arbitrum }
     # - { code: USDC_SOLANA, chain: solana }
 
+# The off-ramp SaleVault lane. Optional, enabled false runs without it so the sale and return endpoints answer 503.
+sale_vault:
+  enabled: false
+  chain: arbitrum-sepolia
+  # The numeric EVM chain id operator transactions are signed for.
+  chain_id: 421614
+  # The deployed SaleVault address, set by the operator when enabled.
+  contract: "0x0000000000000000000000000000000000000000"
+  rpc_url: https://sepolia-rollup.arbitrum.io/rpc
+  # The least held amount worth returning, and the dust the contract keeps for its own gas.
+  min_return: "1"
+  dust_target: "5"
+
 # The background worker that advances in-flight funding requests.
 worker:
   interval_ms: 15000
@@ -269,7 +282,7 @@ serviceAccount:
 # Where secret files are mounted (config.json references these paths).
 secretMountPath: /run/secrets
 
-# The two runtime secrets, mounted as files so they never appear in `env` or the image.
+# The runtime secrets, mounted as files so they never appear in `env` or the image. The sale vault operator key is a third, mounted only when the lane is enabled.
 #
 # Declared here with empty `existingSecret` rather than omitted: the templates reference these
 # paths, and leaving the key absent made `helm template` with default values fail on a nil
@@ -283,6 +296,10 @@ secrets:
   jwtKey:
     existingSecret: ""
     key: jwt-key
+  # Mounted only when sale_vault.enabled is true, the same file way as the keys above.
+  saleVaultOperatorKey:
+    existingSecret: ""
+    key: sale-vault-operator-key
 
 # `ephemeral-storage` is still bounded, and its justification has changed twice. It used to be the
 # ceiling on the unbounded refusal write path, back when those rows lived on an `emptyDir`. They
