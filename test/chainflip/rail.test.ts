@@ -4,7 +4,7 @@ import { ChainflipRail } from '../../src/chainflip/rail.js';
 import { Refusal } from '../../src/contract.js';
 import { railSellSessionInput, railSessionInput } from '../fixtures.js';
 
-const railInput = () => railSessionInput({ destinationCode: 'DOT_ASSETHUB' });
+const railInput = () => railSessionInput({ destinationCode: 'DOT' });
 
 const failureOf = async (fn: () => Promise<unknown>): Promise<Refusal | undefined> => {
   try {
@@ -52,7 +52,7 @@ describe('ChainflipRail', () => {
             direction: 'sell',
             countryCode: 'GB',
             sourceCurrencyCode: 'GBP',
-            destinationCurrencyCode: 'DOT_ASSETHUB',
+            destinationCurrencyCode: 'DOT',
             cryptoAmount: '12.3456789012',
             paymentMethodType: 'PAYOUT_TO_BANK',
           })
@@ -75,7 +75,7 @@ describe('ChainflipRail', () => {
         direction: 'buy',
         countryCode: 'US',
         sourceCurrencyCode: 'USD',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         sourceAmount: '20',
         paymentMethodType: 'CREDIT_DEBIT_CARD',
       }),

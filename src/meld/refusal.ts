@@ -9,6 +9,7 @@
 
 import { noQuotesAvailable, reject, Refusal, upstreamUnavailable } from '../contract.js';
 
+import { isKnownCrypto } from './catalog.js';
 import { MeldHttpError } from './client.js';
 
 /**
@@ -25,14 +26,15 @@ import { MeldHttpError } from './client.js';
  * at all. It reads "[TRANSAK] Source amount is below the minimum allowed", and the threshold
  * sits in `serviceProviderDetails.message` as prose that differs between the minimum and maximum
  * cases ("Minimum sell amount should be more than or equal to 0.00011648 BTC" against "Please
- * place an order of less than 0.2812547 BTC"). The `which is` anchor is absent and the symbol
- * may be `DOT_ASSETHUB`, which the three-letter currency group would not match either.
+ * place an order of less than 0.2812547 BTC"). The `which is` anchor is absent there. The symbol is
+ * no help: Meld's code for DOT is now `DOT` (it was `DOT_ASSETHUB`), three letters like a fiat, so
+ * a match whose "currency" is a crypto this service knows is dropped rather than read as fiat.
  *
  * The provider's sentence *is* now carried (`MeldHttpError.providerDetail`), so extracting the
  * number would be a regex away. It is not done, because `FundingFailure`'s threshold is
  * `{ amount, currency }` with nowhere to say which kind of currency, and every existing producer
  * of it — this function's fiat branch, and `onramp.ts`'s config-derived gate — fills it with
- * fiat. Putting `0.00011648 DOT_ASSETHUB` into the same field would hand a client that renders
+ * fiat. Putting `0.00011648 DOT` into the same field would hand a client that renders
  * "the minimum is 0.00011648" a number in units it has no way to know it is reading, next to a
  * `fiat` echo naming something else entirely. A missing threshold makes a client say "too low";
  * a wrongly-denominated one makes it say a specific false thing. So the number goes to the
@@ -41,7 +43,9 @@ import { MeldHttpError } from './client.js';
  */
 function threshold(detail: string): { value: { amount: string; currency: string } } | undefined {
   const m = detail.match(/which is\s+(\d+(?:\.\d{1,2})?)\s+([A-Za-z]{3})/i);
-  return m && m[1] && m[2] ? { value: { amount: m[1], currency: m[2].toUpperCase() } } : undefined;
+  if (!m || !m[1] || !m[2]) return undefined;
+  const currency = m[2].toUpperCase();
+  return isKnownCrypto(currency) ? undefined : { value: { amount: m[1], currency } };
 }
 
 /**

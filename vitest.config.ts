@@ -3,6 +3,8 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
+    /** Installs the asset catalog `startup.ts` would, for the suites that never boot. */
+    setupFiles: ['test/setup.ts'],
     /**
      * The end-to-end suite is excluded here and run by `vitest.e2e.config.ts`.
      *

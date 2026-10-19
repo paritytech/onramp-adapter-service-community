@@ -74,7 +74,7 @@ let meldCalls: string[] = [];
  * Meld decides which direction a quote or a session is (verified). A list rather than a pattern:
  * `DOT` and `BTC` are three letters, so no shape test separates them from `USD`.
  */
-const CRYPTO_CODES = ['USDC_ASSETHUB', 'USDT_ASSETHUB', 'DOT_ASSETHUB'];
+const CRYPTO_CODES = ['USDC_DOT', 'USDT_DOT', 'DOT'];
 const isCrypto = (code: unknown): boolean => typeof code === 'string' && CRYPTO_CODES.includes(code);
 
 /** The request body as JSON, or an empty object for a GET. */
@@ -260,7 +260,9 @@ async function fakeMeld(
                 sourceAmount: '25.00',
                 sourceCurrencyCode: 'USD',
                 destinationAmount: '24',
-                destinationCurrencyCode: 'USDC_ASSETHUB',
+                // Echoed, as the real endpoint does: boot asks for every configured asset code
+                // and refuses to start on a quote that comes back for another one.
+                destinationCurrencyCode: destination,
                 totalFee: '1.00',
               },
             ],
@@ -344,7 +346,7 @@ async function writeConfig(
             routes_cache_ttl_ms: 60_000,
           }),
       boot_probe: {
-        destination_code: 'USDC_ASSETHUB',
+        asset: 'usdc@assethub',
         source_amount: '20',
         source_currency: 'USD',
         country_code: 'US',
@@ -363,7 +365,8 @@ async function writeConfig(
           },
         }
       : { mode: 'insecure_dev' },
-    limits: [{ code: 'USDC_ASSETHUB', min: '10.00', max: '2000.00', currency: 'USD' }],
+    assets: { 'dot@assethub': 'DOT', 'usdt@assethub': 'USDT_DOT', 'usdc@assethub': 'USDC_DOT' },
+    limits: [{ asset: 'usdc@assethub', min: '10.00', max: '2000.00', currency: 'USD' }],
     allowed_products: opts.products ?? [PRODUCT],
     cors: { allowed_origins: opts.allowedOrigins ?? [] },
     rate_limit: { per_person_max: 1000, per_address_max: 1000, window_seconds: 60 },
@@ -579,7 +582,7 @@ describe('the service as a process', () => {
       headers: { 'content-type': 'application/json', 'x-dev-product-id': PRODUCT },
       body: JSON.stringify({
         idempotencyKey: 'e2e-pool-0001',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: WALLET,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -662,7 +665,7 @@ describe('the service as a process', () => {
       body: JSON.stringify({
         country: 'US',
         fiat: 'USD',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         sourceAmount: '25.00',
         paymentMethodType: 'CREDIT_DEBIT_CARD',
       }),
@@ -757,7 +760,7 @@ describe('the service as a process', () => {
         body: JSON.stringify({
           country: 'US',
           fiat: 'USD',
-          destinationCurrencyCode: 'USDC_ASSETHUB',
+          destinationCurrencyCode: 'USDC_DOT',
           sourceAmount: '25.00',
           paymentMethodType: 'CREDIT_DEBIT_CARD',
         }),
@@ -814,7 +817,7 @@ describe('the funding journey over real HTTP', () => {
     const base = `http://127.0.0.1:${String(port)}`;
 
     // Boot passes run after the port opens, so the first read can legitimately be empty. Both
-    // directions are refreshed for DOT_ASSETHUB (`SUPPORTED_REFRESH_JOBS` in `startup.ts`), so a
+    // directions are refreshed for DOT (`SUPPORTED_REFRESH_JOBS` in `startup.ts`), so a
     // filled cache is 4 rows: (BR, US) x (buy, sell).
     const deadline = Date.now() + 15_000;
     let rows: Record<string, unknown>[] = [];
@@ -844,17 +847,17 @@ describe('the funding journey over real HTTP', () => {
     // Name-sorted, as `countries` returns and the catalog preserves; buy's job runs before sell's
     // (`SUPPORTED_REFRESH_JOBS`' order), and each direction's route path has its own argument order.
     expect(discovery.filter((url) => url.includes('/supported/routes/'))).toEqual([
-      '/network-partner/supported/routes/CRYPTO_ONRAMP/BR/BRL/DOT_ASSETHUB',
-      '/network-partner/supported/routes/CRYPTO_ONRAMP/ZZ/ZZZ/DOT_ASSETHUB',
-      '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT_ASSETHUB',
-      '/network-partner/supported/routes/CRYPTO_OFFRAMP/BR/DOT_ASSETHUB/BRL',
-      '/network-partner/supported/routes/CRYPTO_OFFRAMP/ZZ/DOT_ASSETHUB/ZZZ',
-      '/network-partner/supported/routes/CRYPTO_OFFRAMP/US/DOT_ASSETHUB/USD',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/BR/BRL/DOT',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/ZZ/ZZZ/DOT',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/BR/DOT/BRL',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/ZZ/DOT/ZZZ',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/US/DOT/USD',
     ]);
 
     // And the endpoint serves those rows without going to Meld.
     const before = meldCalls.length;
-    const response = await fetch(`${base}/supported/corridors?destinationCurrencyCode=DOT_ASSETHUB`, {
+    const response = await fetch(`${base}/supported/corridors?destinationCurrencyCode=DOT`, {
       headers: { 'x-dev-product-id': PRODUCT },
     });
     expect(response.status).toBe(200);
@@ -869,7 +872,7 @@ describe('the funding journey over real HTTP', () => {
 
     // `direction=sell` serves the sibling row, not the buy one: the whole point of the v7 -> v8
     // migration is that these two never share a slot.
-    const sellResponse = await fetch(`${base}/supported/corridors?destinationCurrencyCode=DOT_ASSETHUB&direction=sell`, {
+    const sellResponse = await fetch(`${base}/supported/corridors?destinationCurrencyCode=DOT&direction=sell`, {
       headers: { 'x-dev-product-id': PRODUCT },
     });
     expect(sellResponse.status).toBe(200);
@@ -900,8 +903,8 @@ describe('the funding journey over real HTTP', () => {
      * a crossed quote fails at this service's own boundary rather than depending on the shape
      * assertion below to notice.
      *
-     * **This is as far as a sell can be taken here.** No provider on the account off-ramps
-     * `*_ASSETHUB`, so the real corridor could not be exercised even against the live sandbox;
+     * **This is as far as a sell can be taken here.** No provider on the account off-ramped
+     * an Asset Hub asset when this was written, so the real corridor could not be exercised even against the live sandbox;
      * and nothing yet reads a deposit address back, so the row correctly stops at
      * `session_opened` and the sale cannot be completed through this service.
      */
@@ -920,7 +923,7 @@ describe('the funding journey over real HTTP', () => {
         direction: 'sell',
         country: 'GB',
         fiat: 'GBP',
-        destinationCurrencyCode: 'DOT_ASSETHUB',
+        destinationCurrencyCode: 'DOT',
         cryptoAmount: '12.3456789012',
         paymentMethodType: 'PAYOUT_TO_BANK',
       }),
@@ -929,7 +932,7 @@ describe('the funding journey over real HTTP', () => {
     const priced = (await quote.json()) as { quotes: Record<string, unknown>[]; requested: Record<string, unknown> };
     // The echo names the term the seller committed, and does not name one they did not.
     expect(priced.requested).toEqual({
-      destinationCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'DOT',
       cryptoAmount: '12.3456789012',
       fiat: 'GBP',
     });
@@ -938,7 +941,7 @@ describe('the funding journey over real HTTP', () => {
     // destination, which is inverted from a buy.
     expect(priced.quotes[0]).toMatchObject({
       transactionType: 'CRYPTO_SELL',
-      sourceCurrencyCode: 'DOT_ASSETHUB',
+      sourceCurrencyCode: 'DOT',
       destinationCurrencyCode: 'GBP',
       sourceAmountWithoutFees: null,
       destinationAmountWithoutFees: '63.18',
@@ -952,7 +955,7 @@ describe('the funding journey over real HTTP', () => {
         direction: 'sell',
         country: 'GB',
         fiat: 'GBP',
-        destinationCurrencyCode: 'DOT_ASSETHUB',
+        destinationCurrencyCode: 'DOT',
         cryptoAmount: '12.3456789012',
         paymentMethodType: 'PAYOUT_TO_BANK',
         serviceProvider: 'TRANSAK',
@@ -965,7 +968,7 @@ describe('the funding journey over real HTTP', () => {
       pinned: Record<string, unknown>;
     };
     expect(created.pinned).toEqual({
-      destinationCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'DOT',
       cryptoAmount: '12.3456789012',
       fiat: 'GBP',
       country: 'GB',
@@ -1007,7 +1010,7 @@ describe('the funding journey over real HTTP', () => {
       body: JSON.stringify({
         country: 'US',
         fiat: 'USD',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         sourceAmount: '25.00',
         paymentMethodType: 'CREDIT_DEBIT_CARD',
       }),
@@ -1020,7 +1023,7 @@ describe('the funding journey over real HTTP', () => {
       headers,
       body: JSON.stringify({
         idempotencyKey: 'e2e-0001',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: WALLET,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -1048,7 +1051,7 @@ describe('the funding journey over real HTTP', () => {
     expect(created.widgetUrl).toBe(MELD_WIDGET_URL);
     expect(created.widgetUrl).not.toBe(created.serviceProviderWidgetUrl);
     expect(created.pinned).toEqual({
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       walletAddress: WALLET,
       sourceAmount: '25.00',
       fiat: 'USD',
@@ -1068,7 +1071,7 @@ describe('the funding journey over real HTTP', () => {
       id: created.fundingRequestId,
       status: 'session_opened',
       rail: 'meld',
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '25.00',
       fiat: 'USD',
     });
@@ -1096,7 +1099,7 @@ describe('the funding journey over real HTTP', () => {
       headers,
       body: JSON.stringify({
         idempotencyKey: 'e2e-restart-0001',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: WALLET,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -1138,7 +1141,7 @@ describe('the funding journey over real HTTP', () => {
       headers,
       body: JSON.stringify({
         idempotencyKey: 'e2e-cancel-0001',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: WALLET,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -1176,7 +1179,7 @@ describe('the funding journey over real HTTP', () => {
       headers,
       body: JSON.stringify({
         idempotencyKey: 'e2e-cancel-0001',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: WALLET,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -1204,7 +1207,7 @@ describe('the funding journey over real HTTP', () => {
     const headers = { 'content-type': 'application/json', 'x-dev-product-id': PRODUCT };
     const body = JSON.stringify({
       idempotencyKey: 'e2e-idem-0001',
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       walletAddress: WALLET,
       sourceAmount: '25.00',
       fiat: 'USD',
@@ -1262,7 +1265,7 @@ describe('the funding journey over real HTTP', () => {
       headers,
       body: JSON.stringify({
         idempotencyKey: 'e2e-worker-0001',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: WALLET,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -1308,7 +1311,7 @@ describe('the funding journey over real HTTP', () => {
     const body = (redirectUrl: string, key: string) =>
       JSON.stringify({
         idempotencyKey: key,
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: WALLET,
         sourceAmount: '25.00',
         fiat: 'USD',
@@ -1364,7 +1367,7 @@ describe('the funding journey over real HTTP', () => {
       headers: mine,
       body: JSON.stringify({
         idempotencyKey: 'e2e-scope-0001',
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: WALLET,
         sourceAmount: '25.00',
         fiat: 'USD',

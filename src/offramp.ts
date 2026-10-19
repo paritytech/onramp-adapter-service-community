@@ -9,6 +9,9 @@
 import type { MethodLimit } from './meld/discovery.js';
 
 export interface OfframpLane {
+  /** This service's own name for the asset, which a Meld rename does not change. */
+  readonly asset: string;
+  /** Meld's current code for it, the one a quote or session for this lane must send. */
   readonly code: string;
   readonly chain: string;
 }
@@ -69,6 +72,7 @@ export function mergeMethods(views: readonly LaneCorridor[], fiat?: string): Off
   for (const view of views) {
     for (const method of view.methods) {
       const offer: OfframpLaneOffer = {
+        asset: view.lane.asset,
         code: view.lane.code,
         chain: view.lane.chain,
         min: method.min,

@@ -98,7 +98,7 @@ describe('toFundingRequestDto', () => {
       direction: 'buy',
       status: 'transaction_seen',
       providerStatus: 'SUCCEEDED',
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       walletAddress: '0x...',
       sourceAmount: '25.00',
       fiat: 'USD',
@@ -145,7 +145,7 @@ describe('toFundingRequestDto: the deposit disclosure', () => {
     status_history: [{ status: 'transaction_seen', at: 1_700_000_000_000 }],
     deposit_address: '1DepositAddress',
     deposit_amount: '12.3456789012',
-    deposit_currency: 'DOT_ASSETHUB',
+    deposit_currency: 'DOT',
     deposit_observed_at: 1_700_000_000_150,
   });
 
@@ -155,7 +155,7 @@ describe('toFundingRequestDto: the deposit disclosure', () => {
     expect(dto.deposit).toEqual({
       address: '1DepositAddress',
       amount: '12.3456789012',
-      currency: 'DOT_ASSETHUB',
+      currency: 'DOT',
       observedAt: 1_700_000_000_150,
     });
   });

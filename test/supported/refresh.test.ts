@@ -31,7 +31,7 @@ import {
 import type { Corridor, CountryRow, MethodLimit } from '../../src/meld/discovery.js';
 import { fakeStore } from '../fixtures.js';
 
-const CRYPTO = 'DOT_ASSETHUB';
+const CRYPTO = 'DOT';
 /** Every test in this file predates direction and is written against a buy job, unless noted. */
 const JOB: RefreshJob = { crypto: CRYPTO, direction: 'buy' };
 const SELL_JOB: RefreshJob = { crypto: CRYPTO, direction: 'sell' };
@@ -294,7 +294,7 @@ describe('refreshRoutes', () => {
 
     expect(written).toBe(1);
     expect((await store.readCorridors(CRYPTO, 'buy')).map((r) => r.country)).toEqual(['US']);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('BR/DOT_ASSETHUB'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('BR/DOT'));
   });
 
   it('does not start processing a country when the signal is already aborted', async () => {

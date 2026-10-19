@@ -593,8 +593,8 @@ export class MeldClient {
         // listed here.
         //
         // Whether `cryptoCurrency` constrains anything `destinationCurrencyCode` does not is
-        // unverified. They may be the same concept at different granularity (`DOT` against
-        // `DOT_ASSETHUB`), or the widget's asset picker may bind to one and not the other. Listed
+        // unverified. They may be the same concept at different granularity (`USDT` against
+        // `USDT_DOT`), or the widget's asset picker may bind to one and not the other. Listed
         // anyway, because the asymmetry is one-sided: a redundant lock costs nothing, and an
         // absent one leaves the buyer walkable onto another asset if it is the field that matters.
         //
