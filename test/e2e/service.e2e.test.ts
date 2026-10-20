@@ -817,25 +817,33 @@ describe('the funding journey over real HTTP', () => {
     const base = `http://127.0.0.1:${String(port)}`;
 
     // Boot passes run after the port opens, so the first read can legitimately be empty. Both
-    // directions are refreshed for DOT (`SUPPORTED_REFRESH_JOBS` in `startup.ts`), so a
-    // filled cache is 4 rows: (BR, US) x (buy, sell).
+    // directions are refreshed for DOT, and a buy for each other deliverable asset the config
+    // names (`refreshJobs` in `startup.ts`), so a filled cache is 8 rows: (BR, US) x (DOT buy,
+    // DOT sell, USDC_DOT buy, USDT_DOT buy).
     const deadline = Date.now() + 15_000;
     let rows: Record<string, unknown>[] = [];
     for (;;) {
-      rows = await rawQuery(schema, 'SELECT direction, country, fiat, methods FROM supported_corridors ORDER BY direction, country');
-      if (rows.length >= 4 || Date.now() > deadline) break;
+      rows = await rawQuery(
+        schema,
+        'SELECT destination_currency_code AS code, direction, country, fiat, methods FROM supported_corridors ORDER BY code, direction, country',
+      );
+      if (rows.length >= 8 || Date.now() > deadline) break;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
 
     // BR and US only in each direction: NF dropped (no fiat, either direction), ZZ skipped (no
     // route, either direction).
-    expect(rows.map((r) => [r.direction, r.country])).toEqual([
-      ['buy', 'BR'],
-      ['buy', 'US'],
-      ['sell', 'BR'],
-      ['sell', 'US'],
+    expect(rows.map((r) => [r.code, r.direction, r.country])).toEqual([
+      ['DOT', 'buy', 'BR'],
+      ['DOT', 'buy', 'US'],
+      ['DOT', 'sell', 'BR'],
+      ['DOT', 'sell', 'US'],
+      ['USDC_DOT', 'buy', 'BR'],
+      ['USDC_DOT', 'buy', 'US'],
+      ['USDT_DOT', 'buy', 'BR'],
+      ['USDT_DOT', 'buy', 'US'],
     ]);
-    expect(rows.map((r) => r.fiat)).toEqual(['BRL', 'USD', 'BRL', 'USD']);
+    expect(rows.map((r) => r.fiat)).toEqual(['BRL', 'USD', 'BRL', 'USD', 'BRL', 'USD', 'BRL', 'USD']);
 
     // Catalog before routes, and routes asks per country with the catalog's fiat — never
     // re-reading `defaults`/`fiat-limits`, which is what makes its cadence affordable.
@@ -844,8 +852,9 @@ describe('the funding journey over real HTTP', () => {
     // Only a buy reads `defaults/`; a sell reads `fiat-limits` instead (see `MeldDiscovery.defaultFiat`).
     expect(discovery.filter((url) => url.startsWith('/network-partner/defaults/'))).toHaveLength(4);
     expect(discovery.filter((url) => url.startsWith('/network-partner/supported/fiat-limits'))).toHaveLength(1);
-    // Name-sorted, as `countries` returns and the catalog preserves; buy's job runs before sell's
-    // (`SUPPORTED_REFRESH_JOBS`' order), and each direction's route path has its own argument order.
+    // Name-sorted, as `countries` returns and the catalog preserves; jobs run in `refreshJobs`'
+    // order (DOT buy, DOT sell, then each other deliverable asset's buy), and each direction's
+    // route path has its own argument order.
     expect(discovery.filter((url) => url.includes('/supported/routes/'))).toEqual([
       '/network-partner/supported/routes/CRYPTO_ONRAMP/BR/BRL/DOT',
       '/network-partner/supported/routes/CRYPTO_ONRAMP/ZZ/ZZZ/DOT',
@@ -853,6 +862,12 @@ describe('the funding journey over real HTTP', () => {
       '/network-partner/supported/routes/CRYPTO_OFFRAMP/BR/DOT/BRL',
       '/network-partner/supported/routes/CRYPTO_OFFRAMP/ZZ/DOT/ZZZ',
       '/network-partner/supported/routes/CRYPTO_OFFRAMP/US/DOT/USD',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/BR/BRL/USDT_DOT',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/ZZ/ZZZ/USDT_DOT',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/USDT_DOT',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/BR/BRL/USDC_DOT',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/ZZ/ZZZ/USDC_DOT',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/USDC_DOT',
     ]);
 
     // And the endpoint serves those rows without going to Meld.
