@@ -199,9 +199,16 @@ export class Onramp {
     resolveForDirection(code, dir);
     // The rows are written by the routes pass, so that is the cadence staleness is measured in;
     // sell jobs run it on their own, slower, interval.
-    const interval = dir === 'sell' ? this.cfg.supported.sell_routes_interval_ms : this.cfg.supported.routes_interval_ms;
-    const freshAfter = this.clock() - interval * STALE_PASSES;
-    const rows = await this.funding.readCorridors(code, dir, freshAfter);
+    const window = (dir === 'sell' ? this.cfg.supported.sell_routes_interval_ms : this.cfg.supported.routes_interval_ms) * STALE_PASSES;
+    let rows = await this.funding.readCorridors(code, dir, this.clock() - window);
+    // Nothing fresh (a boot after a long idle, before the first pass lands, or a refresh that has
+    // been failing): serve the last catalog the refresh wrote rather than none, the window anchored
+    // on its newest row instead of now so a country it had already retired stays retired.
+    if (rows.length === 0) {
+      const all = await this.funding.readCorridors(code, dir);
+      const newest = Math.max(...all.map((r) => r.updated_at));
+      rows = all.filter((r) => r.updated_at >= newest - window);
+    }
     return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: r.methods }));
   }
 

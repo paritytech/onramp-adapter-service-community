@@ -18,7 +18,7 @@ import { FundingStore } from './funding/store.js';
 import { startWorker, type RailObservation } from './funding/worker.js';
 import { startSupportedRefresh, type RefreshJob } from './supported/refresh.js';
 import { MeldClient, MeldHttpError } from './meld/client.js';
-import { AssetCatalog, installCatalog, type AssetId } from './meld/catalog.js';
+import { ASSET_IDS, ASSETS, AssetCatalog, installCatalog, type AssetId } from './meld/catalog.js';
 import { MeldDiscovery } from './meld/discovery.js';
 import { Onramp } from './onramp.js';
 import { MeldRail } from './meld/rail.js';
@@ -30,21 +30,24 @@ import { validateWithCommitment } from './personhood/verifiablejs.js';
 import { resolveSecret } from './secret.js';
 import { buildServer } from './server.js';
 
-// The assets the supported-corridors refresh enumerates; DOT only in v1, the table is crypto-keyed so more are additive.
-const SUPPORTED_REFRESH_ASSETS: readonly AssetId[] = ['dot@assethub'];
+// The asset the refresh walks in both directions; the table is crypto-keyed so more are additive.
+const SUPPORTED_REFRESH_ASSET: AssetId = 'dot@assethub';
 
 /**
- * Every job the refresh walks: both directions for each refreshed asset this deployment names
- * (under its configured code), plus a sell job per offramp lane. A job that finds no provider
- * writes nothing, which is not a failure.
+ * Every job the refresh walks: both directions for DOT, a buy job for every other deliverable
+ * asset this deployment names (a client reads the buy catalog for whichever one its route
+ * delivers, so an unrefreshed one reads as no corridors at all), plus a sell job per offramp lane.
+ * Each under its configured code. A job that finds no provider writes nothing, which is not a failure.
  */
 export function refreshJobs(
   lanes: readonly { code: string }[],
   assets: Readonly<Partial<Record<AssetId, string>>>,
 ): RefreshJob[] {
-  const jobs: RefreshJob[] = SUPPORTED_REFRESH_ASSETS.flatMap((asset) => {
+  const jobs: RefreshJob[] = ASSET_IDS.flatMap((asset): RefreshJob[] => {
     const crypto = assets[asset];
-    return crypto === undefined ? [] : DIRECTIONS.map((direction) => ({ crypto, direction }));
+    if (crypto === undefined || !ASSETS[asset].deliverable) return [];
+    if (asset === SUPPORTED_REFRESH_ASSET) return DIRECTIONS.map((direction) => ({ crypto, direction }));
+    return [{ crypto, direction: 'buy' }];
   });
   for (const { code } of lanes) {
     if (!jobs.some((j) => j.crypto === code && j.direction === 'sell')) {
