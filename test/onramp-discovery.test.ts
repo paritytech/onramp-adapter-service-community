@@ -324,8 +324,8 @@ describe('Onramp.supportedCorridors', () => {
 
   it('serves the last catalog written rather than none when nothing is fresh', async () => {
     const store = stampedStore([{ country: 'BR', at: T }]);
-    // A clock far past the row's stamp puts it outside `now - 3*interval`; it is still served.
-    expect((await at(store, 3_000_000_000_000).supportedCorridors('DOT')).map((r) => r.country)).toEqual(['BR']);
+    // 10h on puts it outside the 6h buy window (3 x 2h); it is still served.
+    expect((await at(store, T + 10 * HOUR).supportedCorridors('DOT')).map((r) => r.country)).toEqual(['BR']);
   });
 
   it('anchors the fallback window on the newest row, so a country already retired stays retired', async () => {
@@ -334,7 +334,20 @@ describe('Onramp.supportedCorridors', () => {
       { country: 'AR', at: T - 2 * HOUR },
       { country: 'MX', at: T - 10 * HOUR },
     ]);
-    expect((await at(store, T + 100 * HOUR).supportedCorridors('DOT')).map((r) => r.country)).toEqual(['BR', 'AR']);
+    expect((await at(store, T + 20 * HOUR).supportedCorridors('DOT')).map((r) => r.country)).toEqual(['BR', 'AR']);
+  });
+
+  it('stops serving the last catalog a day past the window, when a crypto stopped routing everywhere', async () => {
+    const store = stampedStore([
+      { country: 'BR', direction: 'buy', at: T },
+      { country: 'BR', direction: 'sell', at: T },
+    ]);
+    // Buy: a 6h window plus a day's grace.
+    expect((await at(store, T + 29 * HOUR).supportedCorridors('DOT')).map((r) => r.country)).toEqual(['BR']);
+    expect(await at(store, T + 31 * HOUR).supportedCorridors('DOT')).toEqual([]);
+    // Sell: its own 36h window plus the same day.
+    expect((await at(store, T + 59 * HOUR).supportedCorridors('DOT', 'sell')).map((r) => r.country)).toEqual(['BR']);
+    expect(await at(store, T + 61 * HOUR).supportedCorridors('DOT', 'sell')).toEqual([]);
   });
 
   it('returns no corridors when the refresh has never written one', async () => {

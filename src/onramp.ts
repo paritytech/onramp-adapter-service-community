@@ -68,6 +68,15 @@ export interface SupportedCorridorDto {
  */
 const STALE_PASSES = 3;
 
+/**
+ * How long past the freshness window `GET /supported/corridors` may still serve a crypto's last
+ * catalog when none of its rows is fresh. Long enough to bridge a boot after an idle spell and a
+ * Meld outage; bounded because a crypto that stops routing everywhere is never written again (an
+ * empty corridor is not upserted), and without an end its old catalog, minimums included, would be
+ * offered forever.
+ */
+const FALLBACK_GRACE_MS = 24 * 3_600_000;
+
 /** An injectable clock so tests can pin "now" without mocking time. */
 export type Clock = () => number;
 
@@ -203,9 +212,10 @@ export class Onramp {
     let rows = await this.funding.readCorridors(code, dir, this.clock() - window);
     // Nothing fresh (a boot after a long idle, before the first pass lands, or a refresh that has
     // been failing): serve the last catalog the refresh wrote rather than none, the window anchored
-    // on its newest row instead of now so a country it had already retired stays retired.
+    // on its newest row instead of now so a country it had already retired stays retired. Only for
+    // a day past the window: a catalog older than that is one the refresh has stopped writing.
     if (rows.length === 0) {
-      const all = await this.funding.readCorridors(code, dir);
+      const all = await this.funding.readCorridors(code, dir, this.clock() - window - FALLBACK_GRACE_MS);
       const newest = Math.max(...all.map((r) => r.updated_at));
       rows = all.filter((r) => r.updated_at >= newest - window);
     }
