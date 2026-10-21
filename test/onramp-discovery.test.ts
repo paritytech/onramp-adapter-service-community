@@ -300,26 +300,71 @@ describe('Onramp.supportedCorridors', () => {
     expect(await svc.supportedCorridors('DOT', 'sell')).toEqual([{ country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [payout] }]);
   });
 
-  it('hides a stale corridor whose row predates the freshness window', async () => {
+  // A store holding rows stamped at given times, for the freshness window; `fakeStore` stamps every row alike.
+  const stampedStore = (rows: { country: string; direction?: 'buy' | 'sell'; at: number }[]) => {
     const store = fakeStore();
-    await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
-    // A clock far past the row's stamp (2e12) puts it outside `now - 3*interval`, so it is filtered.
-    const svc = new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => 3_000_000_000_000, () => 'funding-1', undefined);
+    store.readCorridors = async (code: string, direction: 'buy' | 'sell', freshAfter?: number) =>
+      rows
+        .filter((r) => (r.direction ?? 'buy') === direction && r.at >= (freshAfter ?? 0))
+        .map((r) => ({ destination_currency_code: code, direction, country: r.country, name: r.country, fiat: 'BRL', methods: [pix], updated_at: r.at }));
+    return store;
+  };
+  const HOUR = 3_600_000;
+  const T = 2_000_000_000_000;
+  const at = (store: ReturnType<typeof fakeStore>, now: number) =>
+    new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => now, () => 'f', undefined);
 
-    expect(await svc.supportedCorridors('DOT')).toEqual([]);
+  it('hides a stale corridor while a fresh one exists', async () => {
+    const store = stampedStore([
+      { country: 'BR', at: T },
+      { country: 'MX', at: T - 10 * HOUR },
+    ]);
+    expect((await at(store, T).supportedCorridors('DOT')).map((r) => r.country)).toEqual(['BR']);
+  });
+
+  it('serves the last catalog written rather than none when nothing is fresh', async () => {
+    const store = stampedStore([{ country: 'BR', at: T }]);
+    // 10h on puts it outside the 6h buy window (3 x 2h); it is still served.
+    expect((await at(store, T + 10 * HOUR).supportedCorridors('DOT')).map((r) => r.country)).toEqual(['BR']);
+  });
+
+  it('anchors the fallback window on the newest row, so a country already retired stays retired', async () => {
+    const store = stampedStore([
+      { country: 'BR', at: T },
+      { country: 'AR', at: T - 2 * HOUR },
+      { country: 'MX', at: T - 10 * HOUR },
+    ]);
+    expect((await at(store, T + 20 * HOUR).supportedCorridors('DOT')).map((r) => r.country)).toEqual(['BR', 'AR']);
+  });
+
+  it('stops serving the last catalog a day past the window, when a crypto stopped routing everywhere', async () => {
+    const store = stampedStore([
+      { country: 'BR', direction: 'buy', at: T },
+      { country: 'BR', direction: 'sell', at: T },
+    ]);
+    // Buy: a 6h window plus a day's grace.
+    expect((await at(store, T + 29 * HOUR).supportedCorridors('DOT')).map((r) => r.country)).toEqual(['BR']);
+    expect(await at(store, T + 31 * HOUR).supportedCorridors('DOT')).toEqual([]);
+    // Sell: its own 36h window plus the same day.
+    expect((await at(store, T + 59 * HOUR).supportedCorridors('DOT', 'sell')).map((r) => r.country)).toEqual(['BR']);
+    expect(await at(store, T + 61 * HOUR).supportedCorridors('DOT', 'sell')).toEqual([]);
+  });
+
+  it('returns no corridors when the refresh has never written one', async () => {
+    expect(await at(stampedStore([]), T).supportedCorridors('DOT')).toEqual([]);
   });
 
   it('ages sell rows over three sell intervals (36h) and buy rows over three routes intervals (6h)', async () => {
-    const store = fakeStore();
-    for (const direction of ['buy', 'sell'] as const) {
-      await store.upsertCorridor({ destination_currency_code: 'DOT', direction, country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
-    }
-    // Rows are stamped 2e12. 10h on: buy is stale, sell still fresh. 40h on: both stale.
-    const at = (ms: number) => new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => 2_000_000_000_000 + ms, () => 'f', undefined);
-    const HOUR = 3_600_000;
-    expect(await at(10 * HOUR).supportedCorridors('DOT')).toEqual([]);
-    expect((await at(10 * HOUR).supportedCorridors('DOT', 'sell')).map((r) => r.country)).toEqual(['BR']);
-    expect(await at(40 * HOUR).supportedCorridors('DOT', 'sell')).toEqual([]);
+    const store = stampedStore([
+      { country: 'BR', direction: 'buy', at: T },
+      { country: 'BR', direction: 'sell', at: T },
+      { country: 'AR', direction: 'buy', at: T - 9 * HOUR },
+      { country: 'AR', direction: 'sell', at: T - 30 * HOUR },
+      { country: 'MX', direction: 'sell', at: T - 40 * HOUR },
+    ]);
+    // Buy keeps rows within 6h, sell within 36h, both measured back from now.
+    expect((await at(store, T).supportedCorridors('DOT')).map((r) => r.country)).toEqual(['BR']);
+    expect((await at(store, T).supportedCorridors('DOT', 'sell')).map((r) => r.country)).toEqual(['BR', 'AR']);
   });
 
   it('refuses an unknown crypto before reading', async () => {
