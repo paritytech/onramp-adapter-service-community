@@ -119,11 +119,13 @@ describe('mergeOfframpCorridors', () => {
 });
 
 describe('refreshJobs', () => {
-  it('keeps DOT buy and sell, and adds a sell job per lane without duplicating', () => {
+  it('keeps DOT buy and sell, buys every other deliverable asset, and adds a sell job per lane without duplicating', () => {
     const jobs = refreshJobs([{ code: 'DOT' }, { code: 'USDT_SOLANA' }, { code: 'USDT_SOLANA' }], TEST_ASSETS);
     expect(jobs).toEqual([
       { crypto: 'DOT', direction: 'buy' },
       { crypto: 'DOT', direction: 'sell' },
+      { crypto: 'USDT_DOT', direction: 'buy' },
+      { crypto: 'USDC_DOT', direction: 'buy' },
       { crypto: 'USDT_SOLANA', direction: 'sell' },
     ]);
   });
@@ -132,7 +134,16 @@ describe('refreshJobs', () => {
     expect(refreshJobs([{ code: 'USDT_SOLANA' }], TEST_ASSETS).map((j) => `${j.crypto}|${j.direction}`)).toEqual([
       'DOT|buy',
       'DOT|sell',
+      'USDT_DOT|buy',
+      'USDC_DOT|buy',
       'USDT_SOLANA|sell',
+    ]);
+  });
+
+  it('adds a sell job for a deliverable asset only when it is a lane', () => {
+    expect(refreshJobs([{ code: 'USDT_DOT' }], { 'usdt@assethub': 'USDT_DOT' })).toEqual([
+      { crypto: 'USDT_DOT', direction: 'buy' },
+      { crypto: 'USDT_DOT', direction: 'sell' },
     ]);
   });
 

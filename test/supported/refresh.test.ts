@@ -604,8 +604,10 @@ describe('startSupportedRefresh', () => {
     // The reachable fault is a throwing logger, fired once inside a periodic catalog pass. The loop
     // must report it and run the next tick, not stop learning for good.
     let threw = false;
-    const log = vi.fn((_message: string) => {
-      if (threw) return;
+    // Only the blip's own message throws: an empty catalog also logs its retry, which is not the
+    // fault under test.
+    const log = vi.fn((message: string) => {
+      if (threw || !message.includes('meld blip')) return;
       threw = true;
       throw new Error('sink is down');
     });
@@ -759,5 +761,76 @@ describe('startSupportedRefresh', () => {
     await refresh.stop(5_000);
     clearTimeout(tripwire);
     expect(waited).toBe(false);
+  });
+});
+
+describe('startSupportedRefresh: retrying a job that wrote nothing', () => {
+  const retryLogs = (logs: string[]) =>
+    logs.filter((l) => l.includes('retrying in')).map((l) => Number(/retrying in (\d+)ms/.exec(l)?.[1]));
+
+  it('retries soon, backing off, and stops once the job writes', async () => {
+    // Meld fails the boot pass and the first retry, then answers.
+    let calls = 0;
+    const store = fakeStore();
+    const logs: string[] = [];
+    const refresh = startSupportedRefresh(
+      disco({
+        corridor: async (c) => {
+          calls += 1;
+          if (calls <= 2) throw new Error('meld down');
+          return corridor(c);
+        },
+      }),
+      store,
+      [JOB],
+      { ...NEVER, retryBaseMs: 10 },
+      (m) => logs.push(m),
+    );
+
+    await vi.waitFor(async () => {
+      expect(await store.readCorridors(CRYPTO, 'buy')).toHaveLength(1);
+    });
+    // Two empty passes, two retries, the second waiting twice the first; none after the write.
+    expect(retryLogs(logs)).toEqual([10, 20]);
+    expect(calls).toBe(3);
+
+    await refresh.stop(0);
+  });
+
+  it('stops retrying once the backoff reaches the job\'s own interval', async () => {
+    // A crypto that genuinely routes nowhere: every pass writes nothing.
+    const logs: string[] = [];
+    const refresh = startSupportedRefresh(
+      disco({ corridor: async (c) => corridor(c, { methods: [] }) }),
+      fakeStore(),
+      [JOB],
+      { catalogMs: 100_000, routesMs: 50, retryBaseMs: 10 },
+      (m) => logs.push(m),
+    );
+
+    // 10, 20, 40; 80 would reach the 50ms interval, where the regular pass is the retry.
+    await vi.waitFor(() => {
+      expect(retryLogs(logs)).toEqual([10, 20, 40]);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(retryLogs(logs)).toEqual([10, 20, 40]);
+
+    await refresh.stop(0);
+  });
+
+  it('does not retry a job that wrote', async () => {
+    const logs: string[] = [];
+    const store = fakeStore();
+    const refresh = startSupportedRefresh(disco({}), store, [JOB], { ...NEVER, retryBaseMs: 10 }, (m) =>
+      logs.push(m),
+    );
+
+    await vi.waitFor(async () => {
+      expect(await store.readCorridors(CRYPTO, 'buy')).toHaveLength(1);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(retryLogs(logs)).toEqual([]);
+
+    await refresh.stop(0);
   });
 });
