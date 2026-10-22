@@ -109,7 +109,13 @@ data:
         "rpc_url": {{ .Values.sale_vault.rpc_url | quote }},
         "operator_key": { "mode": "file", "path": {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.saleVaultOperatorKey.key | quote }} },
         "min_return": {{ .Values.sale_vault.min_return | quote }},
-        "dust_target": {{ .Values.sale_vault.dust_target | quote }}
+        "dust_target": {{ .Values.sale_vault.dust_target | quote }},
+        "chainflip": {
+          "rpc_url": {{ .Values.sale_vault.chainflip.rpc_url | quote }},
+          "backend_url": {{ .Values.sale_vault.chainflip.backend_url | quote }},
+          "slippage_bps": {{ int .Values.sale_vault.chainflip.slippage_bps }},
+          "retry_blocks": {{ int .Values.sale_vault.chainflip.retry_blocks }}
+        }
       }
       {{- end }}
     }

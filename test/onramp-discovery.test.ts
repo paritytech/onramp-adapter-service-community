@@ -653,6 +653,12 @@ describe('Onramp offramp discovery', () => {
         operator_key: { mode: 'env' as const, var: 'OP_KEY' },
         min_return: '1',
         dust_target: '5',
+        chainflip: {
+          rpc_url: 'https://archive.perseverance.chainflip.io',
+          backend_url: 'https://chainflip-swap-perseverance.chainflip.io',
+          slippage_bps: 200,
+          retry_blocks: 100,
+        },
       },
     };
     const discovery: Discovery = {

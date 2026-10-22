@@ -20,7 +20,7 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{asset, code, chain, min, max, currency}]}]}]}`. When a SaleVault lane is configured, a `vault: {chain, chainId, contract}` field names the deployment-wide SaleVault the app's Chainflip CCM must deliver to. No query parameters (strict). See "Offramp lanes" and "The off-ramp SaleVault" below. |
 | `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`, plus the same `vault` field when configured. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
 | `GET /offramp/sale/:fundingRequestId` | none (reads the SaleVault on chain) | The on-chain SaleVault state of one of the caller's off-ramp sales, scoped by alias: `{sale: {fundingRequestId, chain, contract, ref, status, recipient, amount, home, held, returnStatus, returnTx}}`. `status` is the contract's `Sale.Status` (`none`/`paid`/`held`/`returned`); `returnStatus` is this service's own record of a return (`none`/`returning`/`returned`). 404 for an unknown or another caller's request; 503 when no vault is configured or the chain is unreachable. See "The off-ramp SaleVault" below. |
-| `POST /offramp/returns/:fundingRequestId` | none (operator-signs the SaleVault) | Return a held sale to its own Asset Hub home, operator-signed. Empty body. The return is claimed before it is broadcast, so a retried or concurrent tap cannot sign two; 409 only when the sale has nothing held to return (not in the `held` state), 404 for an unknown request, 503 when no vault is configured or the chain is unreachable. The response is the same `{sale: {...}}` shape as the read. |
+| `POST /offramp/returns/:fundingRequestId` | none (operator-signs the SaleVault) | Return a sale to its own Asset Hub home, operator-signed: everything a `held` sale holds, or, for a `paid` sale whose provider status is `REFUNDED`, the USDC the provider sent back to the vault from the address it was paid at (capped by the sale amount and the vault's unclaimed balance). Empty body. The swap's `cf_parameters` are priced from a Chainflip quote and encoded by the Chainflip swap backend, refunding to the vault if the price is not met. The return is claimed before it is broadcast, so a retried or concurrent tap cannot sign two. 409 `SALE_NOT_RETURNABLE` when there is nothing to return, `SALE_REFUND_NOT_ARRIVED` when a refunded sale's USDC has not reached the vault, `SALE_REFUND_AMBIGUOUS` when another sale was paid to the same provider address since, so the refund cannot be matched to this sale alone, `SALE_RETURN_NOT_SWAPPABLE` when the amount is below Chainflip's minimum deposit or above its maximum swap; 404 for an unknown request; 503 when no vault is configured or the chain, the Chainflip backend or the State Chain RPC is unreachable. The response is the same `{sale: {...}}` shape as the read. |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
 | `GET /transaction/:id` | `GET /payments/transactions/{id}` | Status, projected onto the five fields this service declares. |
@@ -324,6 +324,22 @@ Two routes read and drive the vault for one of the caller's own sales, keyed by 
   operator. The return is claimed in the store before it is broadcast, so a retried or concurrent tap
   cannot sign two; a broadcast that never leaves releases the claim so it can be re-sent. `held` funds
   can only ever leave to the sale's own home, never to the operator.
+- The same route returns a **paid** sale whose provider status is `REFUNDED` (`returnRefund`). Only
+  the USDC the provider transferred to the vault from the address it was paid at, after the sale's
+  `SalePaid`, counts as its refund, capped by the sale amount and the vault's `unclaimed()` balance.
+  A sale can only be returned once, so the refund counts only once its newest transfer is about an
+  hour of blocks old. Until then the route answers 409 `SALE_REFUND_NOT_ARRIVED`. When another sale
+  was paid to the same provider address after this one, any refund could be either's, so the route
+  answers 409 `SALE_REFUND_AMBIGUOUS` and leaves it to an operator rather than guess.
+
+Every return is a Chainflip vault swap (Arbitrum USDC to Asset Hub USDT) whose `cf_parameters` this
+service never hand-encodes: it prices the swap from the swap backend's `/v2/quote` (the quoted price
+less `sale_vault.chainflip.slippage_bps`, scaled as Chainflip's X128 minimum price), then asks the
+backend's `/api/encodeCfParameters` for the bytes with the vault as the refund address, the same
+request the Chainflip SDK sends, so the backend names its own broker. Chainflip ignores a vault swap below its minimum deposit and confiscates the part
+above its maximum swap, so both limits are read live and a return outside them is refused with 409
+`SALE_RETURN_NOT_SWAPPABLE` rather than sent. A swap whose price is not met within
+`sale_vault.chainflip.retry_blocks` is refunded to the vault, where it lands as unclaimed USDC.
 
 ## `GET /assets`
 

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SaleVaultClient, fetchTransport } from '../../src/salevault/chain.js';
+import { ChainUnavailableError, RefundAmbiguousError, SaleVaultClient, fetchTransport } from '../../src/salevault/chain.js';
+import { eventTopic, topicOf } from '../../src/salevault/abi.js';
 
 const hexToBytes = (hex: string): Uint8Array => {
   const clean = hex.replace(/^0x/, '');
@@ -17,6 +18,125 @@ const CFG = {
 
 // A 32-byte word for a uint.
 const uintWord = (n: bigint) => n.toString(16).padStart(64, '0');
+
+describe('SaleVaultClient refund attribution', () => {
+  const REF = `0x${'22'.repeat(32)}`;
+  const RECIPIENT = `0x${'33'.repeat(20)}`;
+  const USDC = '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d';
+  const SALE_PAID = eventTopic('SalePaid(bytes32,address,uint256,uint256)');
+  const TRANSFER = eventTopic('Transfer(address,address,uint256)');
+
+  // A chain whose SalePaid sits at `paidAt` and whose transfers are listed by block, served window by window.
+  function chain(latest: bigint, paidAt: bigint | null, transfers: [bigint, bigint][], otherPaidAt: bigint[] = []) {
+    const windows: { address: string; from: bigint; to: bigint }[] = [];
+    const rpc = vi.fn(async (method: string, params: unknown[]) => {
+      if (method === 'eth_blockNumber') return `0x${latest.toString(16)}`;
+      if (method === 'eth_call') return `0x${'00'.repeat(12)}${USDC.slice(2)}`;
+      const [filter] = params as [{ address: string; topics: (string | null)[]; fromBlock: string; toBlock: string }];
+      const from = BigInt(filter.fromBlock);
+      const to = BigInt(filter.toBlock);
+      windows.push({ address: filter.address, from, to });
+      expect(to - from).toBeLessThan(10_000_000n);
+      if (filter.topics[0] === SALE_PAID && filter.topics[1] === null) {
+        // Every SalePaid to this recipient, ours included, by recipient topic.
+        expect(filter.topics).toEqual([SALE_PAID, null, topicOf(RECIPIENT)]);
+        const paid: [bigint, string][] = [
+          ...(paidAt === null ? [] : [[paidAt, REF] as [bigint, string]]),
+          ...otherPaidAt.map((b) => [b, `0x${'99'.repeat(32)}`] as [bigint, string]),
+        ];
+        return paid
+          .filter(([block]) => block >= from && block <= to)
+          .map(([block, ref]) => ({ blockNumber: `0x${block.toString(16)}`, topics: [SALE_PAID, ref, topicOf(RECIPIENT)], data: '0x' }));
+      }
+      if (filter.topics[0] === SALE_PAID) {
+        expect(filter.topics).toEqual([SALE_PAID, REF]);
+        return paidAt !== null && paidAt >= from && paidAt <= to ? [{ blockNumber: `0x${paidAt.toString(16)}`, data: '0x' }] : [];
+      }
+      expect(filter.address).toBe(USDC);
+      expect(filter.topics).toEqual([TRANSFER, topicOf(RECIPIENT), topicOf(CFG.contract)]);
+      return transfers
+        .filter(([block]) => block >= from && block <= to)
+        .map(([block, amount]) => ({ blockNumber: `0x${block.toString(16)}`, data: `0x${uintWord(amount)}` }));
+    });
+    return { client: SaleVaultClient.create(CFG, () => KEY, rpc), windows };
+  }
+
+  it('sums only the transfers from the paid address that came after the payout', async () => {
+    const { client } = chain(30_000_000n, 12_000_000n, [
+      [11_999_999n, 7n], // before the payout, another sale's
+      [12_000_001n, 40n],
+      [29_000_000n, 20n],
+    ]);
+    expect(await client.refundedSince(REF, RECIPIENT)).toBe(60n);
+  });
+
+  it('waits until the newest refund transfer is an hour of blocks old, so a split refund lands whole', async () => {
+    const young = chain(30_000_000n, 12_000_000n, [
+      [12_000_001n, 40n],
+      [29_990_000n, 20n], // ten thousand blocks ago, still arriving
+    ]);
+    expect(await young.client.refundedSince(REF, RECIPIENT)).toBe(0n);
+    const settled = chain(30_000_000n, 12_000_000n, [
+      [12_000_001n, 40n],
+      [29_985_600n, 20n], // exactly the settle window ago
+    ]);
+    expect(await settled.client.refundedSince(REF, RECIPIENT)).toBe(60n);
+  });
+
+  it('searches the payout back window by window and reads transfers forward from it', async () => {
+    const { client, windows } = chain(30_000_000n, 12_000_000n, []);
+    await client.refundedSince(REF, RECIPIENT);
+    const paidWindows = windows.filter((w) => w.address === CFG.contract).slice(0, 4);
+    expect(paidWindows.map((w) => [w.from, w.to])).toEqual([
+      [25_000_001n, 30_000_000n],
+      [20_000_001n, 25_000_000n],
+      [15_000_001n, 20_000_000n],
+      [10_000_001n, 15_000_000n],
+    ]);
+    const transferWindows = windows.filter((w) => w.address === USDC);
+    expect(transferWindows.map((w) => [w.from, w.to])).toEqual([
+      [12_000_000n, 16_999_999n],
+      [17_000_000n, 21_999_999n],
+      [22_000_000n, 26_999_999n],
+      [27_000_000n, 30_000_000n],
+    ]);
+  });
+
+  it('refuses to attribute a refund once another sale was paid to the same address', async () => {
+    const { client } = chain(30_000_000n, 12_000_000n, [[20_000_000n, 40n]], [15_000_000n]);
+    await expect(client.refundedSince(REF, RECIPIENT)).rejects.toThrow(RefundAmbiguousError);
+  });
+
+  it('ignores its own payout among the payouts to the same address', async () => {
+    const { client } = chain(30_000_000n, 12_000_000n, [[12_000_000n, 9n], [20_000_000n, 40n]]);
+    // The transfer in the payout block itself predates no refund, only later ones count.
+    expect(await client.refundedSince(REF, RECIPIENT)).toBe(40n);
+  });
+
+  it('answers zero without reading transfers when the sale was never paid', async () => {
+    const { client, windows } = chain(70_000_000n, null, [[69_000_000n, 5n]]);
+    expect(await client.refundedSince(REF, RECIPIENT)).toBe(0n);
+    expect(windows.every((w) => w.address === CFG.contract)).toBe(true);
+    expect(windows).toHaveLength(12);
+  });
+
+  it('stops the search at block zero on a young chain', async () => {
+    const { client, windows } = chain(3_000_000n, null, []);
+    expect(await client.refundedSince(REF, RECIPIENT)).toBe(0n);
+    expect(windows.map((w) => [w.from, w.to])).toEqual([[0n, 3_000_000n]]);
+  });
+
+  it('reads the USDC token off the contract', async () => {
+    const { client } = chain(1n, null, []);
+    expect(await client.usdc()).toBe(USDC);
+  });
+
+  it('treats a log reply that is not a list as an unavailable chain', async () => {
+    const rpc = vi.fn(async (method: string) => (method === 'eth_blockNumber' ? '0x10' : { not: 'a list' }));
+    const client = SaleVaultClient.create(CFG, () => KEY, rpc);
+    await expect(client.refundedSince(REF, RECIPIENT)).rejects.toThrow(ChainUnavailableError);
+  });
+});
 
 describe('SaleVaultClient', () => {
   it('derives the operator address from the key', () => {

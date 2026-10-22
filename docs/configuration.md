@@ -61,6 +61,10 @@ a service that runs in production with a development posture. See
 | `sale_vault.operator_key` | `{ "mode": "file", "path": ... }` or `{ "mode": "env", "var": ... }`, the operator wallet's private key mounted the same file way as `meld.api_key`. |
 | `sale_vault.min_return` | The least held amount worth returning, below which a return costs more gas than it saves. |
 | `sale_vault.dust_target` | The dust the contract keeps to self-fund its own gas, as the operator wants it maintained. |
+| `sale_vault.chainflip.rpc_url` | The Chainflip State Chain RPC, https outside development. It reports the minimum deposit and maximum swap a return must fit. |
+| `sale_vault.chainflip.backend_url` | The Chainflip swap backend, https outside development. Its `/v2/quote` prices a return swap and its `/api/encodeCfParameters` encodes the swap's `cf_parameters` naming the backend's own broker, exactly as the Chainflip SDK does with no broker configured. |
+| `sale_vault.chainflip.slippage_bps` | How far below the quoted price a return swap may fill, 0 to 10000. |
+| `sale_vault.chainflip.retry_blocks` | State Chain blocks Chainflip retries a return swap below its minimum price before refunding it to the vault, 0 to 600 (Chainflip's cap). |
 | `worker.session_max_age_ms` | How long to keep watching a request for a payment. A **floor**, not a fallback: a longer rail expiry extends this window and a shorter one is ignored, because a rail's expiry says when its capture page closes, which is not evidence about payment. 60000 ms to 30 days, default 72h. |
 | `session_creation_enabled` | Kill switch: stops session creation without a deploy. Leaves reads and the settlement worker running. |
 

@@ -609,6 +609,19 @@ const configSchema = z
         min_return: decimal,
         // The dust the contract keeps to self-fund its own gas, as the operator wants it maintained.
         dust_target: decimal,
+        // How a return swap back to Asset Hub is priced and encoded on Chainflip.
+        chainflip: z
+          .object({
+            // The State Chain RPC that reports Chainflip's swap limits.
+            rpc_url: z.url(),
+            // The Chainflip swap backend that quotes the return and encodes it with its own broker.
+            backend_url: z.url(),
+            // How far below the quoted price the return may fill, in basis points.
+            slippage_bps: z.number().int().min(0).max(10_000),
+            // State Chain blocks Chainflip retries before refunding to the vault, at most its 600 cap.
+            retry_blocks: z.number().int().min(0).max(600),
+          })
+          .strict(),
       })
       .strict()
       .optional(),
@@ -808,6 +821,20 @@ const configSchema = z
         path: ['sale_vault', 'rpc_url'],
         message: `sale_vault.rpc_url must use https outside development: "${cfg.sale_vault.rpc_url}" is plaintext.`,
       });
+    }
+
+    // The Chainflip endpoints price and encode a funds-moving swap, so neither may be plaintext.
+    if (cfg.sale_vault !== undefined && cfg.environment !== 'development') {
+      for (const field of ['rpc_url', 'backend_url'] as const) {
+        const url = cfg.sale_vault.chainflip[field];
+        if (!url.startsWith('https://')) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['sale_vault', 'chainflip', field],
+            message: `sale_vault.chainflip.${field} must use https outside development: "${url}" is plaintext.`,
+          });
+        }
+      }
     }
 
     // The zero address is a sentinel for an unset contract, and a swap delivered there burns the funds.

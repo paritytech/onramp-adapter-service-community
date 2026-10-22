@@ -338,6 +338,12 @@ afterEach(async () => {
       operator_key: { mode: 'file', path: keyPath },
       min_return: '1',
       dust_target: '5',
+      chainflip: {
+        rpc_url: 'https://archive.perseverance.chainflip.io',
+        backend_url: 'https://chainflip-swap-perseverance.chainflip.io',
+        slippage_bps: 200,
+        retry_blocks: 100,
+      },
     };
     const schema = await createSchema();
     raw.store = storeConfigFor(schema);

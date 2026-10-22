@@ -191,10 +191,57 @@ describe('parseConfig', () => {
             operator_key: { mode: 'file', path: '/run/secrets/op-key' },
             min_return: '1',
             dust_target: '5',
+            chainflip: {
+              rpc_url: 'https://archive.perseverance.chainflip.io',
+              backend_url: 'https://chainflip-swap-perseverance.chainflip.io',
+              slippage_bps: 200,
+              retry_blocks: 100,
+            },
           },
         }),
       ),
     ).toThrow(/sale_vault.*plaintext/s);
+  });
+
+  it('refuses plaintext Chainflip endpoints for the sale_vault outside development', () => {
+    // Both endpoints price and encode a funds-moving swap, so each is refused on its own.
+    const personhood = (personhoodConfig().auth as { personhood?: Record<string, unknown> }).personhood ?? {};
+    const withChainflip = (chainflip: Record<string, unknown>) =>
+      rawConfig({
+        environment: 'production',
+        auth: { mode: 'personhood', personhood },
+        meld: {
+          ...(rawConfig().meld as Record<string, unknown>),
+          base_url: 'https://api.meld.io',
+          api_key: { mode: 'file', path: '/run/secrets/meld-api-key' },
+        },
+        cors: { allowed_origins: ['https://app.example'] },
+        sale_vault: {
+          chain: 'arbitrum-one',
+          chain_id: 42161,
+          contract: '0x81949127042930F8e7A1723385A2F76213C72ee9',
+          rpc_url: 'https://rpc.example',
+          operator_key: { mode: 'file', path: '/run/secrets/op-key' },
+          min_return: '1',
+          dust_target: '5',
+          chainflip: {
+            rpc_url: 'https://mainnet-rpc.chainflip.io',
+            backend_url: 'https://chainflip-swap.chainflip.io',
+            slippage_bps: 200,
+            retry_blocks: 100,
+            ...chainflip,
+          },
+        },
+      });
+    expect(() => parseConfig(withChainflip({}))).not.toThrow();
+    expect(() => parseConfig(withChainflip({ rpc_url: 'http://rpc.chainflip.example' }))).toThrow(
+      /sale_vault\.chainflip\.rpc_url must use https/,
+    );
+    expect(() => parseConfig(withChainflip({ backend_url: 'http://backend.chainflip.example' }))).toThrow(
+      /sale_vault\.chainflip\.backend_url must use https/,
+    );
+    // Chainflip refuses a retry duration above its 600 block cap.
+    expect(() => parseConfig(withChainflip({ retry_blocks: 601 }))).toThrow();
   });
 
   it('refuses the zero address as the sale_vault contract', () => {
@@ -210,6 +257,12 @@ describe('parseConfig', () => {
             operator_key: { mode: 'env', var: 'OP_KEY' },
             min_return: '1',
             dust_target: '5',
+            chainflip: {
+              rpc_url: 'https://archive.perseverance.chainflip.io',
+              backend_url: 'https://chainflip-swap-perseverance.chainflip.io',
+              slippage_bps: 200,
+              retry_blocks: 100,
+            },
           },
         }),
       ),

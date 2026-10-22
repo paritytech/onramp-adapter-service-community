@@ -29,6 +29,7 @@ import { commitmentsFrom } from './personhood/source.js';
 import { validateWithCommitment } from './personhood/verifiablejs.js';
 import { resolveSecret } from './secret.js';
 import { SaleVaultClient } from './salevault/chain.js';
+import { ReturnSwapEncoder } from './salevault/chainflip.js';
 import { buildServer } from './server.js';
 
 // The asset the refresh walks in both directions; the table is crypto-keyed so more are additive.
@@ -98,6 +99,7 @@ export async function start(
 
   // The off-ramp SaleVault client, built only when the lane is configured. Resolved before the store opens so a missing key leaves nothing to close.
   let saleVault: SaleVaultClient | undefined;
+  let returnEncoder: ReturnSwapEncoder | undefined;
   if (cfg.sale_vault !== undefined) {
     const operatorSecret = await resolveSecret(cfg.sale_vault.operator_key, {
       minBytes: 32,
@@ -111,6 +113,13 @@ export async function start(
       },
       () => Uint8Array.from(Buffer.from(operatorSecret.expose().replace(/^0x/, ''), 'hex')),
     );
+    const cf = cfg.sale_vault.chainflip;
+    returnEncoder = ReturnSwapEncoder.create({
+      rpcUrl: cf.rpc_url,
+      backendUrl: cf.backend_url,
+      slippageBps: cf.slippage_bps,
+      retryBlocks: cf.retry_blocks,
+    });
   }
 
   // Live capability discovery over Meld's route catalog. Reading it at runtime is what makes the
@@ -185,7 +194,7 @@ export async function start(
     app = await buildServer(
       cfg,
       (audit) =>
-        new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery, saleVault),
+        new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery, saleVault, returnEncoder),
       personhood,
       logDestination,
     );

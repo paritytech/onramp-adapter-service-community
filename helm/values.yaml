@@ -232,6 +232,14 @@ sale_vault:
   # The least held amount worth returning, and the dust the contract keeps for its own gas.
   min_return: "1"
   dust_target: "5"
+  # How a return swap back to Asset Hub is priced and encoded on Chainflip.
+  chainflip:
+    rpc_url: https://archive.perseverance.chainflip.io
+    # Quotes the return and encodes it with the backend's own broker, as the Chainflip SDK does.
+    backend_url: https://chainflip-swap-perseverance.chainflip.io
+    slippage_bps: 200
+    # State Chain blocks Chainflip retries before refunding to the vault, at most 600.
+    retry_blocks: 100
 
 # The background worker that advances in-flight funding requests.
 worker:

@@ -48,7 +48,8 @@ import {
 import { toMinorUnits } from './money.js';
 import type { Corridor, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
 import { saleRef } from './salevault/abi.js';
-import { ChainUnavailableError, type SaleVaultClient } from './salevault/chain.js';
+import { ChainUnavailableError, RefundAmbiguousError, type SaleVaultClient } from './salevault/chain.js';
+import { ReturnNotSwappableError, type ReturnSwapEncoder } from './salevault/chainflip.js';
 
 /** Just the store surface onramp touches, injectable in a test. */
 export type FundingPort = Pick<
@@ -221,6 +222,8 @@ export class Onramp {
     private readonly discovery?: Discovery,
     // The off-ramp SaleVault client, present only when `sale_vault` is configured. Absent, the sale routes 503.
     private readonly saleVault?: SaleVaultClient,
+    // Prices and encodes a return swap's cf_parameters, present with the sale vault.
+    private readonly returnEncoder?: ReturnSwapEncoder,
   ) {}
 
   /** The methods + fiat min/max a corridor offers, for the buyer's (or seller's) amount screen.
@@ -346,14 +349,14 @@ export class Onramp {
       // Read the row as it stood before this poll, so the age of a broadcast return is measured from
       // when it was sent, not from this read (touchVaultSale refreshes updated_at on every poll).
       const before = await this.funding.readVaultSale(id);
-      // A return that broadcast but never mined leaves the sale Held with return_status 'returning'.
+      // A return that broadcast but never mined leaves the sale Held, or Paid for a refund, with return_status 'returning'.
       // Once it is stale and the tx is still not on chain, reset the claim so a fresh POST re-sends
       // it. Re-sending is safe: the contract refuses a second return on a sale that is no longer Held.
       // The reset is keyed to that exact tx, so a poll that raced a fresh re-send cannot wipe it.
       if (
         before?.return_status === 'returning' &&
         before.return_tx !== null &&
-        sale.status === 2 &&
+        (sale.status === 2 || sale.status === 1) &&
         this.clock() - before.updated_at > SALE_RETURN_RESEND_MS &&
         (await vault.receipt(before.return_tx)) === null
       ) {
@@ -380,11 +383,12 @@ export class Onramp {
     });
   }
 
-  // Return a held sale to its own on-chain home, funds cannot be redirected. 404 unknown, 409 if not Held.
+  // Return a held sale, or a paid sale Meld refunded, to its own on-chain home. 404 unknown, 409 if nothing to return.
   async offrampReturn(subject: Subject, id: string): Promise<OfframpSaleDto | undefined> {
     const record = await this.funding.byAlias(id, subject.alias, subject.productId);
     if (record === undefined) return undefined;
     const vault = this.requireSaleVault('offrampReturn');
+    const encoder = this.requireReturnEncoder('offrampReturn');
     return this.onChain(async () => {
       const ref = saleRef(id);
       const sale = await vault.sale(ref);
@@ -403,15 +407,25 @@ export class Onramp {
         const row = await this.funding.readVaultSale(id);
         return this.saleDto(id, ref, sale, 'returned', row?.return_tx ?? null, vault.contractAddress);
       }
-      if (sale.status !== 2) {
-        throw reject(
-          {
-            tag: 'Other',
-            value: { code: 'SALE_NOT_RETURNABLE', message: 'That sale has nothing held to return.', fundingRequestId: id },
-          },
-          `offrampReturn on sale ${id} with on-chain status ${String(sale.status)}, not Held`,
-          409,
-        );
+      // A return already claimed is reported as is, before the log scan and the quote it would waste.
+      const existing = await this.funding.readVaultSale(id);
+      if (existing !== undefined && existing.return_status !== 'none') {
+        return this.saleDto(id, ref, sale, existing.return_status, existing.return_tx, vault.contractAddress);
+      }
+      const amount = await this.returnableAmount(id, record.provider_status, sale, vault);
+      // Priced and encoded before the claim, so a quote or RPC failure leaves nothing claimed.
+      let cfParameters: string;
+      try {
+        cfParameters = await encoder.returnParameters({ amount, home: sale.home, refundAddress: vault.contractAddress });
+      } catch (error) {
+        if (error instanceof ReturnNotSwappableError) {
+          throw reject(
+            { tag: 'Other', value: { code: 'SALE_RETURN_NOT_SWAPPABLE', message: error.message, fundingRequestId: id } },
+            `offrampReturn on sale ${id}: ${error.message}`,
+            409,
+          );
+        }
+        throw error;
       }
       // Claim the return before signing, so a retried or concurrent tap cannot broadcast a second one.
       const claimed = await this.funding.claimVaultReturn({
@@ -420,7 +434,7 @@ export class Onramp {
         contract: vault.contractAddress,
         ref,
         contract_status: sale.status,
-        held: sale.held.toString(),
+        held: amount.toString(),
       });
       if (!claimed) {
         const row = await this.funding.readVaultSale(id);
@@ -429,8 +443,8 @@ export class Onramp {
       }
       let returnTx: string;
       try {
-        // cfParameters empty: a plain xSwapToken back to Asset Hub, no CCM or broker leg.
-        returnTx = await vault.returnHeld(ref, '0x');
+        returnTx =
+          sale.status === 2 ? await vault.returnHeld(ref, cfParameters) : await vault.returnRefund(ref, amount, cfParameters);
       } catch (error) {
         // The broadcast never left, so release the claim and let the return be re-sent.
         await this.funding.releaseVaultReturn(id);
@@ -439,6 +453,69 @@ export class Onramp {
       await this.funding.setVaultReturnTx(id, returnTx);
       return this.saleDto(id, ref, sale, 'returning', returnTx, vault.contractAddress);
     });
+  }
+
+  // What a return sends: all a held sale holds, or the refund that reached the vault for a refunded paid sale.
+  private async returnableAmount(
+    id: string,
+    providerStatus: string | undefined,
+    sale: { status: number; held: bigint; amount: bigint; recipient: string },
+    vault: SaleVaultClient,
+  ): Promise<bigint> {
+    if (sale.status === 2) return sale.held;
+    if (sale.status !== 1 || providerStatus?.trim().toUpperCase() !== 'REFUNDED') {
+      throw reject(
+        {
+          tag: 'Other',
+          value: { code: 'SALE_NOT_RETURNABLE', message: 'That sale has nothing held to return.', fundingRequestId: id },
+        },
+        `offrampReturn on sale ${id} with on-chain status ${String(sale.status)} and provider status ${providerStatus ?? 'none'}`,
+        409,
+      );
+    }
+    // Nothing free in the vault means no refund has landed, so the log scan is skipped.
+    const free = await vault.unclaimed();
+    // Only what the provider sent back from the address it was paid at, capped by the sale and the free balance.
+    let refunded = 0n;
+    try {
+      refunded = free === 0n ? 0n : await vault.refundedSince(saleRef(id), sale.recipient);
+    } catch (error) {
+      if (error instanceof RefundAmbiguousError) {
+        throw reject(
+          {
+            tag: 'Other',
+            value: { code: 'SALE_REFUND_AMBIGUOUS', message: 'The refund cannot be matched to this sale alone.', fundingRequestId: id },
+          },
+          `offrampReturn on sale ${id}: ${error.message}`,
+          409,
+        );
+      }
+      throw error;
+    }
+    const capped = [refunded, sale.amount, free].reduce((a, b) => (a < b ? a : b));
+    if (capped === 0n) {
+      throw reject(
+        {
+          tag: 'Other',
+          value: { code: 'SALE_REFUND_NOT_ARRIVED', message: 'The provider refund has not reached the vault yet.', fundingRequestId: id },
+        },
+        `offrampReturn on sale ${id}: refunded ${refunded.toString()}, free ${free.toString()}`,
+        409,
+      );
+    }
+    return capped;
+  }
+
+  /** The configured return encoder, or a 503 like a missing vault. */
+  private requireReturnEncoder(where: string): ReturnSwapEncoder {
+    if (this.returnEncoder === undefined) {
+      throw reject(
+        { tag: 'Other', value: { code: 'SALE_VAULT_UNAVAILABLE', message: 'The off-ramp sale vault is not configured.' } },
+        `${where}() called without a return encoder.`,
+        503,
+      );
+    }
+    return this.returnEncoder;
   }
 
   /** The configured SaleVault client, or a 503 that names the missing configuration rather than crashing. */

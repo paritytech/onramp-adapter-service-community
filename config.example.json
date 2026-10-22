@@ -129,6 +129,12 @@
     "rpc_url": "https://sepolia-rollup.arbitrum.io/rpc",
     "operator_key": { "mode": "file", "path": "/run/secrets/sale-vault-operator-key" },
     "min_return": "1",
-    "dust_target": "5"
+    "dust_target": "5",
+    "chainflip": {
+      "rpc_url": "https://archive.perseverance.chainflip.io",
+      "backend_url": "https://chainflip-swap-perseverance.chainflip.io",
+      "slippage_bps": 200,
+      "retry_blocks": 100
+    }
   }
 }

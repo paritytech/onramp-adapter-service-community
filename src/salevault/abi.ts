@@ -99,6 +99,21 @@ export function encodeSales(ref: string): string {
   return `0x${bytesToHex(concat([selector('sales(bytes32)'), bytes32(ref)]))}`;
 }
 
+/** The 32-byte topic of an event signature such as `Transfer(address,address,uint256)`. */
+export function eventTopic(signature: string): string {
+  return `0x${bytesToHex(keccakAsU8a(new TextEncoder().encode(signature), 256))}`;
+}
+
+/** An address or bytes32 as an indexed topic, left-padded to 32 bytes. */
+export function topicOf(hex: string): string {
+  return `0x${bytesToHex(bytes32(hex))}`;
+}
+
+/** Decode the address a getter such as `USDC()` returns. */
+export function decodeAddress(hex: string): string {
+  return `0x${hex.replace(/^0x/, '').slice(24, 64)}`;
+}
+
 /** Decode a single uint256 return value (a dust/unclaimed read). */
 export function decodeUint(hex: string): bigint {
   const raw = hex.replace(/^0x/, '');

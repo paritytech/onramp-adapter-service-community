@@ -3,14 +3,17 @@
 // library is pulled in. The operator key is held as a thunk, read only to derive the address and to sign.
 
 import {
+  decodeAddress,
   decodeSale,
   decodeUint,
   encodeGetter,
+  eventTopic,
   encodeResolveUnknown,
   encodeReturnHeld,
   encodeReturnRefund,
   encodeSales,
   encodeWithdrawDust,
+  topicOf,
   type SaleRead,
 } from './abi.js';
 import { addressFromKey, signTransaction, type Eip1559Tx } from './evm.js';
@@ -82,6 +85,30 @@ function hexToBigInt(value: unknown, what: string): bigint {
 // magnitude below this, so a larger one is a misbehaving or hostile RPC, not a fee to pay.
 const MAX_SANE_FEE_WEI = 1_000_000_000_000n; // 1000 gwei
 
+// Log reads span at most this many blocks, under the public RPCs' ten million block cap.
+const LOG_WINDOW = 5_000_000n;
+// How many windows back a sale's payout is searched for, about half a year of Arbitrum blocks.
+const LOG_WINDOWS = 12n;
+// A refund counts once its newest transfer is this many blocks old, about an hour of Arbitrum, so a split refund lands whole.
+const REFUND_SETTLE_BLOCKS = 14_400n;
+
+const SALE_PAID = eventTopic('SalePaid(bytes32,address,uint256,uint256)');
+const TRANSFER = eventTopic('Transfer(address,address,uint256)');
+
+interface LogRead {
+  blockNumber: bigint;
+  topics: string[];
+  data: string;
+}
+
+/** Thrown when another sale was paid to the same address after this one, so a refund cannot be told apart. */
+export class RefundAmbiguousError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RefundAmbiguousError';
+  }
+}
+
 /** One SaleVault on one chain, read and written by the operator. */
 export class SaleVaultClient {
   readonly operatorAddress: string;
@@ -119,6 +146,58 @@ export class SaleVaultClient {
   /** USDC in the contract that is not in any bucket. */
   async unclaimed(): Promise<bigint> {
     return decodeUint(await this.ethCall(encodeGetter('unclaimed()')));
+  }
+
+  /** The USDC token the vault accounts in, read off the contract. */
+  async usdc(): Promise<string> {
+    return decodeAddress(await this.ethCall(encodeGetter('USDC()')));
+  }
+
+  /** USDC that `from` sent the vault after this sale was paid, the refund a provider sent back. Zero when unpaid or still arriving. */
+  async refundedSince(ref: string, from: string): Promise<bigint> {
+    const latest = hexToBigInt(await this.rpc('eth_blockNumber', []), 'blockNumber');
+    const paidAt = await this.paidBlock(ref, latest);
+    if (paidAt === null) return 0n;
+    const usdc = await this.usdc();
+    let total = 0n;
+    let newest = 0n;
+    for (let start = paidAt; start <= latest; start += LOG_WINDOW) {
+      const end = start + LOG_WINDOW - 1n < latest ? start + LOG_WINDOW - 1n : latest;
+      // Another sale paid to the same address since this one could own any refund that follows.
+      const otherPaid = await this.logs(this.cfg.contract, [SALE_PAID, null, topicOf(from)], start, end);
+      if (otherPaid.some((log) => log.topics[1]?.toLowerCase() !== ref.toLowerCase())) {
+        throw new RefundAmbiguousError(`another sale was paid to ${from} after sale ${ref}`);
+      }
+      const transfers = await this.logs(usdc, [TRANSFER, topicOf(from), topicOf(this.cfg.contract)], start, end);
+      for (const log of transfers.filter((t) => t.blockNumber > paidAt)) {
+        total += hexToBigInt(log.data, 'transfer amount');
+        if (log.blockNumber > newest) newest = log.blockNumber;
+      }
+    }
+    // A refund still arriving is not returned yet, since a sale can only be returned once.
+    return total > 0n && latest - newest < REFUND_SETTLE_BLOCKS ? 0n : total;
+  }
+
+  // The block this sale's SalePaid was emitted in, searched back window by window, or null.
+  private async paidBlock(ref: string, latest: bigint): Promise<bigint | null> {
+    for (let i = 0n, end = latest; i < LOG_WINDOWS && end >= 0n; i++, end -= LOG_WINDOW) {
+      const start = end - LOG_WINDOW + 1n > 0n ? end - LOG_WINDOW + 1n : 0n;
+      const found = await this.logs(this.cfg.contract, [SALE_PAID, ref], start, end);
+      if (found.length > 0) return found[0]?.blockNumber ?? null;
+    }
+    return null;
+  }
+
+  private async logs(address: string, topics: (string | null)[], from: bigint, to: bigint): Promise<LogRead[]> {
+    const result = await this.rpc('eth_getLogs', [
+      { address, topics, fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` },
+    ]);
+    if (!Array.isArray(result)) throw new ChainUnavailableError(`rpc eth_getLogs: expected a list, got ${JSON.stringify(result)}`);
+    return (result as { blockNumber?: unknown; topics?: unknown; data?: unknown }[]).map((log) => ({
+      blockNumber: hexToBigInt(log.blockNumber, 'log blockNumber'),
+      topics: Array.isArray(log.topics) ? log.topics.map(String) : [],
+      data: asHexString(log.data, 'log data'),
+    }));
   }
 
   /** Send a refund of a paid sale back to the seller's home. Returns the transaction hash. */
