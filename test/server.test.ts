@@ -515,14 +515,15 @@ describe('the direction discriminator', () => {
     expect(await post(url, payload)).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
   });
 
-  it('refuses a sell that supplies a wallet address, rather than ignoring it', async () => {
-    // A seller who sends one believes they have pinned where the crypto goes. Nobody reads it:
-    // on a sell the crypto travels the other way and the provider issues the deposit address.
-    // Accepting it silently is the dangerous half of "extra fields are ignored".
-    expect(await post('/session', sellRequest({ walletAddress: ALICE }))).toEqual({
-      status: 400,
-      code: 'MALFORMED_REQUEST',
+  it("accepts a sell carrying the seller's own sending address", async () => {
+    // Banxa requires the wallet the crypto is sent from, which is also where it refunds.
+    let reached: unknown;
+    const { status } = await post('/session', sellRequest({ walletAddress: ALICE }), (body) => {
+      reached = body;
     });
+
+    expect(status).toBe(201);
+    expect(reached).toMatchObject({ direction: 'sell', walletAddress: ALICE });
   });
 
   it('refuses a buy with no wallet address on /session, and asks for none on /quote', async () => {

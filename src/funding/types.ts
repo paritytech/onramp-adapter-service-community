@@ -51,7 +51,7 @@ export interface FundingRecord {
   direction: Direction;
   /** The crypto leg in both directions, even on a sell where the crypto is the source. */
   destination_currency_code: string;
-  /** The delivery address, on a buy. A sell has none: the provider issues the deposit address. */
+  /** The delivery address on a buy, or on a sell the seller's own sending address, if one was sent. */
   wallet_address: string | undefined;
   /** The fiat committed, on a buy. A sell commits no fiat, only a quoted estimate of it. */
   source_amount: string | undefined;
@@ -189,8 +189,8 @@ export interface FundingRequestDto {
   providerStatus?: string;
   destinationCurrencyCode: string;
   /**
-   * Present on a buy, absent on a sell. An approved narrowing of a shipped field: a sell has no
-   * caller-supplied address, and an empty string would be a destination nobody pinned.
+   * Present on a buy. On a sell, the seller's own sending address when one was sent. An approved
+   * narrowing of a shipped field: an empty string would be an address nobody pinned.
    */
   walletAddress?: string;
   /** The fiat committed, on a buy. Absent on a sell, which commits no fiat. */
@@ -200,7 +200,7 @@ export interface FundingRequestDto {
    *
    * A client resuming into an existing request compares this against the sale it believes it is
    * resuming, and refuses on a mismatch. On a buy that job is done by the wallet address, which
-   * is unique per purchase; on a sell there is no such field and `sourceAmount` is absent, so
+   * is unique per purchase. On a sell it may be absent, and `sourceAmount` is absent, so
    * this is the only term between two sales in one corridor. Omitting it would silently degrade
    * that check to corridor-only matching, which hands a seller someone else's settlement surface
    * at someone else's amount. The database refuses a sell row without one.

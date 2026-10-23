@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { encodeAddress } from '@polkadot/util-crypto';
 
-import { canonicalizeDisclosedAddress, normalizeAddress } from '../src/address.js';
+import { canonicalizeDisclosedAddress, normalizeAddress, normalizeSellerAddress } from '../src/address.js';
 import { Refusal } from '../src/contract.js';
 
 // Alice, the canonical well-known account.
@@ -112,5 +112,32 @@ describe('canonicalizeDisclosedAddress for an EVM sell-only code', () => {
   it('is not accepted for the other codes', () => {
     expect(canonicalizeDisclosedAddress(MIXED, 'USDC_SOLANA')).toBeUndefined();
     expect(canonicalizeDisclosedAddress(MIXED, 'DOT')).toBeUndefined();
+  });
+});
+
+describe('normalizeSellerAddress', () => {
+  const VAULT = '0xAbCdEf0123456789aBcDeF0123456789AbCdEf01';
+  const refusedAs = (fn: () => unknown) => {
+    try {
+      fn();
+    } catch (error) {
+      return error instanceof Refusal && error.failure.tag === 'Other' ? error.failure.value.code : 'other';
+    }
+    return 'accepted';
+  };
+
+  it('normalises an Asset Hub seller to prefix 0', () => {
+    expect(normalizeSellerAddress(ALICE_PREFIX_42, 'DOT', undefined)).toBe(ALICE_PREFIX_0);
+  });
+
+  it('takes only the configured vault on Arbitrum, in any casing', () => {
+    expect(normalizeSellerAddress(VAULT.toLowerCase(), 'USDC_ARBITRUM', VAULT)).toBe(VAULT.toLowerCase());
+    expect(refusedAs(() => normalizeSellerAddress(`0x${'1'.repeat(40)}`, 'USDC_ARBITRUM', VAULT))).toBe('INVALID_ADDRESS');
+    expect(refusedAs(() => normalizeSellerAddress(VAULT, 'USDC_ARBITRUM', undefined))).toBe('INVALID_ADDRESS');
+    expect(refusedAs(() => normalizeSellerAddress(ALICE_PREFIX_0, 'USDC_ARBITRUM', VAULT))).toBe('INVALID_ADDRESS');
+  });
+
+  it('refuses any seller on Solana, where no sending address is ours', () => {
+    expect(refusedAs(() => normalizeSellerAddress('So11111111111111111111111111111111111111112', 'USDC_SOLANA', VAULT))).toBe('INVALID_ADDRESS');
   });
 });

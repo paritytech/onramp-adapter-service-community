@@ -320,13 +320,12 @@ export interface BuyWidgetSessionParams extends WidgetSessionCommon {
  * ("Source currency is not a valid crypto currency"), so a sell's `sourceCurrencyCode` is the
  * asset and its `destinationCurrencyCode` is the payout currency.
  *
- * **No `walletAddress`, and that is not an omission.** Verified: Meld does not require one on a
- * SELL (a BUY without one is refused, a SELL without one is `200`), and there is no request-side
- * field for a deposit address under any name — Meld issues the address itself, on the transaction
- * record, after the seller clears KYC. Sending one anyway would be worse than useless: the
- * endpoint silently accepts unknown and meaningless fields (an invalid address, and an entirely
- * invented key, both return `200`), so a `walletAddress` here would be read by nobody while
- * looking, to anyone auditing the request, like a pinned destination.
+ * **`walletAddress` is the seller's own address, never the deposit address.** There is no
+ * request-side field for a deposit address under any name. Meld issues the address itself, on the
+ * transaction record, after the seller clears KYC. Meld's docs mark `walletAddress` optional on a
+ * SELL, but with BANXA Meld answers `400 CRYPTO_INVALID_DESTINATION_WALLET` "The walletAddress is
+ * required." without one: Banxa's sell order requires the wallet the crypto is sent from, which is
+ * also where a refund goes.
  */
 export interface SellWidgetSessionParams extends WidgetSessionCommon {
   direction: 'sell';
@@ -336,6 +335,8 @@ export interface SellWidgetSessionParams extends WidgetSessionCommon {
   fiatCurrencyCode: string;
   /** The exact crypto committed. Meld's `sourceAmount` on a sell, and required. */
   cryptoAmount: string;
+  /** The seller's own sending and refund address, none sent when absent. */
+  walletAddress?: string | undefined;
 }
 
 type WidgetSessionParams = BuyWidgetSessionParams | SellWidgetSessionParams;
@@ -520,7 +521,8 @@ export class MeldClient {
   }
 
   /**
-   * Create a session with the legs, the amount and (on a buy) the address pinned server-side.
+   * Create a session with the legs, the amount and the address (a buy's delivery, or a sell's own
+   * sender) pinned server-side.
    *
    * Meld locks through a `lockFields` array on `sessionData`, not per-field `*Locked` booleans,
    * which are accepted and silently ignored. Six fields are listed, so the configured `limits`
@@ -532,8 +534,8 @@ export class MeldClient {
    * so a buyer cannot be walked onto a different asset or address inside Meld's own interface.
    *
    * On a sell the legs invert and one endpoint serves both: same path, same envelope, and
-   * `sessionType` carries the difference. See `SellWidgetSessionParams` for why there is no
-   * address on that side.
+   * `sessionType` carries the difference. See `SellWidgetSessionParams` for what the address on
+   * that side is.
    */
   async createWidgetSession(params: WidgetSessionParams): Promise<WidgetSession> {
     // The three fields whose meaning inverts with the direction, resolved once. Meld's names on
@@ -541,22 +543,22 @@ export class MeldClient {
     // destination is the fiat, which the server enforces rather than merely accepts (sending
     // fiat as source on a SELL answers "Source currency is not a valid crypto currency").
     //
-    // `walletAddress` is in this object rather than below it because it exists on exactly one
-    // side. Spreading it means a sell's body does not carry the key at all, as opposed to
-    // carrying it empty — and an empty one would be accepted, since this endpoint takes unknown
-    // and meaningless fields with a `200`.
+    // `walletAddress` is in this object rather than below it because it means a different thing
+    // on each side. A sell without one does not carry the key at all, as opposed to carrying it
+    // empty, and an empty one would be accepted, since this endpoint takes unknown and
+    // meaningless fields with a `200`.
     const legs =
       params.direction === 'sell'
         ? {
             sourceCurrencyCode: params.cryptoCurrencyCode,
             destinationCurrencyCode: params.fiatCurrencyCode,
             sourceAmount: params.cryptoAmount,
-            // Plain `undefined`, as `serviceProvider` and `redirectUrl` below are: this object
-            // is only ever JSON-serialised and `JSON.stringify` drops an undefined value, so the
-            // key is genuinely absent from the sell body. Written this way rather than as a
-            // conditional spread so both branches emit the same field in the same position, and
-            // the bytes a buy POSTs do not depend on which branch produced them.
-            walletAddress: undefined,
+            // Possibly `undefined`, as `serviceProvider` and `redirectUrl` below are: this object
+            // is only ever JSON-serialised and `JSON.stringify` drops an undefined value, so an
+            // absent address is genuinely absent from the sell body. Written this way rather than
+            // as a conditional spread so both branches emit the same field in the same position,
+            // and the bytes a buy POSTs do not depend on which branch produced them.
+            walletAddress: params.walletAddress,
           }
         : {
             sourceCurrencyCode: params.sourceCurrency,

@@ -359,9 +359,9 @@ const direction = z.enum(DIRECTIONS).optional();
  * So the wrong combination is refused rather than ignored, in both directions:
  *
  * - buy: `sourceAmount` required, `cryptoAmount` refused. On `/session`, `walletAddress` required.
- * - sell: `cryptoAmount` required, `sourceAmount` refused, and `walletAddress` refused because
- *   the provider issues the deposit address later; a caller-supplied one is read by nobody and
- *   accepting it would let a seller believe they had pinned a destination.
+ * - sell: `cryptoAmount` required, `sourceAmount` refused. `walletAddress` is optional: it is the
+ *   seller's own sending and refund address (Banxa requires it), never the deposit address, which
+ *   the provider issues later.
  *
  * `requireSessionFields` is what the two schemas disagree about: `/quote` prices a corridor and
  * has no address in either direction.
@@ -383,9 +383,6 @@ function directionalFields(
     if (value.cryptoAmount === undefined) absent('cryptoAmount', 'A sell requires cryptoAmount.');
     if (value.sourceAmount !== undefined) {
       absent('sourceAmount', 'A sell commits crypto, not fiat: send cryptoAmount instead.');
-    }
-    if (value.walletAddress !== undefined) {
-      absent('walletAddress', 'A sell has no caller-supplied wallet address; the provider issues one.');
     }
     return;
   }
@@ -430,10 +427,10 @@ export const createSessionRequest = z
     /** The crypto sold. Required on a sell, refused on a buy; see `directionalFields`. */
     cryptoAmount: cryptoAmount.optional(),
     /**
-     * SS58 address that receives the tokens. Normalised and validated before use.
+     * On a buy, the SS58 address that receives the tokens. Normalised and validated before use.
      *
-     * Required on a buy and refused on a sell, where the crypto travels the other way and the
-     * provider issues the deposit address after the session exists.
+     * Required on a buy. Optional on a sell, where it is the seller's own sending and refund
+     * address. The provider issues the deposit address after the session exists.
      */
     walletAddress: z.string().min(1).max(128).optional(),
     paymentMethodType,
@@ -564,12 +561,12 @@ export interface CreateSessionResponse {
   pinned: {
     destinationCurrencyCode: string;
     /**
-     * Present on a buy, absent on a sell.
+     * Present on a buy. On a sell, the seller's own sending and refund address when one was sent.
      *
      * An approved narrowing of a shipped contract, so it is spelled out rather than left to be
-     * inferred: a sell has no caller-supplied address, the provider issues the deposit address
-     * after the session exists, and echoing an empty string would be a claim about a destination
-     * nobody pinned. A buy's response is byte-identical to what it was.
+     * inferred: the provider issues a sell's deposit address after the session exists, and
+     * echoing an empty string would be a claim about an address nobody pinned. A buy's response
+     * is byte-identical to what it was.
      */
     walletAddress?: string;
     /** The fiat committed, on a buy. Absent on a sell, which commits no fiat, only an estimate. */

@@ -11,7 +11,7 @@
  * neutral rail input, calls through the seam, and persists the neutral result.
  */
 
-import { normalizeAddress } from './address.js';
+import { normalizeAddress, normalizeSellerAddress } from './address.js';
 import { railRefusal } from './meld/refusal.js';
 import type { AuditEvent, AuditLog } from './audit.js';
 import type { Subject } from './auth.js';
@@ -194,7 +194,7 @@ function auditTerms(terms: CreateSessionResponse['pinned']): Pick<
  *
  * The `cryptoAmount` echo is load-bearing on a sell. A resuming client compares it against the
  * sale it believes it is resuming and refuses on a mismatch; on a buy the wallet address does
- * that job, and a sell has none.
+ * that job, and a sell may have none.
  */
 function pinnedOf(record: FundingRecord): CreateSessionResponse['pinned'] {
   return {
@@ -847,7 +847,7 @@ export class Onramp {
     let session;
     try {
       // The same split as `quote`: one set of legs, and the committed amount the direction
-      // actually has. A sell additionally carries no address, because there is none to carry.
+      // actually has. A sell carries the seller's own address only when one was pinned.
       const opening = {
         destinationCode: pinned.destinationCurrencyCode,
         fiat: pinned.fiat,
@@ -860,7 +860,12 @@ export class Onramp {
       };
       session = await rail.createSession(
         direction === 'sell'
-          ? { ...opening, direction, cryptoAmount: committedTerm(pinned.cryptoAmount, 'cryptoAmount', direction) }
+          ? {
+              ...opening,
+              direction,
+              cryptoAmount: committedTerm(pinned.cryptoAmount, 'cryptoAmount', direction),
+              walletAddress: pinned.walletAddress,
+            }
           : {
               ...opening,
               direction,
@@ -1512,11 +1517,13 @@ export class Onramp {
   ): Promise<Committed> {
     const destination = resolveForDirection(request.destinationCurrencyCode, direction);
     const currency = request.fiat.toUpperCase();
-    // Only a buy has an address to pin. On a sell the schema has already refused one, and the
-    // deposit address the seller will use is the provider's, issued after the session exists.
+    // A buy pins where the crypto is delivered. A sell may pin the seller's own sending and refund
+    // address. The deposit address the seller will use is the provider's, issued after the session exists.
     const walletAddress =
       direction === 'sell'
-        ? undefined
+        ? request.walletAddress === undefined
+          ? undefined
+          : normalizeSellerAddress(request.walletAddress, destination.code, this.cfg.sale_vault?.contract)
         : normalizeAddress(committedTerm(request.walletAddress, 'walletAddress', direction));
 
     // The fiat corridor gate is Meld's own question; only the fiat rail has one. A non-fiat rail
@@ -1726,8 +1733,8 @@ export class Onramp {
         rail,
         ...auditDirection(direction),
         destinationCurrencyCode: request.destinationCurrencyCode,
-        // Submitted, not pinned, and only where the caller sent one. A sell sends no address and
-        // no fiat amount; emitting a key with `undefined` would put a field on the stream that
+        // Submitted, not pinned, and only where the caller sent one. A sell may send its own address
+        // and sends no fiat amount. Emitting a key with `undefined` would put a field on the stream that
         // says nothing, and a `''` would say something false.
         ...(request.walletAddress === undefined ? {} : { walletAddress: request.walletAddress }),
         ...(request.sourceAmount === undefined ? {} : { sourceAmount: request.sourceAmount }),

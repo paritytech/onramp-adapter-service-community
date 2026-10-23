@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { AuditEvent } from '../src/audit.js';
+import type { Config } from '../src/config.js';
 import {
   directionUnsupported,
   Refusal,
@@ -2075,6 +2076,125 @@ describe('a sell request', () => {
     });
     // Nothing invents an address for the leg that has none.
     expect(asBuy(meld.calls[0])).toBeUndefined();
+  });
+
+  it("pins the seller's own sending address, normalised, and hands it to the rail", async () => {
+    // Banxa refuses a sell without the wallet the crypto is sent from.
+    const meld = new FakeMeld();
+    const { service, funding } = build(meld);
+
+    const created = await service.createSession(SUBJECT, sell({ walletAddress: ALICE_PREFIX_42 }), REQUEST_ID);
+    const row = await funding.byId(created.fundingRequestId);
+
+    expect(created.pinned.walletAddress).toBe(ALICE);
+    expect(meld.calls[0]).toMatchObject({ direction: 'sell', walletAddress: ALICE });
+    expect(row?.wallet_address).toBe(ALICE);
+  });
+
+  it('refuses a malformed seller address before any rail call', async () => {
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    const refusal = await failureOf(() => service.createSession(SUBJECT, sell({ walletAddress: 'not-an-address' }), REQUEST_ID));
+
+    expect(refusal).toMatchObject({ tag: 'Other', value: { code: 'INVALID_ADDRESS' } });
+    expect(meld.calls).toHaveLength(0);
+  });
+
+  it('takes one account under either prefix as the same seller on a replay', async () => {
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    const first = await service.createSession(SUBJECT, sell({ walletAddress: ALICE_PREFIX_42 }), REQUEST_ID);
+    const again = await service.createSession(SUBJECT, sell({ walletAddress: ALICE }), REQUEST_ID);
+
+    expect(again.fundingRequestId).toBe(first.fundingRequestId);
+    expect(meld.calls).toHaveLength(1);
+  });
+
+  describe('on a chain other than Asset Hub', () => {
+    const VAULT = '0x81949127042930F8e7A1723385A2F76213C72ee9';
+    const laneConfig = (vault: boolean) => {
+      const c = config();
+      return {
+        ...c,
+        supported: {
+          ...c.supported,
+          offramp_lanes: [
+            { asset: 'usdc@arbitrum', code: 'USDC_ARBITRUM', chain: 'arbitrum' as const },
+            { asset: 'usdc@solana', code: 'USDC_SOLANA', chain: 'solana' as const },
+          ],
+        },
+        ...(vault
+          ? {
+              sale_vault: {
+                chain: 'arbitrum-sepolia',
+                chain_id: 421614,
+                contract: VAULT,
+                rpc_url: 'http://127.0.0.1:1',
+                operator_key: { mode: 'env' as const, var: 'OP_KEY' },
+                min_return: '1',
+                dust_target: '5',
+                chainflip: {
+                  rpc_url: 'https://archive.perseverance.chainflip.io',
+                  backend_url: 'https://chainflip-swap-perseverance.chainflip.io',
+                  slippage_bps: 200,
+                  retry_blocks: 100,
+                },
+              },
+            }
+          : {}),
+      } as Config;
+    };
+
+    it('takes only the configured vault as an Arbitrum seller, stored lowercase', async () => {
+      const meld = new FakeMeld();
+      const { service } = build(meld, laneConfig(true));
+
+      const created = await service.createSession(
+        SUBJECT,
+        sell({ destinationCurrencyCode: 'USDC_ARBITRUM', walletAddress: VAULT }),
+        REQUEST_ID,
+      );
+      expect(created.pinned.walletAddress).toBe(VAULT.toLowerCase());
+      expect(meld.calls[0]).toMatchObject({ walletAddress: VAULT.toLowerCase() });
+
+      const other = await failureOf(() =>
+        service.createSession(
+          SUBJECT,
+          sell({ idempotencyKey: 'idem-sell-0002', destinationCurrencyCode: 'USDC_ARBITRUM', walletAddress: `0x${'1'.repeat(40)}` }),
+          REQUEST_ID,
+        ),
+      );
+      expect(other).toMatchObject({ value: { code: 'INVALID_ADDRESS' } });
+      expect(meld.calls).toHaveLength(1);
+    });
+
+    it('refuses an Arbitrum seller with no vault configured, and any Solana seller', async () => {
+      const meld = new FakeMeld();
+      const { service } = build(meld, laneConfig(false));
+
+      for (const [code, address] of [
+        ['USDC_ARBITRUM', VAULT],
+        ['USDC_SOLANA', 'So11111111111111111111111111111111111111112'],
+      ] as const) {
+        const refusal = await failureOf(() =>
+          service.createSession(SUBJECT, sell({ destinationCurrencyCode: code, walletAddress: address }), REQUEST_ID),
+        );
+        expect(refusal).toMatchObject({ value: { code: 'INVALID_ADDRESS' } });
+      }
+      expect(meld.calls).toHaveLength(0);
+    });
+  });
+
+  it('treats a replay naming another seller address as a different request', async () => {
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    await service.createSession(SUBJECT, sell({ walletAddress: ALICE }), REQUEST_ID);
+    const refusal = await failureOf(() => service.createSession(SUBJECT, sell(), REQUEST_ID));
+
+    expect(refusal).toMatchObject({ tag: 'Other', value: { code: 'IDEMPOTENCY_KEY_REUSED' } });
   });
 
   it('does not run the fiat limit gate, which would compare crypto against fiat', async () => {

@@ -45,9 +45,9 @@ export interface AuditEvent {
    *
    * Optional as of the sell release, and this is a deliberate change to a contract that ships
    * off-box: a consumer of this stream that read `walletAddress` as always-present now has to
-   * handle its absence. A sell has no caller-supplied address at all (the provider issues the
-   * deposit address later), so the alternative was emitting an empty string, which is a claim
-   * about a destination that was never pinned, on the one record a dispute is answered from.
+   * handle its absence. On a sell it is the seller's own sending address, present only when one
+   * was sent (the provider issues the deposit address later), so the alternative was emitting an
+   * empty string, a claim about an address never pinned, on the one record a dispute is answered from.
    */
   walletAddress?: string;
   /**

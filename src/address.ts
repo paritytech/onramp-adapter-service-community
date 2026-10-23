@@ -16,7 +16,7 @@
 
 import { base58Decode, decodeAddress, encodeAddress } from '@polkadot/util-crypto';
 
-import { reject } from './contract.js';
+import { Refusal, reject } from './contract.js';
 import { chainOf } from './meld/catalog.js';
 
 /** Polkadot Asset Hub. Passed explicitly at every call site; never defaulted. */
@@ -33,6 +33,10 @@ const PUBLIC_KEY_BYTES = 32;
  */
 const invalidAddress = (detail: string) =>
   reject({ tag: 'Other', value: { code: 'INVALID_ADDRESS', message: 'The destination address is not valid.' } }, detail);
+
+/** The same refusal for a seller's own sending address, which is not a destination. */
+const invalidSellerAddress = (detail: string) =>
+  reject({ tag: 'Other', value: { code: 'INVALID_ADDRESS', message: 'The sending address is not valid.' } }, detail);
 
 /**
  * Normalise to the Polkadot prefix, or refuse.
@@ -56,6 +60,24 @@ export function normalizeAddress(input: string): string {
   }
 
   return encodeAddress(publicKey, POLKADOT_SS58_PREFIX);
+}
+
+/** A seller's own sending and refund address: the sale key on Asset Hub, or the configured SaleVault on Arbitrum, else refused. */
+export function normalizeSellerAddress(input: string, code: string, vaultContract: string | undefined): string {
+  const chain = chainOf(code);
+  if (chain === 'arbitrum') {
+    const address = evmAddress(input);
+    if (address === undefined || vaultContract === undefined || address !== vaultContract.toLowerCase()) {
+      throw invalidSellerAddress(`A sell of ${code} must name the configured sale vault, got ${input}.`);
+    }
+    return address;
+  }
+  if (chain === 'solana') throw invalidSellerAddress(`A sell of ${code} has no seller address this service controls.`);
+  try {
+    return normalizeAddress(input);
+  } catch (error) {
+    throw error instanceof Refusal ? invalidSellerAddress(error.message) : error;
+  }
 }
 
 /**

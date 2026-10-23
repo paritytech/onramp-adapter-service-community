@@ -84,7 +84,7 @@ reinterpreted:
 | --- | --- | --- |
 | amount field | `sourceAmount`, the fiat charged | `cryptoAmount`, the crypto sold |
 | format | decimal, at most **2** fraction digits | exact decimal, kept as a string end to end and never rounded or parsed; **this service accepts** up to 30 fraction digits (see the note below on what the provider has been observed to accept) |
-| `walletAddress` | **required** on `/session` | **refused**: the provider issues the deposit address after the session exists |
+| `walletAddress` | **required** on `/session` | optional on `/session`: the seller's own sending and refund address (Asset Hub: SS58; Arbitrum: the configured SaleVault; Solana: refused). Banxa requires it. Never the deposit address, which the provider issues after the session exists |
 
 **What "30 fraction digits" is and is not a promise about.** 30 is this service's own accepted
 bound, chosen to be wider than any asset's precision so that nothing is ever silently truncated on
@@ -109,9 +109,10 @@ deliberate, and it is the safe direction to fail — the alternative is parsing 
 one number and handing back a settlement surface committed to the other one. Send the same
 bytes on a retry that you sent the first time.
 
-The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount` or
-`walletAddress`, a buy carrying `cryptoAmount`, or either direction missing its own amount, is a
-local `400 MALFORMED_REQUEST` before any upstream call.
+The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount`, a buy carrying
+`cryptoAmount`, or either direction missing its own amount, is a local `400 MALFORMED_REQUEST`
+before any upstream call. A sell's `walletAddress` that is not a valid seller address for the
+asset's chain is a local `400 INVALID_ADDRESS`.
 
 **The Meld rail serves a sell.** Chainflip still refuses one with
 `400 Other{ DIRECTION_UNSUPPORTED }`, permanently: it has no fiat leg to pay a seller from, and no
@@ -475,7 +476,7 @@ guarantee about what the provider's widget will allow.
 ```
 
 A sell sends the same body with `direction: "sell"`, `cryptoAmount` in place of `sourceAmount`,
-and no `walletAddress`:
+and, optionally, `walletAddress` as the seller's own sending address:
 
 ```json
 {
@@ -485,6 +486,7 @@ and no `walletAddress`:
   "fiat": "GBP",
   "destinationCurrencyCode": "DOT",
   "cryptoAmount": "12.3456789012",
+  "walletAddress": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
   "paymentMethodType": "PAYOUT_TO_BANK",
   "serviceProvider": "TRANSAK"
 }
@@ -525,10 +527,10 @@ Rejected as `REDIRECT_NOT_ALLOWED`, locally.
 }
 ```
 
-On a sell, `pinned` carries `cryptoAmount` and no `walletAddress` or `sourceAmount`: those are
-terms a sell does not commit, and they are absent rather than empty. **`cryptoAmount` is the term
+On a sell, `pinned` carries `cryptoAmount`, the seller's normalised `walletAddress` when one was
+sent, and no `sourceAmount`: absent terms are absent rather than empty. **`cryptoAmount` is the term
 a resuming client compares against.** On a buy the wallet address distinguishes two purchases in
-one corridor; a sell has none, so this is the only thing between two sales of the same asset in
+one corridor; a sell may have none, so this is the only thing between two sales of the same asset in
 the same corridor, and a mismatch must be treated as "this is a different sale", not a warning.
 
 `serviceProviderWidgetUrl` is the provider's capture page, always present. `widgetUrl` is Meld's
@@ -638,7 +640,8 @@ for another caller's alike.
 }
 ```
 
-`direction` is always present. On a sell row, `walletAddress` and `sourceAmount` are absent and
+`direction` is always present. On a sell row, `sourceAmount` is absent, `walletAddress` is the
+seller's own address when one was pinned, and
 `cryptoAmount` carries the committed crypto at full precision; see `direction` above for why that
 echo is load-bearing rather than informational. A sell moves through the **same** eight states a
 buy does: the direction is a term of the request, not a stage of its life.

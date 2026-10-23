@@ -170,7 +170,8 @@ const CRYPTO_AMOUNT_COLUMN = ' crypto_amount TEXT';
  *
  * The other two replace what the dropped `NOT NULL`s used to guarantee, per direction rather
  * than globally. `wallet_address` and `source_amount` became nullable because a sell has
- * neither, and without these a buy could now be written missing both.
+ * neither, and without these a buy could now be written missing both. A sell may now carry the
+ * seller's own sending address in `wallet_address`, and nothing constrains it.
  *
  * `crypto_amount` is the one worth spelling out. A consumer resuming a sell hard-compares the
  * committed crypto against its own record to detect being resumed into a *different* sale, and
