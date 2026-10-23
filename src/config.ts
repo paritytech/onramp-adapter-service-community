@@ -595,6 +595,36 @@ const configSchema = z
       .strict()
       // `.prefault({})` like `cors`/`rate_limit`: an absent block is the documented defaults.
       .prefault({}),
+    // The on-chain SaleVault for the offramp swap lane. Optional, so a deployment that does not run
+    // the contract lane validates without it. Required fields have no default since they move money.
+    sale_vault: z
+      .object({
+        chain: z.string().min(1),
+        // The numeric EVM chain id signed into every transaction, explicit so signing is correct offline.
+        chain_id: z.number().int().positive(),
+        contract: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
+        rpc_url: z.url(),
+        operator_key: secretSource,
+        // The least held amount worth returning, below which a return would cost more gas than it saves.
+        min_return: decimal,
+        // The dust the contract keeps to self-fund its own gas, as the operator wants it maintained.
+        dust_target: decimal,
+        // How a return swap back to Asset Hub is priced and encoded on Chainflip.
+        chainflip: z
+          .object({
+            // The State Chain RPC that reports Chainflip's swap limits.
+            rpc_url: z.url(),
+            // The Chainflip swap backend that quotes the return and encodes it with its own broker.
+            backend_url: z.url(),
+            // How far below the quoted price the return may fill, in basis points.
+            slippage_bps: z.number().int().min(0).max(10_000),
+            // State Chain blocks Chainflip retries before refunding to the vault, at most its 600 cap.
+            retry_blocks: z.number().int().min(0).max(600),
+          })
+          .strict(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((cfg, ctx) => {
@@ -732,6 +762,7 @@ const configSchema = z
       // redaction hooks do nothing for `process.env`, which is the whole reason this loop exists.
       ['store.password', cfg.store.password],
       ...(cfg.auth.personhood === undefined ? [] : [['auth.personhood.jwt_key', cfg.auth.personhood.jwt_key] as const]),
+      ...(cfg.sale_vault === undefined ? [] : [['sale_vault.operator_key', cfg.sale_vault.operator_key] as const]),
     ] as const) {
       if (source.mode === 'env' && cfg.environment !== 'development') {
         ctx.addIssue({
@@ -777,6 +808,42 @@ const configSchema = z
           message: `cors.allowed_origins must use https outside development: "${value}" is plaintext.`,
         });
       }
+    }
+
+    // The sale-vault RPC carries the operator's signed transactions, so it must not be plaintext.
+    if (
+      cfg.sale_vault !== undefined &&
+      cfg.environment !== 'development' &&
+      !cfg.sale_vault.rpc_url.startsWith('https://')
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['sale_vault', 'rpc_url'],
+        message: `sale_vault.rpc_url must use https outside development: "${cfg.sale_vault.rpc_url}" is plaintext.`,
+      });
+    }
+
+    // The Chainflip endpoints price and encode a funds-moving swap, so neither may be plaintext.
+    if (cfg.sale_vault !== undefined && cfg.environment !== 'development') {
+      for (const field of ['rpc_url', 'backend_url'] as const) {
+        const url = cfg.sale_vault.chainflip[field];
+        if (!url.startsWith('https://')) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['sale_vault', 'chainflip', field],
+            message: `sale_vault.chainflip.${field} must use https outside development: "${url}" is plaintext.`,
+          });
+        }
+      }
+    }
+
+    // The zero address is a sentinel for an unset contract, and a swap delivered there burns the funds.
+    if (cfg.sale_vault !== undefined && cfg.sale_vault.contract.toLowerCase() === `0x${'0'.repeat(40)}`) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['sale_vault', 'contract'],
+        message: 'sale_vault.contract must be the deployed SaleVault address, not the zero address.',
+      });
     }
 
     // The store link carries every funding row (aliases, wallet addresses, amounts) and the

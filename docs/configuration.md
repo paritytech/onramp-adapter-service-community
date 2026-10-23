@@ -53,6 +53,18 @@ a service that runs in production with a development posture. See
 | `supported.routes_interval_ms` | How often the routes pass re-reads every catalogued corridor's methods and limits. 60000 to 86400000, default 7200000 (2h). One Meld call per country per pass, the fiat already being known from the catalog. Three consecutive missed passes retire a corridor from `GET /supported/corridors`, unless no row for that crypto is fresh, when the last catalog written is served rather than none for up to a day past that window. Each pass walks one buy job per deliverable asset in `assets`, so every one added is another Meld call per country. A job whose pass writes nothing is retried on its own after a minute, then two, four and so on, until the wait reaches this interval. |
 | `supported.sell_routes_interval_ms` | How often the routes pass re-reads sell corridors (every sell refresh job, including each offramp lane). 60000 to 604800000, default 43200000 (12h). Buy jobs keep `supported.routes_interval_ms`. Sell rows are retired from `GET /supported/offramp*` and `GET /supported/corridors?direction=sell` after three missed passes (3 x this value). `meld.routes_cache_ttl_ms` must stay under it. |
 | `supported.offramp_lanes` | Ordered array of `{ "asset": string }` (strict, at least one), default `[{"asset": "dot@assethub"}]`; the code comes from `assets` and the chain from the asset. The sell lanes behind `GET /supported/offramp*`; where several lanes offer a payout method, the method lists every one of them in this order, each with its own limits. Each `asset` must be a known asset named in `assets`, delivered or sell-only (`usdt@solana`, `usdc@solana`, `usdc@arbitrum`), and lanes must be unique. Every lane gets a sell corridor refresh job, alongside the fixed `dot@assethub` buy and sell jobs. A sell quote or session for a code not listed is refused `RegionUnavailable`, so this list is the switch for which off-ramp routes exist: leave the Chainflip swap lanes (`usdc@arbitrum`, `usdc@solana`) out and only the direct Asset Hub sales are offered. The chart's `values.yaml` lists the direct lanes `usdt@assethub` and `dot@assethub`, with `usdc@arbitrum` and `usdc@solana` commented out; `config.example.json` lists all four. Deposit addresses are validated per chain: base58 32-byte keys on Solana, `0x` plus 40 hex (stored lowercased) on Arbitrum, SS58 normalised to the Polkadot prefix on Asset Hub, and for a code the config no longer names (every retired code was Asset Hub's). |
+| `sale_vault` | Optional. The off-ramp SaleVault lane on an EVM chain. Absent, `GET /offramp/sale/:id` and `POST /offramp/returns/:id` answer 503 and no vault rides `GET /supported/offramp`. All fields below are required once the block is present. |
+| `sale_vault.chain` | The chain label stored on each sale row, e.g. `arbitrum-sepolia`. |
+| `sale_vault.chain_id` | The numeric EVM chain id signed into every operator transaction, e.g. 421614 for Arbitrum Sepolia. |
+| `sale_vault.contract` | The deployed SaleVault address, `0x` plus 40 hex. |
+| `sale_vault.rpc_url` | The chain's JSON-RPC URL, https outside development. |
+| `sale_vault.operator_key` | `{ "mode": "file", "path": ... }` or `{ "mode": "env", "var": ... }`, the operator wallet's private key mounted the same file way as `meld.api_key`. |
+| `sale_vault.min_return` | The least held amount worth returning, below which a return costs more gas than it saves. |
+| `sale_vault.dust_target` | The dust the contract keeps to self-fund its own gas, as the operator wants it maintained. |
+| `sale_vault.chainflip.rpc_url` | The Chainflip State Chain RPC, https outside development. It reports the minimum deposit and maximum swap a return must fit. |
+| `sale_vault.chainflip.backend_url` | The Chainflip swap backend, https outside development. Its `/v2/quote` prices a return swap and its `/api/encodeCfParameters` encodes the swap's `cf_parameters` naming the backend's own broker, exactly as the Chainflip SDK does with no broker configured. |
+| `sale_vault.chainflip.slippage_bps` | How far below the quoted price a return swap may fill, 0 to 10000. |
+| `sale_vault.chainflip.retry_blocks` | State Chain blocks Chainflip retries a return swap below its minimum price before refunding it to the vault, 0 to 600 (Chainflip's cap). |
 | `worker.session_max_age_ms` | How long to keep watching a request for a payment. A **floor**, not a fallback: a longer rail expiry extends this window and a shorter one is ignored, because a rail's expiry says when its capture page closes, which is not evidence about payment. 60000 ms to 30 days, default 72h. |
 | `session_creation_enabled` | Kill switch: stops session creation without a deploy. Leaves reads and the settlement worker running. |
 
@@ -127,7 +139,9 @@ In process the key lives in a type whose `toString`, `toJSON` and `inspect` hook
 `[redacted]`, and reading it requires calling `expose()`, which is greppable, so *"where is the
 key used"* has an exact answer. There are three secrets (the Meld key, the JWT signing key and the
 CloudSQL password) and four `expose()` call sites: one in the Meld client, two in `startup`'s HKDF
-derivation, and one where the store builds its pool.
+derivation, and one where the store builds its pool. A fourth secret and a fifth `expose()` site
+exist only when the off-ramp lane is configured: the `sale_vault.operator_key`, read in `startup` to
+derive the operator address and at each signing.
 
 > [!NOTE]
 > Node cannot erase a string. `Buffer` contents can be overwritten, but the value must become a

@@ -153,6 +153,8 @@ const stubOnramp = () => ({
   supportedCorridors: async () => [],
     offrampCorridors: async () => [],
     offramp: async (country: string) => ({ country, fiat: 'USD', methods: [] }),
+  offrampSale: async () => undefined,
+  offrampReturn: async () => undefined,
   transaction: async () => ({ transaction: {} }),
   cancel: async () => undefined,
   get: async () => undefined,

@@ -322,6 +322,37 @@ afterEach(async () => {
     expect((await started.app.inject({ method: 'GET', url: '/health' })).statusCode).toBe(200);
   });
 
+  it('builds the sale vault client at boot when the lane is configured', async () => {
+    // The off-ramp lane is optional, so its construction has no other boot test. A valid 32-byte
+    // operator key lets the client derive its address at construction, and no RPC is made at boot.
+    const baseUrl = await fakeMeld({ quotes: [] });
+    const path = await writeConfig('salevault', baseUrl);
+    const keyPath = join(dir, 'salevault-operator.key');
+    await writeFile(keyPath, `${'46'.repeat(32)}\n`);
+    const raw = JSON.parse(await readFile(path, 'utf8')) as { sale_vault?: unknown; store: unknown };
+    raw.sale_vault = {
+      chain: 'arbitrum-sepolia',
+      chain_id: 421614,
+      contract: '0x81949127042930F8e7A1723385A2F76213C72ee9',
+      rpc_url: 'http://127.0.0.1:1',
+      operator_key: { mode: 'file', path: keyPath },
+      min_return: '1',
+      dust_target: '5',
+      chainflip: {
+        rpc_url: 'https://archive.perseverance.chainflip.io',
+        backend_url: 'https://chainflip-swap-perseverance.chainflip.io',
+        slippage_bps: 200,
+        retry_blocks: 100,
+      },
+    };
+    const schema = await createSchema();
+    raw.store = storeConfigFor(schema);
+    await writeFile(path, JSON.stringify(raw));
+
+    handle = await start(path);
+    expect((await handle.app.inject({ method: 'GET', url: '/health' })).statusCode).toBe(200);
+  });
+
   it('announces that callers are unverified when auth.mode is insecure_dev', async () => {
     // The operator's only signal that this instance verifies nobody. Configuration refuses this
     // mode in production, so the warning is what covers development and sandbox. Every mutant

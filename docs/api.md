@@ -17,8 +17,10 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Rows not refreshed within three routes passes are retired, but when none is fresh (a boot after a long idle, or a refresh that keeps failing) the last catalog written is served instead, windowed back from its newest row so an already-retired country stays retired, for up to a day past the freshness window. After that, and for a crypto the refresh has never written, it returns `[]`, which the client falls back from. Buy rows exist for every deliverable asset the config names (`dot@assethub`, `usdt@assethub`, `usdc@assethub`); sell rows for DOT and each offramp lane. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
-| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{asset, code, chain, min, max, currency}]}]}]}`. No query parameters (strict). See "Offramp lanes" below. |
-| `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
+| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{asset, code, chain, min, max, currency}]}]}]}`. When a SaleVault lane is configured, a `vault: {chain, chainId, contract}` field names the deployment-wide SaleVault the app's Chainflip CCM must deliver to. No query parameters (strict). See "Offramp lanes" and "The off-ramp SaleVault" below. |
+| `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`, plus the same `vault` field when configured. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
+| `GET /offramp/sale/:fundingRequestId` | none (reads the SaleVault on chain) | The on-chain SaleVault state of one of the caller's off-ramp sales, scoped by alias: `{sale: {fundingRequestId, chain, contract, ref, status, recipient, amount, home, held, returnStatus, returnTx}}`. `status` is the contract's `Sale.Status` (`none`/`paid`/`held`/`returned`); `returnStatus` is this service's own record of a return (`none`/`returning`/`returned`). 404 for an unknown or another caller's request; 503 when no vault is configured or the chain is unreachable. See "The off-ramp SaleVault" below. |
+| `POST /offramp/returns/:fundingRequestId` | none (operator-signs the SaleVault) | Return a sale to its own Asset Hub home, operator-signed: everything a `held` sale holds, or, for a `paid` sale whose provider status is `REFUNDED`, the USDC the provider sent back to the vault from the address it was paid at (capped by the sale amount and the vault's unclaimed balance). Empty body. The swap's `cf_parameters` are priced from a Chainflip quote and encoded by the Chainflip swap backend, refunding to the vault if the price is not met. The return is claimed before it is broadcast, so a retried or concurrent tap cannot sign two. 409 `SALE_NOT_RETURNABLE` when there is nothing to return, `SALE_REFUND_NOT_ARRIVED` when a refunded sale's USDC has not reached the vault, `SALE_REFUND_AMBIGUOUS` when another sale was paid to the same provider address since, so the refund cannot be matched to this sale alone, `SALE_RETURN_NOT_SWAPPABLE` when the amount is below Chainflip's minimum deposit or above its maximum swap; 404 for an unknown request; 503 when no vault is configured or the chain, the Chainflip backend or the State Chain RPC is unreachable. The response is the same `{sale: {...}}` shape as the read. |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
 | `GET /transaction/:id` | `GET /payments/transactions/{id}` | Status, projected onto the five fields this service declares. |
@@ -82,7 +84,7 @@ reinterpreted:
 | --- | --- | --- |
 | amount field | `sourceAmount`, the fiat charged | `cryptoAmount`, the crypto sold |
 | format | decimal, at most **2** fraction digits | exact decimal, kept as a string end to end and never rounded or parsed; **this service accepts** up to 30 fraction digits (see the note below on what the provider has been observed to accept) |
-| `walletAddress` | **required** on `/session` | **refused**: the provider issues the deposit address after the session exists |
+| `walletAddress` | **required** on `/session` | optional on `/session`: the seller's own sending and refund address (Asset Hub: SS58; Arbitrum: the configured SaleVault; Solana: refused). Banxa requires it. Never the deposit address, which the provider issues after the session exists |
 
 **What "30 fraction digits" is and is not a promise about.** 30 is this service's own accepted
 bound, chosen to be wider than any asset's precision so that nothing is ever silently truncated on
@@ -107,9 +109,10 @@ deliberate, and it is the safe direction to fail — the alternative is parsing 
 one number and handing back a settlement surface committed to the other one. Send the same
 bytes on a retry that you sent the first time.
 
-The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount` or
-`walletAddress`, a buy carrying `cryptoAmount`, or either direction missing its own amount, is a
-local `400 MALFORMED_REQUEST` before any upstream call.
+The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount`, a buy carrying
+`cryptoAmount`, or either direction missing its own amount, is a local `400 MALFORMED_REQUEST`
+before any upstream call. A sell's `walletAddress` that is not a valid seller address for the
+asset's chain is a local `400 INVALID_ADDRESS`.
 
 **The Meld rail serves a sell.** Chainflip still refuses one with
 `400 Other{ DIRECTION_UNSUPPORTED }`, permanently: it has no fiat leg to pay a seller from, and no
@@ -304,6 +307,41 @@ hex), stored lowercased so comparisons are case-insensitive; an Asset Hub sell d
 normalised to the Polkadot prefix. Anything
 else for that code is recorded as malformed and never disclosed.
 
+### The off-ramp SaleVault
+
+On the Arbitrum lane a sale's Chainflip egress can be delivered to a **SaleVault** contract rather than
+straight to the provider, so the exact promised amount is paid and any shortfall is held for the seller
+rather than lost. The vault is deployment-wide: `GET /supported/offramp*` carry its `{chain, chainId,
+contract}` as a `vault` field, which the app reads to target its CCM. The CCM message the app encodes
+(`ref`, provider recipient, committed amount, the seller's Asset Hub home) is 128 bytes; `ref =
+keccak256(fundingRequestId)`.
+
+Two routes read and drive the vault for one of the caller's own sales, keyed by `fundingRequestId`:
+
+- `GET /offramp/sale/:fundingRequestId` reads the on-chain `Sale` (status, recipient, amount, home,
+  held) and this service's return record, persisting the refreshed state. A return that was broadcast
+  but never mined is released on a read once it is stale, so a fresh return can re-send it.
+- `POST /offramp/returns/:fundingRequestId` returns a **held** sale to its Asset Hub home, signed by the
+  operator. The return is claimed in the store before it is broadcast, so a retried or concurrent tap
+  cannot sign two; a broadcast that never leaves releases the claim so it can be re-sent. `held` funds
+  can only ever leave to the sale's own home, never to the operator.
+- The same route returns a **paid** sale whose provider status is `REFUNDED` (`returnRefund`). Only
+  the USDC the provider transferred to the vault from the address it was paid at, after the sale's
+  `SalePaid`, counts as its refund, capped by the sale amount and the vault's `unclaimed()` balance.
+  A sale can only be returned once, so the refund counts only once its newest transfer is about an
+  hour of blocks old. Until then the route answers 409 `SALE_REFUND_NOT_ARRIVED`. When another sale
+  was paid to the same provider address after this one, any refund could be either's, so the route
+  answers 409 `SALE_REFUND_AMBIGUOUS` and leaves it to an operator rather than guess.
+
+Every return is a Chainflip vault swap (Arbitrum USDC to Asset Hub USDT) whose `cf_parameters` this
+service never hand-encodes: it prices the swap from the swap backend's `/v2/quote` (the quoted price
+less `sale_vault.chainflip.slippage_bps`, scaled as Chainflip's X128 minimum price), then asks the
+backend's `/api/encodeCfParameters` for the bytes with the vault as the refund address, the same
+request the Chainflip SDK sends, so the backend names its own broker. Chainflip ignores a vault swap below its minimum deposit and confiscates the part
+above its maximum swap, so both limits are read live and a return outside them is refused with 409
+`SALE_RETURN_NOT_SWAPPABLE` rather than sent. A swap whose price is not met within
+`sale_vault.chainflip.retry_blocks` is refunded to the vault, where it lands as unclaimed USDC.
+
 ## `GET /assets`
 
 What Meld calls each asset this deployment serves, by this service's own name for it. Behind the
@@ -438,7 +476,7 @@ guarantee about what the provider's widget will allow.
 ```
 
 A sell sends the same body with `direction: "sell"`, `cryptoAmount` in place of `sourceAmount`,
-and no `walletAddress`:
+and, optionally, `walletAddress` as the seller's own sending address:
 
 ```json
 {
@@ -448,6 +486,7 @@ and no `walletAddress`:
   "fiat": "GBP",
   "destinationCurrencyCode": "DOT",
   "cryptoAmount": "12.3456789012",
+  "walletAddress": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
   "paymentMethodType": "PAYOUT_TO_BANK",
   "serviceProvider": "TRANSAK"
 }
@@ -488,10 +527,10 @@ Rejected as `REDIRECT_NOT_ALLOWED`, locally.
 }
 ```
 
-On a sell, `pinned` carries `cryptoAmount` and no `walletAddress` or `sourceAmount`: those are
-terms a sell does not commit, and they are absent rather than empty. **`cryptoAmount` is the term
+On a sell, `pinned` carries `cryptoAmount`, the seller's normalised `walletAddress` when one was
+sent, and no `sourceAmount`: absent terms are absent rather than empty. **`cryptoAmount` is the term
 a resuming client compares against.** On a buy the wallet address distinguishes two purchases in
-one corridor; a sell has none, so this is the only thing between two sales of the same asset in
+one corridor; a sell may have none, so this is the only thing between two sales of the same asset in
 the same corridor, and a mismatch must be treated as "this is a different sale", not a warning.
 
 `serviceProviderWidgetUrl` is the provider's capture page, always present. `widgetUrl` is Meld's
@@ -601,7 +640,8 @@ for another caller's alike.
 }
 ```
 
-`direction` is always present. On a sell row, `walletAddress` and `sourceAmount` are absent and
+`direction` is always present. On a sell row, `sourceAmount` is absent, `walletAddress` is the
+seller's own address when one was pinned, and
 `cryptoAmount` carries the committed crypto at full precision; see `direction` above for why that
 echo is load-bearing rather than informational. A sell moves through the **same** eight states a
 buy does: the direction is a term of the request, not a stage of its life.

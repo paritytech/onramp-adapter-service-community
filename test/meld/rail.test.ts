@@ -182,6 +182,17 @@ describe('MeldRail', () => {
     expect(session.expiresAt).toBeUndefined();
   });
 
+  it("hands a sell's own sending address to the client, and none when absent", async () => {
+    const { stub, createWidgetSession } = client();
+    const rail = new MeldRail(stub);
+
+    await rail.createSession(railSellSessionInput({ walletAddress: ALICE }));
+    await rail.createSession(railSellSessionInput());
+
+    expect(createWidgetSession).toHaveBeenNthCalledWith(1, expect.objectContaining({ direction: 'sell', walletAddress: ALICE }));
+    expect((createWidgetSession.mock.calls[1] as unknown[])[0]).toMatchObject({ walletAddress: undefined });
+  });
+
   it('maps a neutral quote onto the Meld client and echoes the canonical requested shape', async () => {
     const { stub, quote } = client();
     const rail = new MeldRail(stub);
@@ -578,6 +589,22 @@ describe('MeldRail.observation', () => {
         });
         expect(await rail.observation().finder(sellRecord())).not.toHaveProperty('deposit');
       }
+    });
+
+    it("never discloses the seller's own address as the deposit", async () => {
+      // Meld may echo the walletAddress a sell was opened with, and the crypto must not go back to it.
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT' };
+      const echoed = sellClient({ id: 'tx-1', status: 'PENDING', ...terms, cryptoDetails: { destinationWalletAddress: ALICE_PREFIX_42 } });
+      expect(await echoed.rail.observation().finder(sellRecord({ wallet_address: ALICE }))).not.toHaveProperty('deposit');
+
+      const other = sellClient({ id: 'tx-1', status: 'PENDING', ...terms, cryptoDetails: { destinationWalletAddress: BOB } });
+      expect((await other.rail.observation().finder(sellRecord({ wallet_address: ALICE })))?.deposit?.address).toBe(BOB);
+
+      // An EVM echo in another casing is still the seller's own address.
+      const vault = '0x81949127042930F8e7A1723385A2F76213C72ee9';
+      const evm = sellClient({ id: 'tx-1', status: 'PENDING', sourceAmount: '30', sourceCurrencyCode: 'USDC_ARBITRUM', cryptoDetails: { destinationWalletAddress: vault } });
+      const arbitrum = sellRecord({ destination_currency_code: 'USDC_ARBITRUM', wallet_address: vault.toLowerCase() });
+      expect(await evm.rail.observation().finder(arbitrum)).not.toHaveProperty('deposit');
     });
 
     it('discloses nothing when the two address fields name different accounts', async () => {

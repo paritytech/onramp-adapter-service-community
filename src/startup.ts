@@ -28,6 +28,8 @@ import { chainReader } from './personhood/chain.js';
 import { commitmentsFrom } from './personhood/source.js';
 import { validateWithCommitment } from './personhood/verifiablejs.js';
 import { resolveSecret } from './secret.js';
+import { SaleVaultClient } from './salevault/chain.js';
+import { ReturnSwapEncoder } from './salevault/chainflip.js';
 import { buildServer } from './server.js';
 
 // The asset the refresh walks in both directions; the table is crypto-keyed so more are additive.
@@ -94,6 +96,31 @@ export async function start(
 
   const meld = new MeldClient(cfg.meld.base_url, apiKey, cfg.meld.api_version, cfg.meld.timeout_ms);
   const meldRail = new MeldRail(meld);
+
+  // The off-ramp SaleVault client, built only when the lane is configured. Resolved before the store opens so a missing key leaves nothing to close.
+  let saleVault: SaleVaultClient | undefined;
+  let returnEncoder: ReturnSwapEncoder | undefined;
+  if (cfg.sale_vault !== undefined) {
+    const operatorSecret = await resolveSecret(cfg.sale_vault.operator_key, {
+      minBytes: 32,
+      name: 'sale_vault.operator_key',
+    });
+    saleVault = SaleVaultClient.create(
+      {
+        rpcUrl: cfg.sale_vault.rpc_url,
+        chainId: BigInt(cfg.sale_vault.chain_id),
+        contract: cfg.sale_vault.contract,
+      },
+      () => Uint8Array.from(Buffer.from(operatorSecret.expose().replace(/^0x/, ''), 'hex')),
+    );
+    const cf = cfg.sale_vault.chainflip;
+    returnEncoder = ReturnSwapEncoder.create({
+      rpcUrl: cf.rpc_url,
+      backendUrl: cf.backend_url,
+      slippageBps: cf.slippage_bps,
+      retryBlocks: cf.retry_blocks,
+    });
+  }
 
   // Live capability discovery over Meld's route catalog. Reading it at runtime is what makes the
   // supported-region set and the amount bounds dynamic instead of hand-maintained. `account` scope
@@ -167,7 +194,7 @@ export async function start(
     app = await buildServer(
       cfg,
       (audit) =>
-        new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery),
+        new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery, saleVault, returnEncoder),
       personhood,
       logDestination,
     );

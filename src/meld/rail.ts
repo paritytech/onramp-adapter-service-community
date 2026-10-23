@@ -115,6 +115,7 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
             cryptoCurrencyCode: input.destinationCode,
             fiatCurrencyCode: input.fiat,
             cryptoAmount: input.cryptoAmount,
+            walletAddress: input.walletAddress,
             countryCode: input.countryCode,
             paymentMethodType: input.paymentMethodType,
             serviceProvider: input.serviceProvider,
@@ -195,7 +196,8 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
  * **The address**: `cryptoDetails.destinationWalletAddress ?? offrampDestinationWalletAddress`,
  * as Meld advises for either side of `Meld-Version` 2025-03-04, a blank one read as absent. Both
  * present and naming different accounts discloses nothing. Never `sourceWalletAddress`,
- * `sessionWalletAddress` or `walletAddress`, which are the seller's own.
+ * `sessionWalletAddress` or `walletAddress`, which are the seller's own, and never one naming the
+ * row's own `wallet_address`.
  *
  * **The amount**: the top-level `sourceAmount`, not `serviceProviderDetails.details.cryptoAmount`,
  * which is untyped per-provider passthrough. Withheld while the transaction carries none.
@@ -217,7 +219,12 @@ function depositFrom(record: FundingRecord, txn: MeldTransaction): RailDeposit |
   const named = given(details?.destinationWalletAddress);
   const former = given(details?.offrampDestinationWalletAddress);
   if (named !== undefined && former !== undefined && !sameAccount(named, former, record.destination_currency_code)) return undefined;
-  const address = named ?? former;
+  const disclosed = named ?? former;
+  // Meld may echo the seller's own address back, which is never where the crypto goes.
+  const address =
+    disclosed !== undefined && record.wallet_address !== undefined && sameAccount(disclosed, record.wallet_address, record.destination_currency_code)
+      ? undefined
+      : disclosed;
   const amount = given(txn.sourceAmount);
   const currency = given(txn.sourceCurrencyCode);
   if (address === undefined || amount === undefined || currency === undefined) return undefined;

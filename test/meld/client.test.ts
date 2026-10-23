@@ -198,9 +198,9 @@ describe('createWidgetSession', () => {
     // `sessionType` is `SELL` (the enum is `BUY, SELL, TRANSFER`); `sourceCurrencyCode` is the
     // crypto and `destinationCurrencyCode` the fiat, which the server enforces rather than
     // merely accepts; `sourceAmount` is the crypto committed, at a precision the fiat field
-    // could not hold; there is no `walletAddress` at all, because Meld does not require one
-    // on a SELL and issues the deposit address itself; and `redirectFlow` asks the providers
-    // that honour it for Meld's preferred off-ramp flow.
+    // could not hold. There is no `walletAddress` when the sell pinned none, and Meld issues the
+    // deposit address itself. And `redirectFlow` asks the providers that honour it for Meld's
+    // preferred off-ramp flow.
     expect(JSON.parse(sentInit(fetchMock).body as string)).toEqual({
       sessionType: 'SELL',
       sessionData: {
@@ -249,6 +249,15 @@ describe('createWidgetSession', () => {
 
     const body = sentBody(fetchMock) as { sessionData: Record<string, unknown> };
     expect(body.sessionData).not.toHaveProperty('walletAddress');
+  });
+
+  it("sends a sell's own sending address when one is pinned", async () => {
+    // Banxa refuses a sell without it: 400 CRYPTO_INVALID_DESTINATION_WALLET.
+    const fetchMock = stub(200, session);
+    await client().createWidgetSession({ ...sellParams(), walletAddress: '1abc' });
+
+    const body = sentBody(fetchMock) as { sessionData: Record<string, unknown> };
+    expect(body.sessionData.walletAddress).toBe('1abc');
   });
 
   it('derives sessionType from the direction rather than from any other field', async () => {
