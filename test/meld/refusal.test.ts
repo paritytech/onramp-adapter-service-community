@@ -23,3 +23,19 @@ describe('the threshold a Meld limit message names', () => {
     });
   });
 });
+
+describe('an amount a provider turned down without naming a bound', () => {
+  it('is its own code, so the buyer is asked for a different amount', () => {
+    expect(refusalOf('Invalid currency amount', 'INVALID_AMOUNT').failure).toEqual({
+      tag: 'Other',
+      value: { code: 'AMOUNT_REJECTED', message: 'The provider cannot take this amount.' },
+    });
+  });
+
+  it('leaves a combination the provider declines as the generic refusal', () => {
+    expect(refusalOf('Incompatible request: Body does not match service providers', 'INCOMPATIBLE_REQUEST').failure).toEqual({
+      tag: 'Other',
+      value: { code: 'PROVIDER_REJECTED', message: 'The provider declined this request.' },
+    });
+  });
+});

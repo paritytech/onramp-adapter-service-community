@@ -122,6 +122,16 @@ export function meld400(error: MeldHttpError): Refusal {
     return reject({ tag: coded, ...(detail === undefined ? {} : (threshold(detail) ?? {})) }, operatorDetail(error));
   }
 
+  // A provider turned the amount down without naming a bound (Meld's `INVALID_AMOUNT`: "a provider
+  // rejected the amount for this route"). Still the amount's fault rather than the route's, so it
+  // gets its own code: the remedy is a different amount, which `PROVIDER_REJECTED` cannot say.
+  if (error.code === 'INVALID_AMOUNT') {
+    return reject(
+      { tag: 'Other', value: { code: 'AMOUNT_REJECTED', message: 'The provider cannot take this amount.' } },
+      operatorDetail(error),
+    );
+  }
+
   if (detail !== undefined) {
     const phrase = detail.toLowerCase();
     if (phrase.includes('below the minimum')) {
