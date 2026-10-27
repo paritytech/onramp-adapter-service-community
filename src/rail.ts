@@ -142,13 +142,14 @@ export interface RailBuySession extends RailSessionCommon {
 /**
  * Opening a sell: the seller commits `cryptoAmount` and the provider issues a deposit address.
  *
- * No `walletAddress`, and that is the point. The address on a sell is the provider's, disclosed
- * after the session exists, so a caller cannot supply one and a request that tried to would be
- * naming a field nobody reads (`contract.ts` refuses it rather than ignoring it).
+ * `walletAddress` is the seller's own, never where the crypto goes: the account it is sent from,
+ * which the provider refunds to. The deposit address is the provider's, disclosed after the
+ * session exists. Present on every Asset Hub lane; see `normalizeSellerAddress`.
  */
 export interface RailSellSession extends RailSessionCommon {
   direction: 'sell';
   cryptoAmount: string;
+  walletAddress?: string | undefined;
 }
 
 /** Everything the session leg needs from a wire `createSessionRequest`. See `RailQuote`. */

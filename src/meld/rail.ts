@@ -115,6 +115,7 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
             cryptoCurrencyCode: input.destinationCode,
             fiatCurrencyCode: input.fiat,
             cryptoAmount: input.cryptoAmount,
+            walletAddress: input.walletAddress,
             countryCode: input.countryCode,
             paymentMethodType: input.paymentMethodType,
             serviceProvider: input.serviceProvider,

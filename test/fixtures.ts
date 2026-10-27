@@ -153,6 +153,8 @@ export const sellRequest = (overrides: Record<string, unknown> = {}) => ({
   country: 'GB',
   paymentMethodType: 'PAYOUT_TO_BANK',
   serviceProvider: 'TRANSAK',
+  // The seller's own Asset Hub account: required on an Asset Hub lane (`normalizeSellerAddress`).
+  walletAddress: ALICE,
   ...overrides,
 });
 

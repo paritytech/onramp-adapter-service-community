@@ -343,6 +343,12 @@ export interface SellWidgetSessionParams extends WidgetSessionCommon {
   fiatCurrencyCode: string;
   /** The exact crypto committed. Meld's `sourceAmount` on a sell, and required. */
   cryptoAmount: string;
+  /**
+   * The seller's own address, the one the crypto is sent from: Meld's `sessionData.walletAddress`
+   * on a sell, and where the provider refunds. Banxa refuses a sell without it
+   * (`CRYPTO_INVALID_DESTINATION_WALLET`). Absent leaves the key out of the body.
+   */
+  walletAddress?: string | undefined;
 }
 
 type WidgetSessionParams = BuyWidgetSessionParams | SellWidgetSessionParams;
@@ -548,22 +554,21 @@ export class MeldClient {
     // destination is the fiat, which the server enforces rather than merely accepts (sending
     // fiat as source on a SELL answers "Source currency is not a valid crypto currency").
     //
-    // `walletAddress` is in this object rather than below it because it exists on exactly one
-    // side. Spreading it means a sell's body does not carry the key at all, as opposed to
-    // carrying it empty — and an empty one would be accepted, since this endpoint takes unknown
-    // and meaningless fields with a `200`.
+    // `walletAddress` is in this object rather than below it because it means different things on
+    // the two sides: a buy's is the delivery address, a sell's the seller's own (sent from, and
+    // refunded to). A sell without one leaves the key out of the body rather than sending it
+    // empty, since this endpoint takes unknown and meaningless fields with a `200`.
     const legs =
       params.direction === 'sell'
         ? {
             sourceCurrencyCode: params.cryptoCurrencyCode,
             destinationCurrencyCode: params.fiatCurrencyCode,
             sourceAmount: params.cryptoAmount,
-            // Plain `undefined`, as `serviceProvider` and `redirectUrl` below are: this object
-            // is only ever JSON-serialised and `JSON.stringify` drops an undefined value, so the
-            // key is genuinely absent from the sell body. Written this way rather than as a
-            // conditional spread so both branches emit the same field in the same position, and
-            // the bytes a buy POSTs do not depend on which branch produced them.
-            walletAddress: undefined,
+            // Plain assignment, as `serviceProvider` and `redirectUrl` below are: this object is
+            // only ever JSON-serialised and `JSON.stringify` drops an undefined value, so a sell
+            // without one carries no key at all. Written this way rather than as a conditional
+            // spread so both branches emit the same field in the same position.
+            walletAddress: params.walletAddress,
           }
         : {
             sourceCurrencyCode: params.sourceCurrency,

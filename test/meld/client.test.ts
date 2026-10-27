@@ -251,6 +251,15 @@ describe('createWidgetSession', () => {
     expect(body.sessionData).not.toHaveProperty('walletAddress');
   });
 
+  it('sends the seller\'s own address on a sell, which the provider refunds to', async () => {
+    // Banxa refuses a sell without it (`CRYPTO_INVALID_DESTINATION_WALLET`).
+    const fetchMock = stub(200, session);
+    await client().createWidgetSession({ ...sellParams(), walletAddress: '15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5' });
+
+    const body = sentBody(fetchMock) as { sessionData: Record<string, unknown> };
+    expect(body.sessionData.walletAddress).toBe('15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5');
+  });
+
   it('derives sessionType from the direction rather than from any other field', async () => {
     // The two bodies above pin `BUY` and `SELL`, which a hardcoded literal cannot both satisfy.
     // This adds the case they do not cover: two sells differing in every value still say SELL,

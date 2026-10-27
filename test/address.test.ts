@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { encodeAddress } from '@polkadot/util-crypto';
 
-import { canonicalizeDisclosedAddress, normalizeAddress } from '../src/address.js';
+import { canonicalizeDisclosedAddress, normalizeAddress, normalizeSellerAddress } from '../src/address.js';
 import { Refusal } from '../src/contract.js';
 
 // Alice, the canonical well-known account.
@@ -112,5 +112,39 @@ describe('canonicalizeDisclosedAddress for an EVM sell-only code', () => {
   it('is not accepted for the other codes', () => {
     expect(canonicalizeDisclosedAddress(MIXED, 'USDC_SOLANA')).toBeUndefined();
     expect(canonicalizeDisclosedAddress(MIXED, 'DOT')).toBeUndefined();
+  });
+});
+
+describe('normalizeSellerAddress', () => {
+  // The seller's own address on a sell: sent from, and refunded to.
+  const refusalCode = (run: () => unknown) => {
+    try {
+      run();
+    } catch (e) {
+      return e instanceof Refusal && e.failure.tag === 'Other' ? e.failure.value.code : 'not a refusal';
+    }
+    return 'no refusal';
+  };
+
+  it('requires one on an Asset Hub lane, and normalises it to the Polkadot prefix', () => {
+    const key = new Uint8Array(32).fill(7);
+    expect(normalizeSellerAddress(encodeAddress(key, 42), 'DOT')).toBe(encodeAddress(key, 0));
+    expect(refusalCode(() => normalizeSellerAddress(undefined, 'DOT'))).toBe('INVALID_ADDRESS');
+    expect(refusalCode(() => normalizeSellerAddress(undefined, 'USDT_DOT'))).toBe('INVALID_ADDRESS');
+  });
+
+  it('takes none on another chain, and checks one in that chain\'s form', () => {
+    expect(normalizeSellerAddress(undefined, 'USDC_SOLANA')).toBeUndefined();
+    expect(normalizeSellerAddress('11111111111111111111111111111111', 'USDC_SOLANA')).toBe(
+      '11111111111111111111111111111111',
+    );
+    expect(normalizeSellerAddress('0xABCDEF0123456789abcdef0123456789ABCDEF01', 'USDC_ARBITRUM')).toBe(
+      '0xabcdef0123456789abcdef0123456789abcdef01',
+    );
+    expect(refusalCode(() => normalizeSellerAddress('0x1234', 'USDC_ARBITRUM'))).toBe('INVALID_ADDRESS');
+    // An Asset Hub address is not a Solana one: refused rather than refunded to.
+    expect(refusalCode(() => normalizeSellerAddress(encodeAddress(new Uint8Array(32).fill(7), 0), 'USDC_SOLANA'))).toBe(
+      'INVALID_ADDRESS',
+    );
   });
 });

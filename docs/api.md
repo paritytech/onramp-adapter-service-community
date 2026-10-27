@@ -82,7 +82,7 @@ reinterpreted:
 | --- | --- | --- |
 | amount field | `sourceAmount`, the fiat charged | `cryptoAmount`, the crypto sold |
 | format | decimal, at most **2** fraction digits | exact decimal, kept as a string end to end and never rounded or parsed; **this service accepts** up to 30 fraction digits (see the note below on what the provider has been observed to accept) |
-| `walletAddress` | **required** on `/session` | **refused**: the provider issues the deposit address after the session exists |
+| `walletAddress` | **required** on `/session`: where the crypto is delivered | the seller's **own** address, the one the crypto is sent from and the provider refunds to, never a destination (the provider issues the deposit address after the session exists). **Required** on an Asset Hub lane (`DOT`, `USDT_DOT`, `USDC_DOT`); optional on another chain, and checked in that chain's form. A missing or malformed one is `400 INVALID_ADDRESS` |
 
 **What "30 fraction digits" is and is not a promise about.** 30 is this service's own accepted
 bound, chosen to be wider than any asset's precision so that nothing is ever silently truncated on
@@ -107,9 +107,9 @@ deliberate, and it is the safe direction to fail — the alternative is parsing 
 one number and handing back a settlement surface committed to the other one. Send the same
 bytes on a retry that you sent the first time.
 
-The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount` or
-`walletAddress`, a buy carrying `cryptoAmount`, or either direction missing its own amount, is a
-local `400 MALFORMED_REQUEST` before any upstream call.
+The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount`, a buy carrying
+`cryptoAmount`, or either direction missing its own amount, is a local `400 MALFORMED_REQUEST`
+before any upstream call.
 
 **The Meld rail serves a sell.** Chainflip still refuses one with
 `400 Other{ DIRECTION_UNSUPPORTED }`, permanently: it has no fiat leg to pay a seller from, and no
@@ -443,8 +443,9 @@ guarantee about what the provider's widget will allow.
 }
 ```
 
-A sell sends the same body with `direction: "sell"`, `cryptoAmount` in place of `sourceAmount`,
-and no `walletAddress`:
+A sell sends the same body with `direction: "sell"` and `cryptoAmount` in place of
+`sourceAmount`. Its `walletAddress` is the seller's own, sent to Meld as `sessionData.walletAddress`
+(Banxa refuses a sell without it, `CRYPTO_INVALID_DESTINATION_WALLET`):
 
 ```json
 {
@@ -454,6 +455,7 @@ and no `walletAddress`:
   "fiat": "GBP",
   "destinationCurrencyCode": "DOT",
   "cryptoAmount": "12.3456789012",
+  "walletAddress": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
   "paymentMethodType": "PAYOUT_TO_BANK",
   "serviceProvider": "TRANSAK"
 }
@@ -494,11 +496,10 @@ Rejected as `REDIRECT_NOT_ALLOWED`, locally.
 }
 ```
 
-On a sell, `pinned` carries `cryptoAmount` and no `walletAddress` or `sourceAmount`: those are
-terms a sell does not commit, and they are absent rather than empty. **`cryptoAmount` is the term
-a resuming client compares against.** On a buy the wallet address distinguishes two purchases in
-one corridor; a sell has none, so this is the only thing between two sales of the same asset in
-the same corridor, and a mismatch must be treated as "this is a different sale", not a warning.
+On a sell, `pinned` carries `cryptoAmount`, the seller's `walletAddress` when one was sent, and no
+`sourceAmount`. **`cryptoAmount` is the term a resuming client compares against.** One seller's
+address is the same across their sales, so it does not tell two sales in one corridor apart; the
+amount does, and a mismatch must be treated as "this is a different sale", not a warning.
 
 `serviceProviderWidgetUrl` is the provider's capture page, always present. `widgetUrl` is Meld's
 own hosted widget for the session, present only when Meld returns one; a product embedding Meld's
@@ -607,7 +608,8 @@ for another caller's alike.
 }
 ```
 
-`direction` is always present. On a sell row, `walletAddress` and `sourceAmount` are absent and
+`direction` is always present. On a sell row, `walletAddress` is the seller's own (absent when none
+was sent), `sourceAmount` is absent, and
 `cryptoAmount` carries the committed crypto at full precision; see `direction` above for why that
 echo is load-bearing rather than informational. A sell moves through the **same** eight states a
 buy does: the direction is a term of the request, not a stage of its life.

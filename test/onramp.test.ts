@@ -1145,6 +1145,7 @@ describe('Onramp.create', () => {
         rail: 'meld',
         direction: 'sell',
         destinationCurrencyCode: 'DOT',
+        walletAddress: ALICE,
         cryptoAmount: '12.3456789012',
         fiat: 'GBP',
         reason: 'Other',
@@ -2030,11 +2031,11 @@ describe('a live request whose payment page has closed', () => {
 });
 
 describe('a sell request', () => {
-  /** The sell request as the schema hands it over: no address, no fiat amount, exact crypto. */
+  /** The sell request as the schema hands it over: the seller's own address, no fiat amount, exact crypto. */
   const sell = (overrides: Record<string, unknown> = {}) =>
     sellRequest(overrides) as unknown as Parameters<Onramp['createSession']>[1];
 
-  it('reaches the rail carrying the crypto it committed, and no address', async () => {
+  it('reaches the rail carrying the crypto it committed, and the seller\'s own address', async () => {
     // The whole of this step: a sell is parsed, validated, reserved and handed to a rail. What
     // the rail then does with it is the rail's answer, not a parse failure dressed up as one.
     const meld = new FakeMeld();
@@ -2046,15 +2047,37 @@ describe('a sell request', () => {
       direction: 'sell',
       destinationCode: 'DOT',
       cryptoAmount: '12.3456789012',
+      // The account the crypto is sent from, which the provider refunds to: never a destination.
+      walletAddress: ALICE,
       fiat: 'GBP',
       countryCode: 'GB',
       paymentMethodType: 'PAYOUT_TO_BANK',
       serviceProvider: 'TRANSAK',
       clientReference: 'funding-1',
       redirectUrl: undefined,
+      clientIpAddress: undefined,
     });
-    // Nothing invents an address for the leg that has none.
     expect(asBuy(meld.calls[0])).toBeUndefined();
+  });
+
+  it('refuses an Asset Hub sell with no seller address, before any rail call', async () => {
+    // Banxa refuses a sell without one, and it is where a refund goes.
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    const refusal = await failureOf(() => service.createSession(SUBJECT, sell({ walletAddress: undefined }), REQUEST_ID));
+
+    expect(refusal).toMatchObject({ tag: 'Other', value: { code: 'INVALID_ADDRESS' } });
+    expect(meld.calls).toHaveLength(0);
+  });
+
+  it('pins the seller address in its canonical Asset Hub form', async () => {
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    await service.createSession(SUBJECT, sell({ walletAddress: ALICE_PREFIX_42 }), REQUEST_ID);
+
+    expect(meld.calls[0]).toMatchObject({ direction: 'sell', walletAddress: ALICE });
   });
 
   it('does not run the fiat limit gate, which would compare crypto against fiat', async () => {
@@ -2084,7 +2107,7 @@ describe('a sell request', () => {
     const row = await funding.byId(created.fundingRequestId);
 
     expect(row).toMatchObject({ direction: 'sell', crypto_amount: '12.3456789012', fiat: 'GBP' });
-    expect(row?.wallet_address).toBeUndefined();
+    expect(row?.wallet_address).toBe(ALICE);
     expect(row?.source_amount).toBeUndefined();
   });
 
@@ -2100,13 +2123,14 @@ describe('a sell request', () => {
 
     expect(created.pinned).toEqual({
       destinationCurrencyCode: 'DOT',
+      walletAddress: ALICE,
       cryptoAmount: '12.3456789012',
       fiat: 'GBP',
       country: 'GB',
     });
     const dto = toFundingRequestDto(must(row, 'the sell row'), NOW);
     expect(dto.cryptoAmount).toBe('12.3456789012');
-    expect(dto.walletAddress).toBeUndefined();
+    expect(dto.walletAddress).toBe(ALICE);
   });
 
   it('audits the direction, with the crypto amount in place of a fiat one', async () => {
@@ -2116,8 +2140,7 @@ describe('a sell request', () => {
     await service.createSession(SUBJECT, sell(), REQUEST_ID);
 
     const created = audit.events.find((e) => e.event === 'session.created');
-    expect(created).toMatchObject({ direction: 'sell', cryptoAmount: '12.3456789012' });
-    expect(created?.walletAddress).toBeUndefined();
+    expect(created).toMatchObject({ direction: 'sell', cryptoAmount: '12.3456789012', walletAddress: ALICE });
     expect(created?.sourceAmount).toBeUndefined();
   });
 
