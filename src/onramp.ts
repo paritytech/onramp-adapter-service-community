@@ -420,6 +420,8 @@ export class Onramp {
     subject: Subject,
     request: CreateSessionRequest,
     requestId: string,
+    /** The end user's public address, for the provider; see `publicClientIp`. */
+    clientIpAddress?: string,
   ): Promise<CreateSessionResponse> {
     const rail = this.rail(request.rail);
     const name = rail.provider;
@@ -567,6 +569,7 @@ export class Onramp {
         paymentMethodType: request.paymentMethodType,
         serviceProvider: request.serviceProvider,
         redirectUrl,
+        clientIpAddress,
         // This record's id, not the caller's key (see `RailSessionInput.clientReference`).
         clientReference: fundingId,
       };

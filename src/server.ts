@@ -24,6 +24,7 @@ import { z } from 'zod';
 import type { AuditLog } from './audit.js';
 import { callerAuth } from './auth.js';
 import { callerGate } from './caller.js';
+import { publicClientIp } from './client-ip.js';
 import { toOriginMatcher, type Config } from './config.js';
 import type { PersonhoodService } from './personhood.js';
 import {
@@ -344,7 +345,9 @@ export async function buildServer(
   app.post('/session', asCaller, async (request, reply) => {
     const subject = gate.subjectOf(request);
     const body = parse(createSessionRequest, request.body);
-    return reply.code(201).send(await onramp.createSession(subject, body, request.id));
+    return reply
+      .code(201)
+      .send(await onramp.createSession(subject, body, request.id, publicClientIp(request.ip)));
   });
 
   /**

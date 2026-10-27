@@ -407,6 +407,12 @@ on `sessionData`, not per-field `*Locked` booleans, which are silently ignored. 
 sent locked: `cryptoCurrency`, `destinationCurrencyCode`, `walletAddress`, `sourceAmount`,
 `sourceCurrencyCode`, `paymentMethodType`.
 
+**The caller's address is passed on** as `sessionData.clientIpAddress`, buy and sell. Meld asks for
+the end user's public address on every session, and some providers refuse one without it: Transak
+answers `CLIENT_IP_ADDRESS_REQUIRED`. Only a public address is sent; a private, loopback or
+link-local one (an untrusted ingress hop, or local development) is left out. It is the forwarded
+client only when `server.trusted_proxy_cidrs` trusts the hop in front.
+
 **`country` is echoed, not locked.** Meld exposes no `lockFields` entry for it, so a buyer who
 changes jurisdiction inside Meld's flow is not stopped here. `pinned` records what was committed,
 not necessarily what the buyer transacted under. See threat model R11.

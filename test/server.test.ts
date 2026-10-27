@@ -287,6 +287,30 @@ describe('the rate-limit bucket', () => {
       payload: quoteRequestBody(),
     });
 
+  it('hands the forwarded public address to the session, and nothing for a private one', async () => {
+    // The provider wants the buyer's address, not the ingress's. Behind a trusted hop
+    // `request.ip` is the forwarded client; a private address is this service's own network.
+    const seen: unknown[] = [];
+    const app = await serve(
+      async (...args: unknown[]) => {
+        seen.push(args[3]);
+        return RESPONSE;
+      },
+      config({ server: { ...SERVER, trusted_proxy_cidrs: ['127.0.0.1/32'] } }),
+    );
+    const open = (forwardedFor: string) =>
+      app.inject({
+        method: 'POST',
+        url: '/session',
+        headers: { ...DEV_HEADERS, 'x-forwarded-for': forwardedFor },
+        payload: createRequest(),
+      });
+
+    expect((await open('203.0.113.7')).statusCode).toBe(201);
+    expect((await open('10.0.0.8')).statusCode).toBe(201);
+    expect(seen).toEqual(['203.0.113.7', undefined]);
+  });
+
   it('separates callers by forwarded address when a proxy hop is trusted', async () => {
     // The point of `trusted_proxy_cidrs`. The threat model requires TLS terminated in front, so
     // with no trusted hop every request's socket peer is the proxy and the whole product shares

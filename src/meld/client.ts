@@ -297,6 +297,13 @@ interface WidgetSessionCommon {
    * unchecked value here is an open redirect handed to someone who has just paid.
    */
   redirectUrl?: string | undefined;
+  /**
+   * Sent as `sessionData.clientIpAddress`: the end user's public address. Meld's guidance is to
+   * always send it, and some providers refuse a session without it (Transak answers
+   * `CLIENT_IP_ADDRESS_REQUIRED`, buy and sell alike). Absent when the caller's address is not a
+   * public one.
+   */
+  clientIpAddress?: string | undefined;
 }
 
 /** Opening a buy: the buyer pays fiat and the crypto is delivered to an address they named. */
@@ -639,6 +646,8 @@ export class MeldClient {
         // and JSON.stringify drops an undefined value, so a conditional spread would render the
         // identical bytes.
         redirectUrl: params.redirectUrl,
+        // Same plain assignment: absent from the bytes when the caller's address is not public.
+        clientIpAddress: params.clientIpAddress,
         // A sell only: Meld's preferred off-ramp flow. The provider runs KYC and takes the payout
         // details, then sends the seller back to `redirectUrl` instead of showing its own deposit
         // address, because here the funds are sent for the seller once the address is read off

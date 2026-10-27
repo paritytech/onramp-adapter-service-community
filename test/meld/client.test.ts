@@ -309,6 +309,20 @@ describe('createWidgetSession', () => {
     );
   });
 
+  it('sends the client address in sessionData, and omits the key entirely without one', async () => {
+    // Transak refuses a session without it (`CLIENT_IP_ADDRESS_REQUIRED`), buy and sell alike.
+    const withIp = stub(200, session);
+    await client().createWidgetSession({ ...params(), clientIpAddress: '203.0.113.7' });
+    expect(sentBody(withIp)).toMatchObject({ sessionData: { clientIpAddress: '203.0.113.7' } });
+
+    vi.unstubAllGlobals();
+    const without = stub(200, session);
+    await client().createWidgetSession(params());
+    expect((sentBody(without) as { sessionData: Record<string, unknown> }).sessionData).not.toHaveProperty(
+      'clientIpAddress',
+    );
+  });
+
   it.each([
     ['an empty session id', { id: '', serviceProviderWidgetUrl: 'https://widget.example/s/1' }],
     ['a settlement URL that is not a URL', { id: 'meld-1', serviceProviderWidgetUrl: 'not-a-url' }],
