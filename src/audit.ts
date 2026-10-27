@@ -41,15 +41,20 @@ export interface AuditEvent {
   requestId: string;
   destinationCurrencyCode: string;
   /**
-   * The delivery address, on a buy.
+   * The delivery address on a buy, or the seller's own sending address on a sell.
    *
    * Optional as of the sell release, and this is a deliberate change to a contract that ships
    * off-box: a consumer of this stream that read `walletAddress` as always-present now has to
-   * handle its absence. A sell has no caller-supplied address at all (the provider issues the
-   * deposit address later), so the alternative was emitting an empty string, which is a claim
-   * about a destination that was never pinned, on the one record a dispute is answered from.
+   * handle its absence. On a sell it is the seller's own sending address the service derived,
+   * present only when there is one (the provider issues the deposit address later), so the
+   * alternative was emitting an empty string, a claim about an address never pinned, on the one
+   * record a dispute is answered from.
    */
   walletAddress?: string;
+  /** The seller's own account on a sell, when one was sent. The wallet address is derived from it. */
+  sellerAccount?: string;
+  /** The seller's claimer on an Arbitrum sell, the address its sale vault proxy releases to. */
+  sellerClaimer?: string;
   /**
    * The fiat committed, on a buy. Absent on a sell, which commits crypto and only estimates the
    * fiat, so a number here would be an estimate presented as a term.

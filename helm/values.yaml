@@ -220,6 +220,38 @@ supported:
     # - { asset: usdc@arbitrum }
     # - { asset: usdc@solana }
 
+# The Arbitrum sale vault proxy and its keeper. Disabled, Arbitrum sells answer 503 and the sale routes 503.
+sale_vault_proxy:
+  enabled: false
+  # 42161 in production, 421614 for Arbitrum Sepolia
+  chain_id: 421614
+  # The deployed SaleVaultProxyFactory, required when enabled, the Arbitrum Sepolia one here
+  factory: "0xe5ab3776f482040f81f53a1080ca48e6313ee5ab"
+  # Earlier factories on the same chain whose proxies are still watched and served, each { factory, chainflip_vault, usdc }
+  retired: []
+  # Chainflip's Arbitrum Vault and USDC, Perseverance values here, checked against the factory and live Chainflip
+  chainflip_vault: "0x2bb150e6d4366a1bdbc4275d1f35892cd63f27e3"
+  usdc: "0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d"
+  rpc_url: https://sepolia-rollup.arbitrum.io/rpc
+  # The keeper and chainflip tuning values equal the schema defaults, scripts/check-chart.mjs asserts it
+  keeper:
+    enabled: true
+    interval_ms: 60000
+    batch: 25
+    resend_ms: 600000
+    # The most blocks one eth_getLogs spans, at or under the RPC's own range limit
+    log_range: 10000
+    # USDC, the least free factory balance a skim sends, a dust guard since the gas is far smaller
+    min_skim: "5"
+    # ETH, below which each pass logs an error
+    min_eth: "0.002"
+  chainflip:
+    # Perseverance for Sepolia, mainnet in production, the swap backend follows chain_id
+    rpc_url: https://archive.perseverance.chainflip.io
+    quote_margin_bps: 50
+    # How long one read of Chainflip's live limits and broker registration is reused
+    limits_ttl_ms: 30000
+
 # The background worker that advances in-flight funding requests.
 worker:
   interval_ms: 15000
@@ -280,7 +312,7 @@ serviceAccount:
 # Where secret files are mounted (config.json references these paths).
 secretMountPath: /run/secrets
 
-# The two runtime secrets, mounted as files so they never appear in `env` or the image.
+# The runtime secrets, mounted as files so they never appear in `env` or the image.
 #
 # Declared here with empty `existingSecret` rather than omitted: the templates reference these
 # paths, and leaving the key absent made `helm template` with default values fail on a nil
@@ -294,6 +326,10 @@ secrets:
   jwtKey:
     existingSecret: ""
     key: jwt-key
+  # Mounted when existingSecret is set, required when sale_vault_proxy.enabled
+  saleVaultProxyKeeperKey:
+    existingSecret: ""
+    key: sale-vault-proxy-keeper-key
 
 # `ephemeral-storage` is still bounded, and its justification has changed twice. It used to be the
 # ceiling on the unbounded refusal write path, back when those rows lived on an `emptyDir`. They
@@ -395,6 +431,11 @@ networkPolicy:
       instancePort: 3307
       apiPort: 443
     meld:
+      namespaces: []
+      cidrs: []
+      httpPort: 443
+    # The Arbitrum RPC, Chainflip State Chain RPC and Chainflip backend. Required when sale_vault_proxy.enabled
+    saleVaultProxy:
       namespaces: []
       cidrs: []
       httpPort: 443

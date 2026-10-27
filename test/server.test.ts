@@ -1,17 +1,25 @@
 import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { reject, transactionId, type CreateSessionResponse, type QuoteResponse } from '../src/contract.js';
+import { createSessionRequest, reject, transactionId, type CreateSessionResponse, type QuoteResponse } from '../src/contract.js';
 import type { FundingRecord } from '../src/funding/types.js';
 import { MeldHttpError } from '../src/meld/client.js';
-import type { SupportedCorridorDto } from '../src/onramp.js';
+import { Onramp, type SupportedCorridorDto } from '../src/onramp.js';
+import type { FundingRail, MeldTransactionReader, RailSession } from '../src/rail.js';
+import type { Corridor, Discovery } from '../src/meld/discovery.js';
+import type { VerifiedSaleVaultProxy } from '../src/salevaultproxy/verify.js';
 import type { OfframpCorridor } from '../src/offramp.js';
 import { Secret } from '../src/secret.js';
 import { buildServer } from '../src/server.js';
 import {
   ALICE,
+  ALICE_PREFIX_42,
+  ALICE_CLAIMER,
+  ALICE_SALE_VAULT_PROXY,
+  SALE_VAULT_PROXY,
   config,
   createRequest,
+  fakeStore,
   fundingRecord,
   quoteRequestBody,
   sellQuoteBody,
@@ -510,13 +518,47 @@ describe('the direction discriminator', () => {
   });
 
   it('refuses a sell that supplies a wallet address, rather than ignoring it', async () => {
-    // A seller who sends one believes they have pinned where the crypto goes. Nobody reads it:
-    // on a sell the crypto travels the other way and the provider issues the deposit address.
-    // Accepting it silently is the dangerous half of "extra fields are ignored".
+    // The sell address is derived from sellerAccount, so a caller-supplied one is refused
     expect(await post('/session', sellRequest({ walletAddress: ALICE }))).toEqual({
       status: 400,
       code: 'MALFORMED_REQUEST',
     });
+    const parsed = createSessionRequest.safeParse(sellRequest({ walletAddress: ALICE }));
+    expect(parsed.error?.issues.map((i) => i.message)).toEqual(["A sell's wallet address is derived from sellerAccount, send sellerAccount."]);
+  });
+
+  it("hands a sell's seller account on, and refuses one on a buy and on /quote", async () => {
+    let reached: unknown;
+    const { status } = await post('/session', sellRequest({ sellerAccount: ALICE_PREFIX_42 }), (body) => {
+      reached = body;
+    });
+    expect(status).toBe(201);
+    expect(reached).toMatchObject({ direction: 'sell', sellerAccount: ALICE_PREFIX_42 });
+
+    expect(await post('/session', createRequest({ sellerAccount: ALICE }))).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
+    expect(createSessionRequest.safeParse(createRequest({ sellerAccount: ALICE })).error?.issues.map((i) => i.message)).toEqual([
+      'A buy has no seller account.',
+    ]);
+    expect(await post('/quote', sellQuoteBody({ sellerAccount: ALICE }))).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
+    expect(await post('/session', sellRequest({ sellerAccount: 'x'.repeat(129) }))).toEqual({ status: 400, code: 'MALFORMED_REQUEST' });
+  });
+
+  it('lowercases a seller claimer, checks a mixed-case checksum, and refuses one on a buy or at zero', () => {
+    const checksummed = '0x90D121876b4f93DA56F039139fdF37a96cde00c3';
+    const claimerOf = (sellerClaimer: string) => createSessionRequest.safeParse(sellRequest({ sellerClaimer }));
+    expect(claimerOf(checksummed).data?.sellerClaimer).toBe(checksummed.toLowerCase());
+    expect(claimerOf(checksummed.toLowerCase()).success).toBe(true);
+    expect(claimerOf(checksummed.toUpperCase().replace('0X', '0x')).success).toBe(true);
+    expect(claimerOf('0x90d121876b4f93DA56F039139fdF37a96cde00c3').error?.issues.map((i) => i.message)).toEqual([
+      'A mixed-case address must carry a valid EIP-55 checksum.',
+    ]);
+    expect(claimerOf(`0x${'0'.repeat(40)}`).error?.issues.map((i) => i.message)).toEqual(['Must not be the zero address.']);
+    expect(claimerOf('0x1234').success).toBe(false);
+    // A short mixed-case string is refused, never decoded
+    expect(claimerOf('0xAb').error?.issues.map((i) => i.message)).toEqual(['Must be 0x and 40 hex digits.']);
+    expect(createSessionRequest.safeParse(createRequest({ sellerClaimer: checksummed })).error?.issues.map((i) => i.message)).toEqual([
+      'A buy has no seller claimer.',
+    ]);
   });
 
   it('refuses a buy with no wallet address on /session, and asks for none on /quote', async () => {
@@ -2156,5 +2198,80 @@ describe('the discovery routes', () => {
     const response = await built.inject({ method: 'GET', url: '/supported/corridors', headers: DEV_HEADERS });
 
     expect(response.statusCode).toBe(400);
+  });
+});
+
+describe('a sell through the real onramp', () => {
+  /** A Meld rail that opens every session, so the route answers what validation decided. */
+  class OpenRail implements FundingRail, MeldTransactionReader {
+    provider = 'meld' as const;
+    async createSession(): Promise<RailSession> {
+      return { providerSessionId: 'meld-1', settlementUrl: 'https://meldcrypto.com/session/meld-1', hostedWidgetUrl: undefined, expiresAt: undefined };
+    }
+    async quote(): Promise<unknown[]> {
+      return [];
+    }
+    async transaction(id: string) {
+      return { id };
+    }
+  }
+  const payout = { paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' as const, min: '1', max: '100', currency: 'GBP', providers: ['TRANSAK'] };
+  const discovery: Discovery = {
+    corridor: async (country, fiat, crypto): Promise<Corridor> => ({ country, fiat, crypto, methods: [payout] }),
+    corridorForCountry: async (country, crypto): Promise<Corridor> => ({ country, fiat: 'GBP', crypto, methods: [payout] }),
+    countries: async () => [],
+    defaultFiat: async () => 'GBP',
+  };
+  const lanes = () => {
+    const c = config();
+    return {
+      ...c,
+      supported: {
+        ...c.supported,
+        offramp_lanes: [
+          { asset: 'dot@assethub' as const, code: 'DOT', chain: 'assethub' as const },
+          { asset: 'usdc@arbitrum' as const, code: 'USDC_ARBITRUM', chain: 'arbitrum' as const },
+        ],
+      },
+    };
+  };
+  const real = async (proxy: VerifiedSaleVaultProxy | undefined) => {
+    const cfg = lanes();
+    const rail = new OpenRail();
+    app = await buildServer(cfg, (audit) =>
+      new Onramp(cfg, { meld: rail }, audit, fakeStore(), rail, Date.now, () => crypto.randomUUID(), discovery, () => proxy),
+    );
+    return app;
+  };
+  const session = (built: FastifyInstance, payload: Record<string, unknown>) =>
+    built.inject({ method: 'POST', url: '/session', headers: DEV_HEADERS, payload });
+
+  it('answers a malformed seller account with 400 INVALID_ADDRESS', async () => {
+    const response = await session(await real(SALE_VAULT_PROXY), sellRequest({ sellerAccount: 'not-an-address' }));
+    expect(response.statusCode).toBe(400);
+    expect(response.json<{ error: { value: { code: string } } }>().error.value.code).toBe('INVALID_ADDRESS');
+  });
+
+  it("pins an Arbitrum sell to the seller's SaleVaultProxy, and answers 503 while the deployment is unverified", async () => {
+    const body = sellRequest({ destinationCurrencyCode: 'USDC_ARBITRUM', cryptoAmount: '30', sellerClaimer: ALICE_CLAIMER });
+    const opened = await session(await real(SALE_VAULT_PROXY), body);
+    expect(opened.statusCode).toBe(201);
+    expect(opened.json<CreateSessionResponse>().pinned).toMatchObject({ walletAddress: ALICE_SALE_VAULT_PROXY, sellerAccount: ALICE, sellerClaimer: ALICE_CLAIMER });
+    await app?.close();
+
+    const refused = await session(await real(undefined), body);
+    expect(refused.statusCode).toBe(503);
+    expect(refused.json<{ error: { value: { code: string } } }>().error.value.code).toBe('SALE_VAULT_PROXY_UNAVAILABLE');
+  });
+
+  it('carries the deployment on GET /supported/offramp only once verified', async () => {
+    const verified = await (await real(SALE_VAULT_PROXY)).inject({ method: 'GET', url: '/supported/offramp?country=GB', headers: DEV_HEADERS });
+    expect(verified.json()).toMatchObject({
+      saleVaultProxy: { chain: 'arbitrum', chainId: 421614, factory: SALE_VAULT_PROXY.factory, implementation: SALE_VAULT_PROXY.implementation },
+    });
+    await app?.close();
+
+    const unverified = await (await real(undefined)).inject({ method: 'GET', url: '/supported/offramp?country=GB', headers: DEV_HEADERS });
+    expect(unverified.json()).not.toHaveProperty('saleVaultProxy');
   });
 });

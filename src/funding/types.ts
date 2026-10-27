@@ -51,7 +51,7 @@ export interface FundingRecord {
   direction: Direction;
   /** The crypto leg in both directions, even on a sell where the crypto is the source. */
   destination_currency_code: string;
-  /** The delivery address, on a buy. A sell has none: the provider issues the deposit address. */
+  /** The delivery address on a buy, or on a sell the seller's own sending address derived by the service. */
   wallet_address: string | undefined;
   /** The fiat committed, on a buy. A sell commits no fiat, only a quoted estimate of it. */
   source_amount: string | undefined;
@@ -138,6 +138,10 @@ export interface FundingRecord {
   /** When the conflict was recorded. The worker skips a report naming the conflicting address
    *  already on file (`depositIsNew`), so it is stamped once per conflicting address. */
   deposit_conflict_at?: number | undefined;
+  /** The seller's own account on a sell, SS58 prefix 0, the source of the derived wallet address. */
+  seller_account?: string | undefined;
+  /** The seller's claimer on an Arbitrum sell, lowercase, bound into the derived wallet address. */
+  seller_claimer?: string | undefined;
   status_history: TimelineEntry[];
   created_at: number;
   updated_at: number;
@@ -162,6 +166,14 @@ export interface FundingRecord {
  * and a test asserting on `/funding_sell_terms/` passes against either store.
  */
 export function directionTermsViolation(record: FundingRecord): string | undefined {
+  // A seller account only on a sell that also carries its derived wallet address
+  if (record.seller_account !== undefined && (record.direction !== 'sell' || record.wallet_address === undefined)) {
+    return 'funding_seller_account';
+  }
+  // A claimer only beside the seller account its proxy is derived from, as a lowercase address
+  if (record.seller_claimer !== undefined && (record.seller_account === undefined || !/^0x[0-9a-f]{40}$/.test(record.seller_claimer))) {
+    return 'funding_seller_claimer';
+  }
   if (record.direction === 'sell') {
     return record.crypto_amount === undefined ? 'funding_sell_terms' : undefined;
   }
@@ -189,10 +201,14 @@ export interface FundingRequestDto {
   providerStatus?: string;
   destinationCurrencyCode: string;
   /**
-   * Present on a buy, absent on a sell. An approved narrowing of a shipped field: a sell has no
-   * caller-supplied address, and an empty string would be a destination nobody pinned.
+   * Present on a buy. On a sell, the seller's own sending and refund address the service derived,
+   * when there is one. An empty string would be an address nobody pinned.
    */
   walletAddress?: string;
+  /** The seller's own account on a sell, when one was sent. */
+  sellerAccount?: string;
+  /** The seller's claimer on an Arbitrum sell, lowercase. */
+  sellerClaimer?: string;
   /** The fiat committed, on a buy. Absent on a sell, which commits no fiat. */
   sourceAmount?: string;
   /**
@@ -200,7 +216,7 @@ export interface FundingRequestDto {
    *
    * A client resuming into an existing request compares this against the sale it believes it is
    * resuming, and refuses on a mismatch. On a buy that job is done by the wallet address, which
-   * is unique per purchase; on a sell there is no such field and `sourceAmount` is absent, so
+   * is unique per purchase. On a sell it may be absent, and `sourceAmount` is absent, so
    * this is the only term between two sales in one corridor. Omitting it would silently degrade
    * that check to corridor-only matching, which hands a seller someone else's settlement surface
    * at someone else's amount. The database refuses a sell row without one.
@@ -302,6 +318,8 @@ export function toFundingRequestDto(record: FundingRecord, now: number): Funding
     // defaulted: a buy's body is unchanged, and a sell's carries the crypto it committed and no
     // fiat term it never committed.
     ...(record.wallet_address === undefined ? {} : { walletAddress: record.wallet_address }),
+    ...(record.seller_account === undefined ? {} : { sellerAccount: record.seller_account }),
+    ...(record.seller_claimer === undefined ? {} : { sellerClaimer: record.seller_claimer }),
     ...(record.source_amount === undefined ? {} : { sourceAmount: record.source_amount }),
     ...(record.crypto_amount === undefined ? {} : { cryptoAmount: record.crypto_amount }),
     fiat: record.fiat,

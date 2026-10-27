@@ -20,6 +20,7 @@ import { startSupportedRefresh, type RefreshJob } from './supported/refresh.js';
 import { MeldClient, MeldHttpError } from './meld/client.js';
 import { ASSET_IDS, ASSETS, AssetCatalog, installCatalog, type AssetId } from './meld/catalog.js';
 import { MeldDiscovery } from './meld/discovery.js';
+import { ETH_DECIMALS, toBaseUnits, USDC_DECIMALS } from './money.js';
 import { Onramp } from './onramp.js';
 import { MeldRail } from './meld/rail.js';
 import { DIRECTIONS, type RailName, type RailRegistry } from './rail.js';
@@ -27,7 +28,17 @@ import { PersonhoodService, type PersonhoodDeps } from './personhood.js';
 import { chainReader } from './personhood/chain.js';
 import { commitmentsFrom } from './personhood/source.js';
 import { validateWithCommitment } from './personhood/verifiablejs.js';
-import { resolveSecret } from './secret.js';
+import { fetchTransport, SaleVaultProxyChain } from './salevaultproxy/chain.js';
+import { FailedCalls, type FailedCallSource } from './salevaultproxy/failed-calls.js';
+import { SaleVaultProxyKeeper, type KeeperLog, type KeeperStore } from './salevaultproxy/keeper.js';
+import { ReturnLimits } from './salevaultproxy/limits.js';
+import { SaleVaultProxyRelay } from './salevaultproxy/relay.js';
+import { SaleVaultProxyService } from './salevaultproxy/service.js';
+import { KeeperSigner, parseKeeperKey } from './salevaultproxy/signer.js';
+import { saleVaultProxyNetwork } from './salevaultproxy/networks.js';
+import type { VerifiedSaleVaultProxy } from './salevaultproxy/verify.js';
+import { resolveSecret, type Secret } from './secret.js';
+import { laneSellable } from './offramp.js';
 import { buildServer } from './server.js';
 
 // The asset the refresh walks in both directions; the table is crypto-keyed so more are additive.
@@ -127,6 +138,9 @@ export async function start(
   // wired".
   const rails: RailRegistry = { meld: meldRail, chainflip: new ChainflipRail() };
 
+  // The sale vault proxy keeper key, resolved before the store opens so a bad key leaves nothing to close
+  const keeperKey = cfg.sale_vault_proxy === undefined ? undefined : await resolveKeeperKey(cfg.sale_vault_proxy);
+
   // In `personhood` mode this builds the handshake service: one JWT signing Secret, from which the
   // challenge HMAC key and the JWT signing key are HKDF-derived under separate labels, so the
   // challenge path can never mint a bearer token. In `insecure_dev` nothing personhood-shaped is
@@ -149,6 +163,28 @@ export async function start(
     connectionTimeoutMs: cfg.store.connection_timeout_ms,
   });
 
+  // The keeper logs through the server once it exists
+  let keeperLogger: FastifyBaseLogger | undefined;
+  const keeperChain = cfg.sale_vault_proxy === undefined ? undefined : SaleVaultProxyChain.create(cfg.sale_vault_proxy.rpc_url);
+  const keeper =
+    cfg.sale_vault_proxy === undefined || keeperKey === undefined || keeperChain === undefined
+      ? undefined
+      : buildKeeper(
+          cfg.sale_vault_proxy,
+          keeperKey,
+          funding,
+          (level, message) => {
+            keeperLogger?.[level](message);
+          },
+          keeperChain,
+        );
+  // Only beside the keeper loop, which settles every call the relay sends
+  const relay =
+    keeper !== undefined && keeperChain !== undefined && cfg.sale_vault_proxy?.keeper.enabled === true
+      ? new SaleVaultProxyRelay(funding, keeperChain, keeper)
+      : undefined;
+  const saleVaultProxy = (): VerifiedSaleVaultProxy | undefined => keeper?.verified();
+
   // The audit sink is the request logger: one append-only record per externally observable
   // event, shipped wherever PCF already ships logs. See `audit.ts` on why not a database.
   let app: Awaited<ReturnType<typeof buildServer>> | undefined;
@@ -167,13 +203,17 @@ export async function start(
     app = await buildServer(
       cfg,
       (audit) =>
-        new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery),
+        new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery, saleVaultProxy),
       personhood,
       logDestination,
+      new SaleVaultProxyService(funding, keeper),
+      relay,
     );
     // A non-optional handle for the callbacks below: `app` has to be declared outside this block
     // so the `catch` can close it, and TypeScript cannot narrow a mutable binding inside a closure.
     const server = app;
+    keeperLogger = server.log;
+    warnSellLanes(cfg, server.log);
 
 
   // Empty `cors.allowed_origins` is the shipped default and it is the right default: it fails
@@ -211,6 +251,14 @@ export async function start(
     await verifyKey(meld, cfg, app.log);
     await verifyAssetCodes(meld, cfg, app.log);
     await app.listen({ port: cfg.server.port, host: cfg.server.host });
+
+    // Verified on the loop's first run after listen, so a slow RPC never holds the port shut and the Arbitrum lane waits alone
+    if (keeper !== undefined && cfg.sale_vault_proxy?.keeper.enabled === true) {
+      await keeper.checkGasFunds();
+      keeper.start();
+    } else {
+      keeper?.startVerifying();
+    }
 
   // The worker advances in-flight requests even when no SPA is open. Observation dispatch is per
   // rail. Stopped on shutdown so a restart tears down cleanly.
@@ -265,7 +313,7 @@ export async function start(
       ? startSupportedRefresh(
           discovery,
           funding,
-          refreshJobs(cfg.supported.offramp_lanes, cfg.assets),
+          refreshJobs(configuredSellLanes(cfg), cfg.assets),
           {
             catalogMs: cfg.supported.catalog_interval_ms,
             routesMs: cfg.supported.routes_interval_ms,
@@ -291,6 +339,7 @@ export async function start(
     // the cleanup complete if a throwing step is ever added after them.
     await worker?.stop();
     await supported?.stop();
+    await keeper?.stop();
     await app?.close();
     await funding.close();
     throw error;
@@ -306,6 +355,7 @@ export async function start(
       // leaving the server to time them out.
       await worker?.stop();
       await supported?.stop();
+      await keeper?.stop();
       await app.close();
       await funding.close();
     },
@@ -484,4 +534,64 @@ export async function buildPersonhood(cfg: Config): Promise<PersonhoodService> {
     allowedProducts: cfg.allowed_products,
   };
   return new PersonhoodService(deps);
+}
+
+/** Resolve the keeper key and refuse a malformed one at boot, parseKeeperKey owning its format. The value is re-read at each signature. */
+export async function resolveKeeperKey(sp: NonNullable<Config['sale_vault_proxy']>): Promise<Secret> {
+  const secret = await resolveSecret(sp.keeper_key, { name: 'sale_vault_proxy.keeper_key' });
+  parseKeeperKey(secret.expose());
+  return secret;
+}
+
+/** Build the sale vault proxy keeper and its chain clients. Verification happens later, once a logger exists. */
+export function buildKeeper(
+  sp: NonNullable<Config['sale_vault_proxy']>,
+  key: Secret,
+  store: KeeperStore,
+  log: KeeperLog,
+  chain: SaleVaultProxyChain = SaleVaultProxyChain.create(sp.rpc_url),
+  limits: ReturnLimits = ReturnLimits.create({
+    rpcUrl: sp.chainflip.rpc_url,
+    backendUrl: sp.chainflip.backend_url ?? saleVaultProxyNetwork(sp.chain_id).backendUrl,
+    ttlMs: sp.chainflip.limits_ttl_ms,
+  }),
+  failedCalls: FailedCallSource = new FailedCalls(fetchTransport(sp.chainflip.rpc_url)),
+): SaleVaultProxyKeeper {
+  return new SaleVaultProxyKeeper({
+    retired: sp.retired.map((r) => ({ factory: r.factory, vault: r.chainflip_vault, usdc: r.usdc })),
+    deployment: {
+      chainId: sp.chain_id,
+      factory: sp.factory,
+      vault: sp.chainflip_vault,
+      usdc: sp.usdc,
+    },
+    chain,
+    signer: new KeeperSigner(() => parseKeeperKey(key.expose())),
+    limits,
+    failedCalls,
+    store,
+    settings: {
+      intervalMs: sp.keeper.interval_ms,
+      batch: sp.keeper.batch,
+      resendMs: sp.keeper.resend_ms,
+      logRange: sp.keeper.log_range,
+      minSkim: toBaseUnits(sp.keeper.min_skim, USDC_DECIMALS),
+      minEth: toBaseUnits(sp.keeper.min_eth, ETH_DECIMALS),
+      quoteMarginBps: sp.chainflip.quote_margin_bps,
+    },
+    log,
+  });
+}
+
+/** Lanes a sell can open on with this config, the one predicate the refresh and the boot warning share. */
+export function configuredSellLanes(cfg: Config): Config['supported']['offramp_lanes'] {
+  return cfg.supported.offramp_lanes.filter((lane) => laneSellable(lane.chain, cfg.sale_vault_proxy !== undefined));
+}
+
+/** Warn about sell lanes the runtime refuses, without failing the boot. */
+export function warnSellLanes(cfg: Config, log: FastifyBaseLogger): void {
+  const sellable = configuredSellLanes(cfg);
+  for (const lane of cfg.supported.offramp_lanes) {
+    if (!sellable.includes(lane)) log.warn({ asset: lane.asset, chain: lane.chain }, 'supported.offramp_lanes lists a lane no sell can open on, so it is refused at runtime.');
+  }
 }

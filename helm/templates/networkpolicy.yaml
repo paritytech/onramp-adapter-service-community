@@ -8,6 +8,9 @@
 {{- if not (or .Values.networkPolicy.peers.meld.namespaces .Values.networkPolicy.peers.meld.cidrs) }}
 {{- fail "networkPolicy.enabled is true but no egress peer is named for Meld: every quote and every session creation would fail. Name a namespace selector and/or IP block under networkPolicy.peers.meld." }}
 {{- end }}
+{{- if and .Values.sale_vault_proxy.enabled (not (or .Values.networkPolicy.peers.saleVaultProxy.namespaces .Values.networkPolicy.peers.saleVaultProxy.cidrs)) }}
+{{- fail "networkPolicy.enabled is true and sale_vault_proxy.enabled is true, but no egress peer is named for the sale vault proxy: the Arbitrum RPC, the Chainflip State Chain RPC and the Chainflip backend would be unreachable, so the deployment never verifies and the keeper never acts. Name a namespace selector and/or IP block under networkPolicy.peers.saleVaultProxy." }}
+{{- end }}
 {{- if not .Values.networkPolicy.peers.cloudsql.instanceCidrs }}
 {{- fail "networkPolicy.enabled is true but networkPolicy.peers.cloudsql.instanceCidrs is empty, so nothing permits egress to the database and the pod crash-loops on its startup probe, a failure three layers from its cause. With store.authProxy.enabled the Auth Proxy is a sidecar in *this* pod, so this policy governs its egress and it needs the instance on 3307; without the proxy the app reaches the instance directly on store.port. Either way, name the instance CIDR." }}
 {{- end }}
@@ -183,4 +186,28 @@ spec:
           port: {{ default 443 $.Values.networkPolicy.peers.meld.httpPort | int }}
     {{- end }}
     {{- end }}
+{{- if .Values.sale_vault_proxy.enabled }}
+    # The sale vault proxy's Arbitrum RPC, Chainflip State Chain RPC and Chainflip backend
+    {{- with .Values.networkPolicy.peers.saleVaultProxy }}
+    {{- if .namespaces }}
+    - to:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values: {{ .namespaces | toJson }}
+      ports:
+        - protocol: TCP
+          port: {{ default 443 .httpPort | int }}
+    {{- end }}
+    {{- range $cidr := .cidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ $cidr | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ default 443 $.Values.networkPolicy.peers.saleVaultProxy.httpPort | int }}
+    {{- end }}
+    {{- end }}
+{{- end }}
 {{- end }}

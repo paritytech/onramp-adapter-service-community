@@ -5,8 +5,8 @@
   No `| default` on booleans. Helm's `default` treats `false` as empty and substitutes, so
   `session_creation_enabled: false` rendered `true`. The emergency stop for a service spending a
   payment credential could not be switched off. Every key here has a schema default in
-  values.yaml, so the pipe bought nothing and cost that. The two secret sources (meld.api_key and
-  auth.personhood.jwt_key) are emitted as file references
+  values.yaml, so the pipe bought nothing and cost that. The secret sources (meld.api_key,
+  auth.personhood.jwt_key, and sale_vault_proxy.keeper_key when enabled) are emitted as file references
   {"mode":"file","path":"/run/secrets/<key>"} because the real bytes live in
   mounted Secret files (mounted below in the Deployment at secretMountPath).
   A Secret that is missing makes the process fail at boot on the file read,
@@ -18,6 +18,10 @@
   but it is a precision trap waiting on a larger value, and a config file nobody can read at a
   glance. `int` renders the integer.
 */ -}}
+{{- /* Enabling the sale vault proxy without its keeper-key Secret boots to a missing-file read, so fail at render instead. */ -}}
+{{- if and .Values.sale_vault_proxy.enabled (not .Values.secrets.saleVaultProxyKeeperKey.existingSecret) }}
+{{- fail "sale_vault_proxy.enabled is true but secrets.saleVaultProxyKeeperKey.existingSecret is unset: the keeper key would not be mounted." }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -96,5 +100,30 @@ data:
         "routes_interval_ms": {{ int .Values.supported.routes_interval_ms }},
         "sell_routes_interval_ms": {{ int .Values.supported.sell_routes_interval_ms }},
         "offramp_lanes": {{ .Values.supported.offramp_lanes | toJson }}
+      }{{- if .Values.sale_vault_proxy.enabled }},
+      {{- /* The Arbitrum sale vault proxy and its keeper. keeper_key is a file reference like the other secrets. */}}
+      "sale_vault_proxy": {
+        "chain_id": {{ int .Values.sale_vault_proxy.chain_id }},
+        "factory": {{ required "sale_vault_proxy.factory is required when sale_vault_proxy.enabled is true." .Values.sale_vault_proxy.factory | quote }},
+        "retired": {{ .Values.sale_vault_proxy.retired | toJson }},
+        "chainflip_vault": {{ .Values.sale_vault_proxy.chainflip_vault | quote }},
+        "usdc": {{ .Values.sale_vault_proxy.usdc | quote }},
+        "rpc_url": {{ .Values.sale_vault_proxy.rpc_url | quote }},
+        "keeper_key": { "mode": "file", "path": {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.saleVaultProxyKeeperKey.key | quote }} },
+        "keeper": {
+          "enabled": {{ .Values.sale_vault_proxy.keeper.enabled }},
+          "interval_ms": {{ int .Values.sale_vault_proxy.keeper.interval_ms }},
+          "batch": {{ int .Values.sale_vault_proxy.keeper.batch }},
+          "resend_ms": {{ int .Values.sale_vault_proxy.keeper.resend_ms }},
+          "log_range": {{ int .Values.sale_vault_proxy.keeper.log_range }},
+          "min_skim": {{ .Values.sale_vault_proxy.keeper.min_skim | quote }},
+          "min_eth": {{ .Values.sale_vault_proxy.keeper.min_eth | quote }}
+        },
+        "chainflip": {
+          "rpc_url": {{ .Values.sale_vault_proxy.chainflip.rpc_url | quote }},
+          "quote_margin_bps": {{ int .Values.sale_vault_proxy.chainflip.quote_margin_bps }},
+          "limits_ttl_ms": {{ int .Values.sale_vault_proxy.chainflip.limits_ttl_ms }}
+        }
       }
+      {{- end }}
     }

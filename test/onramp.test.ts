@@ -13,11 +13,17 @@ import { railRefusal } from '../src/meld/refusal.js';
 import { TERMINAL_STATES } from '../src/funding/state.js';
 import { toFundingRequestDto } from '../src/funding/types.js';
 import { Onramp, type FundingPort } from '../src/onramp.js';
+import { saleRef } from '../src/salevaultproxy/abi.js';
+import type { SaleVaultProxyLookup, VerifiedSaleVaultProxy } from '../src/salevaultproxy/verify.js';
 import type { FundingRail, MeldTransactionReader, RailBuySession, RailQuote, RailName, RailRegistry, RailSession, RailSessionInput, RailTransaction } from '../src/rail.js';
 import {
   ALICE,
+  ALICE_CLAIMER,
+  ALICE_HOME,
   ALICE_PREFIX_42,
+  ALICE_SALE_VAULT_PROXY,
   BOB,
+  SALE_VAULT_PROXY,
   SHORT_KEY_ADDRESS,
   config,
   createRequest,
@@ -98,18 +104,25 @@ const registry = (meld: FundingRail, chainflip?: FundingRail): RailRegistry =>
   chainflip ? { meld, chainflip } : { meld };
 
 /** Both the rail and its transaction reader are the same FakeMeld instance in these tests. */
-const build = (meld: FakeMeld & MeldTransactionReader, cfg = config()) => {
+const build = (
+  meld: FakeMeld & MeldTransactionReader,
+  cfg = config(),
+  proxy?: VerifiedSaleVaultProxy | SaleVaultProxyLookup,
+  chainflip?: FundingRail,
+) => {
   const audit = new FakeAudit();
   const funding = fakeStore();
   let n = 0;
   const service = new Onramp(
     cfg,
-    registry(meld),
+    registry(meld, chainflip),
     audit,
     funding,
     meld,
     () => NOW,
     () => `funding-${String((n += 1))}`,
+    undefined,
+    typeof proxy === 'function' ? proxy : () => proxy,
   );
   return { service, funding, audit } as const;
 };
@@ -533,6 +546,8 @@ describe('Onramp.create', () => {
       cancel: async () => undefined,
       list: async () => [],
       readCorridors: async () => [],
+      insertSaleVaultProxy: async () => undefined,
+      deleteSaleVaultProxy: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), new FakeAudit(), funding, meld, () => NOW, () => 'funding-1');
 
@@ -566,6 +581,8 @@ describe('Onramp.create', () => {
       cancel: async () => undefined,
       list: async () => [],
       readCorridors: async () => [],
+      insertSaleVaultProxy: async () => undefined,
+      deleteSaleVaultProxy: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), audit, funding, meld, () => NOW, () => 'funding-1');
 
@@ -1145,6 +1162,8 @@ describe('Onramp.create', () => {
         rail: 'meld',
         direction: 'sell',
         destinationCurrencyCode: 'DOT',
+        walletAddress: ALICE,
+        sellerAccount: ALICE,
         cryptoAmount: '12.3456789012',
         fiat: 'GBP',
         reason: 'Other',
@@ -1173,6 +1192,8 @@ describe('Onramp.create', () => {
         cancel: (alias, product, id, now) => funding.cancel(alias, product, id, now),
         list: (alias, product, limit) => funding.list(alias, product, limit),
         readCorridors: (code, direction) => funding.readCorridors(code, direction),
+        insertSaleVaultProxy: (row) => funding.insertSaleVaultProxy(row),
+        deleteSaleVaultProxy: (id) => funding.deleteSaleVaultProxy(id),
         // Rejects, not throws: a synchronous throw is caught whether or not the call is
         // awaited, so it would go green against a missing `await`.
         update: () => Promise.reject(new Error('database is locked')),
@@ -2030,11 +2051,11 @@ describe('a live request whose payment page has closed', () => {
 });
 
 describe('a sell request', () => {
-  /** The sell request as the schema hands it over: no address, no fiat amount, exact crypto. */
+  /** The sell request as the schema hands it over: the seller's account, no fiat amount, exact crypto. */
   const sell = (overrides: Record<string, unknown> = {}) =>
     sellRequest(overrides) as unknown as Parameters<Onramp['createSession']>[1];
 
-  it('reaches the rail carrying the crypto it committed, and no address', async () => {
+  it("reaches the rail carrying the crypto it committed and the seller's own address", async () => {
     // The whole of this step: a sell is parsed, validated, reserved and handed to a rail. What
     // the rail then does with it is the rail's answer, not a parse failure dressed up as one.
     const meld = new FakeMeld();
@@ -2046,6 +2067,7 @@ describe('a sell request', () => {
       direction: 'sell',
       destinationCode: 'DOT',
       cryptoAmount: '12.3456789012',
+      walletAddress: ALICE,
       fiat: 'GBP',
       countryCode: 'GB',
       paymentMethodType: 'PAYOUT_TO_BANK',
@@ -2053,8 +2075,299 @@ describe('a sell request', () => {
       clientReference: 'funding-1',
       redirectUrl: undefined,
     });
-    // Nothing invents an address for the leg that has none.
     expect(asBuy(meld.calls[0])).toBeUndefined();
+  });
+
+  it('sends no address on an Asset Hub sell that names no seller', async () => {
+    const meld = new FakeMeld();
+    const { service, funding } = build(meld);
+
+    const created = await service.createSession(SUBJECT, sell({ sellerAccount: undefined }), REQUEST_ID);
+    const row = await funding.byId(created.fundingRequestId);
+
+    expect(meld.calls[0]).toMatchObject({ direction: 'sell', walletAddress: undefined });
+    expect(created.pinned).not.toHaveProperty('walletAddress');
+    expect(created.pinned).not.toHaveProperty('sellerAccount');
+    expect(row?.wallet_address).toBeUndefined();
+    expect(row?.seller_account).toBeUndefined();
+  });
+
+  it('stores a prefix-42 seller as prefix 0, and takes a replay under either prefix as the same request', async () => {
+    const meld = new FakeMeld();
+    const { service, funding } = build(meld);
+
+    const first = await service.createSession(SUBJECT, sell({ sellerAccount: ALICE_PREFIX_42 }), REQUEST_ID);
+    const again = await service.createSession(SUBJECT, sell({ sellerAccount: ALICE }), REQUEST_ID);
+    const row = await funding.byId(first.fundingRequestId);
+
+    expect(first.pinned).toMatchObject({ walletAddress: ALICE, sellerAccount: ALICE });
+    expect(row).toMatchObject({ wallet_address: ALICE, seller_account: ALICE });
+    expect(again.fundingRequestId).toBe(first.fundingRequestId);
+    expect(again.pinned).toMatchObject({ walletAddress: ALICE, sellerAccount: ALICE });
+    expect(meld.calls).toHaveLength(1);
+  });
+
+  it('treats a replay naming another seller as a different request', async () => {
+    const meld = new FakeMeld();
+    const { service } = build(meld);
+
+    await service.createSession(SUBJECT, sell(), REQUEST_ID);
+
+    expect(await failureOf(() => service.createSession(SUBJECT, sell({ sellerAccount: BOB }), REQUEST_ID))).toMatchObject({
+      value: { code: 'IDEMPOTENCY_KEY_REUSED' },
+    });
+    expect(await failureOf(() => service.createSession(SUBJECT, sell({ sellerAccount: undefined }), REQUEST_ID))).toMatchObject({
+      value: { code: 'IDEMPOTENCY_KEY_REUSED' },
+    });
+  });
+
+  it('refuses a malformed seller account before any rail call', async () => {
+    const meld = new FakeMeld();
+    const { service, audit } = build(meld);
+
+    for (const account of ['not-an-address', SHORT_KEY_ADDRESS, `0x${'1'.repeat(40)}`]) {
+      expect(await failureOf(() => service.createSession(SUBJECT, sell({ sellerAccount: account }), REQUEST_ID))).toEqual({
+        tag: 'Other',
+        value: { code: 'INVALID_ADDRESS', message: 'The seller account is not valid.' },
+      });
+    }
+    expect(meld.calls).toHaveLength(0);
+    // The submitted account rides the refusal line, as a submitted address does
+    expect(audit.events.find((e) => e.event === 'session.refused')).toMatchObject({ sellerAccount: 'not-an-address' });
+  });
+
+  it('keeps a Chainflip sell on its own refusal, whatever the seller', async () => {
+    const meld = new FakeMeld();
+    const chainflip = new FakeMeld(() => directionUnsupported('no fiat leg, so there is no fiat payout to sell into'));
+    chainflip.provider = 'chainflip';
+    const { service, funding } = build(meld, config(), undefined, chainflip);
+
+    const failure = await failureOf(() =>
+      service.createSession(SUBJECT, sell({ rail: 'chainflip', sellerAccount: 'not-an-address' }), REQUEST_ID),
+    );
+
+    expect(failure).toMatchObject({ value: { code: 'DIRECTION_UNSUPPORTED' } });
+    expect(chainflip.calls[0]).toMatchObject({ direction: 'sell', walletAddress: undefined });
+    expect((await funding.byId('funding-1'))?.seller_account).toBeUndefined();
+  });
+
+  describe('on a lane other than Asset Hub', () => {
+    const lanes = () => {
+      const c = config();
+      return {
+        ...c,
+        supported: {
+          ...c.supported,
+          offramp_lanes: [
+            { asset: 'dot@assethub' as const, code: 'DOT', chain: 'assethub' as const },
+            { asset: 'usdc@arbitrum' as const, code: 'USDC_ARBITRUM', chain: 'arbitrum' as const },
+            { asset: 'usdc@solana' as const, code: 'USDC_SOLANA', chain: 'solana' as const },
+          ],
+        },
+      };
+    };
+    const arbitrum = (overrides: Record<string, unknown> = {}) =>
+      sell({ destinationCurrencyCode: 'USDC_ARBITRUM', cryptoAmount: '30', sellerClaimer: ALICE_CLAIMER, ...overrides });
+
+    it("sells from the seller's SaleVaultProxy on Arbitrum, and records it for the keeper", async () => {
+      const meld = new FakeMeld();
+      const { service, funding, audit } = build(meld, lanes(), SALE_VAULT_PROXY);
+
+      const created = await service.createSession(SUBJECT, arbitrum({ sellerAccount: ALICE_PREFIX_42 }), REQUEST_ID);
+      const row = await funding.byId(created.fundingRequestId);
+
+      expect(created.pinned).toMatchObject({ walletAddress: ALICE_SALE_VAULT_PROXY, sellerAccount: ALICE, sellerClaimer: ALICE_CLAIMER });
+      expect(meld.calls[0]).toMatchObject({ direction: 'sell', walletAddress: ALICE_SALE_VAULT_PROXY });
+      expect(row).toMatchObject({ wallet_address: ALICE_SALE_VAULT_PROXY, seller_account: ALICE, seller_claimer: ALICE_CLAIMER });
+      expect(audit.events.find((e) => e.event === 'session.created')).toMatchObject({
+        walletAddress: ALICE_SALE_VAULT_PROXY,
+        sellerAccount: ALICE,
+        sellerClaimer: ALICE_CLAIMER,
+      });
+      expect([...funding.saleVaultProxies.values()]).toEqual([
+        {
+          funding_request_id: created.fundingRequestId,
+          chain_id: 421614,
+          factory: SALE_VAULT_PROXY.factory,
+          implementation: SALE_VAULT_PROXY.implementation,
+          home: ALICE_HOME,
+          claimer: ALICE_CLAIMER,
+          proxy: ALICE_SALE_VAULT_PROXY.toLowerCase(),
+          ref: saleRef(created.fundingRequestId),
+        },
+      ]);
+    });
+
+    it('drops the proxy row of a sale the rail refused', async () => {
+      const meld = new FakeMeld(() => reject({ tag: 'BelowMinimum' }, 'too small'));
+      const { service, funding } = build(meld, lanes(), SALE_VAULT_PROXY);
+
+      await failureOf(() => service.createSession(SUBJECT, arbitrum(), REQUEST_ID));
+
+      expect([...funding.saleVaultProxies.keys()]).toEqual([]);
+    });
+
+    it("still answers the rail's refusal when the proxy row cannot be dropped", async () => {
+      const meld = new FakeMeld(() => reject({ tag: 'BelowMinimum' }, 'too small'));
+      const { service, funding } = build(meld, lanes(), SALE_VAULT_PROXY);
+      funding.deleteSaleVaultProxy = () => Promise.reject(new Error('connection lost'));
+
+      expect(await failureOf(() => service.createSession(SUBJECT, arbitrum(), REQUEST_ID))).toMatchObject({ tag: 'BelowMinimum' });
+    });
+
+    it('keeps the proxy row when the rail outcome is unknown, so a session that did open is still watched', async () => {
+      const meld = new FakeMeld(() => upstreamUnavailable('socket reset'));
+      const { service, funding } = build(meld, lanes(), SALE_VAULT_PROXY);
+
+      await failureOf(() => service.createSession(SUBJECT, arbitrum(), REQUEST_ID));
+
+      expect([...funding.saleVaultProxies.keys()]).toEqual(['funding-1']);
+    });
+
+    it('replays the same claimer with it echoed, and refuses a different claimer under the key', async () => {
+      const meld = new FakeMeld();
+      const { service } = build(meld, lanes(), SALE_VAULT_PROXY);
+
+      const created = await service.createSession(SUBJECT, arbitrum(), REQUEST_ID);
+      const again = await service.createSession(SUBJECT, arbitrum(), REQUEST_ID);
+      expect(again.fundingRequestId).toBe(created.fundingRequestId);
+      expect(again.pinned.sellerClaimer).toBe(ALICE_CLAIMER);
+
+      expect(await failureOf(() => service.createSession(SUBJECT, arbitrum({ sellerClaimer: `0x${'44'.repeat(20)}` }), REQUEST_ID))).toMatchObject({
+        value: { code: 'IDEMPOTENCY_KEY_REUSED' },
+      });
+      expect(meld.calls).toHaveLength(1);
+    });
+
+    it('replays a sale whose deployment rotated since, by its stored address', async () => {
+      const meld = new FakeMeld();
+      let deployment = SALE_VAULT_PROXY;
+      const { service } = build(meld, lanes(), () => deployment);
+
+      const created = await service.createSession(SUBJECT, arbitrum(), REQUEST_ID);
+      deployment = { ...SALE_VAULT_PROXY, factory: '0x3333333333333333333333333333333333333333' };
+      const again = await service.createSession(SUBJECT, arbitrum(), REQUEST_ID);
+
+      expect(again.fundingRequestId).toBe(created.fundingRequestId);
+      expect(again.pinned.walletAddress).toBe(created.pinned.walletAddress);
+      expect(meld.calls).toHaveLength(1);
+    });
+
+    it('frees the key and calls no rail when the proxy cannot be recorded', async () => {
+      const meld = new FakeMeld();
+      const funding = fakeStore();
+      let n = 0;
+      let failInsert = true;
+      const audit = new FakeAudit();
+      const service = new Onramp(
+        lanes(),
+        registry(meld),
+        audit,
+        {
+          reserve: (r) => funding.reserve(r),
+          create: async (r) => { await funding.create(r); },
+          update: (id, to, now, extra) => funding.update(id, to, now, extra),
+          byAlias: (id, alias, product) => funding.byAlias(id, alias, product),
+          byReference: (alias, product, ref) => funding.byReference(alias, product, ref),
+          cancel: (alias, product, id, now) => funding.cancel(alias, product, id, now),
+          list: (alias, product, limit) => funding.list(alias, product, limit),
+          readCorridors: (code, direction) => funding.readCorridors(code, direction),
+          insertSaleVaultProxy: (row) => (failInsert ? Promise.reject(new Error('connection lost')) : funding.insertSaleVaultProxy(row)),
+          deleteSaleVaultProxy: (id) => funding.deleteSaleVaultProxy(id),
+        } satisfies FundingPort,
+        meld,
+        () => NOW,
+        () => `funding-${String((n += 1))}`,
+        undefined,
+        () => SALE_VAULT_PROXY,
+      );
+
+      const refusal = await failureOf(() => service.createSession(SUBJECT, arbitrum(), REQUEST_ID));
+      expect(refusal).toMatchObject({ value: { code: 'SALE_VAULT_PROXY_UNAVAILABLE' } });
+      expect(meld.calls).toHaveLength(0);
+      expect(await funding.byId('funding-1')).toMatchObject({ status: 'refused', client_reference: undefined, reason: 'Other' });
+      expect(audit.events.find((e) => e.event === 'session.refused')).toMatchObject({ reason: 'sale_vault_proxy_record_failed' });
+
+      failInsert = false;
+      const retried = await service.createSession(SUBJECT, arbitrum(), REQUEST_ID);
+      expect(retried.fundingRequestId).toBe('funding-2');
+      expect([...funding.saleVaultProxies.keys()]).toEqual(['funding-2']);
+    });
+
+    it('still surfaces the store error when the reservation cannot be closed either', async () => {
+      const meld = new FakeMeld();
+      const funding = fakeStore();
+      const service = new Onramp(
+        lanes(),
+        registry(meld),
+        new FakeAudit(),
+        {
+          reserve: (r) => funding.reserve(r),
+          create: async (r) => { await funding.create(r); },
+          update: () => Promise.reject(new Error('database is locked')),
+          byAlias: (id, alias, product) => funding.byAlias(id, alias, product),
+          byReference: (alias, product, ref) => funding.byReference(alias, product, ref),
+          cancel: (alias, product, id, now) => funding.cancel(alias, product, id, now),
+          list: (alias, product, limit) => funding.list(alias, product, limit),
+          readCorridors: (code, direction) => funding.readCorridors(code, direction),
+          insertSaleVaultProxy: () => Promise.reject(new Error('connection lost')),
+          deleteSaleVaultProxy: async () => undefined,
+        } satisfies FundingPort,
+        meld,
+        () => NOW,
+        () => 'funding-1',
+        undefined,
+        () => SALE_VAULT_PROXY,
+      );
+
+      expect(await failureOf(() => service.createSession(SUBJECT, arbitrum(), REQUEST_ID))).toMatchObject({
+        value: { code: 'SALE_VAULT_PROXY_UNAVAILABLE' },
+      });
+      expect(meld.calls).toHaveLength(0);
+    });
+
+    it('needs the seller account and a verified deployment on Arbitrum, before any rail call', async () => {
+      const meld = new FakeMeld();
+      const verified = build(meld, lanes(), SALE_VAULT_PROXY).service;
+      const unverified = build(meld, lanes()).service;
+
+      expect(await failureOf(() => verified.createSession(SUBJECT, arbitrum({ sellerAccount: undefined }), REQUEST_ID))).toMatchObject({
+        value: { code: 'SELLER_ACCOUNT_REQUIRED' },
+      });
+      expect(await failureOf(() => verified.createSession(SUBJECT, arbitrum({ sellerClaimer: undefined }), REQUEST_ID))).toMatchObject({
+        value: { code: 'SELLER_CLAIMER_REQUIRED' },
+      });
+      const refusal = await unverified.createSession(SUBJECT, arbitrum(), REQUEST_ID).catch((e: unknown) => e);
+      expect(refusal).toBeInstanceOf(Refusal);
+      expect(refusal).toMatchObject({ status: 503, failure: { value: { code: 'SALE_VAULT_PROXY_UNAVAILABLE' } } });
+      expect(meld.calls).toHaveLength(0);
+    });
+
+    it('refuses an Arbitrum quote while no deployment is verified, and prices one once it is', async () => {
+      const meld = new FakeMeld();
+      const quote = { direction: 'sell', destinationCurrencyCode: 'USDC_ARBITRUM', cryptoAmount: '30', fiat: 'GBP', country: 'GB', paymentMethodType: 'PAYOUT_TO_BANK' } as const;
+      const refusal = await build(meld, lanes()).service.quote(quote).catch((e: unknown) => e);
+      expect(refusal).toMatchObject({ status: 503, failure: { value: { code: 'SALE_VAULT_PROXY_UNAVAILABLE' } } });
+      expect(meld.quoteCalls).toHaveLength(0);
+      await build(meld, lanes(), SALE_VAULT_PROXY).service.quote(quote);
+      expect(meld.quoteCalls).toHaveLength(1);
+    });
+
+    it('refuses Solana on a quote and a session, though the lane is configured', async () => {
+      const meld = new FakeMeld();
+      const { service } = build(meld, lanes(), SALE_VAULT_PROXY);
+
+      expect(await failureOf(() => service.createSession(SUBJECT, sell({ destinationCurrencyCode: 'USDC_SOLANA' }), REQUEST_ID))).toEqual({
+        tag: 'RegionUnavailable',
+      });
+      expect(
+        await failureOf(() =>
+          service.quote({ direction: 'sell', destinationCurrencyCode: 'USDC_SOLANA', cryptoAmount: '30', fiat: 'GBP', country: 'GB', paymentMethodType: 'PAYOUT_TO_BANK' }),
+        ),
+      ).toEqual({ tag: 'RegionUnavailable' });
+      expect(meld.calls).toHaveLength(0);
+      expect(meld.quoteCalls).toHaveLength(0);
+    });
   });
 
   it('does not run the fiat limit gate, which would compare crypto against fiat', async () => {
@@ -2076,21 +2389,20 @@ describe('a sell request', () => {
     expect(meld.calls).toHaveLength(1);
   });
 
-  it('records the direction and the crypto amount on the row, and no fiat term', async () => {
+  it('records the direction, the crypto amount and the seller on the row, and no fiat term', async () => {
     const meld = new FakeMeld();
     const { service, funding } = build(meld);
 
     const created = await service.createSession(SUBJECT, sell(), REQUEST_ID);
     const row = await funding.byId(created.fundingRequestId);
 
-    expect(row).toMatchObject({ direction: 'sell', crypto_amount: '12.3456789012', fiat: 'GBP' });
-    expect(row?.wallet_address).toBeUndefined();
+    expect(row).toMatchObject({ direction: 'sell', crypto_amount: '12.3456789012', fiat: 'GBP', wallet_address: ALICE, seller_account: ALICE });
     expect(row?.source_amount).toBeUndefined();
   });
 
   it('echoes the committed crypto back, which is what a resuming client compares against', async () => {
     // Load-bearing, not informational. On a buy the wallet address tells two purchases apart; a
-    // sell has none, so this is the only term between two sales in one corridor. A client that
+    // sell may have none, so this is the only term between two sales in one corridor. A client that
     // resumes on a corridor match alone gets someone else's surface at someone else's amount.
     const meld = new FakeMeld();
     const { service, funding } = build(meld);
@@ -2100,13 +2412,16 @@ describe('a sell request', () => {
 
     expect(created.pinned).toEqual({
       destinationCurrencyCode: 'DOT',
+      walletAddress: ALICE,
+      sellerAccount: ALICE,
       cryptoAmount: '12.3456789012',
       fiat: 'GBP',
       country: 'GB',
     });
     const dto = toFundingRequestDto(must(row, 'the sell row'), NOW);
     expect(dto.cryptoAmount).toBe('12.3456789012');
-    expect(dto.walletAddress).toBeUndefined();
+    expect(dto.walletAddress).toBe(ALICE);
+    expect(dto.sellerAccount).toBe(ALICE);
   });
 
   it('audits the direction, with the crypto amount in place of a fiat one', async () => {
@@ -2116,8 +2431,7 @@ describe('a sell request', () => {
     await service.createSession(SUBJECT, sell(), REQUEST_ID);
 
     const created = audit.events.find((e) => e.event === 'session.created');
-    expect(created).toMatchObject({ direction: 'sell', cryptoAmount: '12.3456789012' });
-    expect(created?.walletAddress).toBeUndefined();
+    expect(created).toMatchObject({ direction: 'sell', cryptoAmount: '12.3456789012', walletAddress: ALICE, sellerAccount: ALICE });
     expect(created?.sourceAmount).toBeUndefined();
   });
 
@@ -2602,6 +2916,8 @@ describe('recording a refusal is best-effort', () => {
       cancel: async () => undefined,
       list: async () => [],
       readCorridors: async () => [],
+      insertSaleVaultProxy: async () => undefined,
+      deleteSaleVaultProxy: async () => undefined,
     };
     const service = new Onramp(config(), registry(meld), audit, broken, meld, () => NOW);
 

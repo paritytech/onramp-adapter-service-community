@@ -3,9 +3,10 @@ import { encodeAddress } from '@polkadot/util-crypto';
 import { parseConfig, type Config } from '../src/config.js';
 import { TERMINAL_STATES, type FundingState } from '../src/funding/state.js';
 import { mergeAdvance } from '../src/funding/merge.js';
-import type { FundingStore, SupportedCorridorRow } from '../src/funding/store.js';
+import type { FundingStore, NewSaleVaultProxyRow, SupportedCorridorRow } from '../src/funding/store.js';
 import { directionTermsViolation, type FundingRecord } from '../src/funding/types.js';
 import type { Direction, RailBuySession, RailSellSession } from '../src/rail.js';
+import type { VerifiedSaleVaultProxy } from '../src/salevaultproxy/verify.js';
 
 const ALICE_PUBKEY = new Uint8Array([
   0xd4, 0x35, 0x93, 0xc7, 0x15, 0xfd, 0xd3, 0x1c, 0x61, 0x14, 0x1a, 0xbd, 0x04, 0xa9, 0x9f, 0xd6,
@@ -27,6 +28,34 @@ export const SHORT_KEY_ADDRESS = encodeAddress(ALICE_PUBKEY.slice(0, 8), 0);
 
 /** A different person entirely, not another spelling of ALICE (which normalises back to it). */
 export const BOB = encodeAddress(new Uint8Array(32).fill(2), 0);
+
+/** A verified Arbitrum Sepolia deployment, the factory and implementation of the CREATE2 vectors. */
+export const SALE_VAULT_PROXY: VerifiedSaleVaultProxy = {
+  chain: 'arbitrum',
+  chainId: 421614,
+  factory: '0x1111111111111111111111111111111111111111',
+  implementation: '0x2222222222222222222222222222222222222222',
+  vault: '0x2bb150e6d4366a1bdbc4275d1f35892cd63f27e3',
+  usdc: '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d',
+  broker: '0x9e8d88ae895c9b37b2dead9757a3452f7c2299704d91ddfa444d87723f94fe0c',
+  homeChain: 6n,
+  homeToken: 12n,
+  retryBlocks: 100,
+  minReturn: 5_000_000n,
+  maxReturn: 10_000_000n,
+  priceFloorBps: 9_500n,
+  feeAllowance: 1_000_000n,
+  returnCooldown: 3_600n,
+  releaseDelay: 86_400n,
+  releaseAttempts: 7n,
+  staleDelay: 5_184_000n,
+  guardian: '0x5555555555555555555555555555555555555555',
+};
+
+/** ALICE's home and claimer under `SALE_VAULT_PROXY`, and the EIP-55 proxy they predict. */
+export const ALICE_HOME = '0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d';
+export const ALICE_CLAIMER = '0x3333333333333333333333333333333333333333';
+export const ALICE_SALE_VAULT_PROXY = '0xB7967f92Fd611b5fF68b6A043DAf49034Cad476B';
 
 /**
  * What the test deployment calls each asset: Meld's current codes, every asset named. The setup file
@@ -140,14 +169,16 @@ export const createRequest = (overrides: Record<string, unknown> = {}) => ({
 /**
  * The sell counterpart of `createRequest`: the terms a sell actually commits.
  *
- * No `walletAddress` and no `sourceAmount`, because the schema refuses both on a sell rather
- * than ignoring them, and a crypto amount at ten fraction digits, which is DOT's own precision
- * and more than the fiat validator can express.
+ * The seller's account and no `walletAddress` or `sourceAmount`, because the schema refuses both
+ * on a sell rather than ignoring them (the service derives the wallet address from the account),
+ * and a crypto amount at ten fraction digits, which is DOT's own precision and more than the fiat
+ * validator can express.
  */
 export const sellRequest = (overrides: Record<string, unknown> = {}) => ({
   idempotencyKey: 'idem-sell-0001',
   direction: 'sell',
   destinationCurrencyCode: 'DOT',
+  sellerAccount: ALICE,
   cryptoAmount: '12.3456789012',
   fiat: 'GBP',
   country: 'GB',
@@ -189,13 +220,14 @@ export const railSessionInput = (overrides: Partial<RailBuySession> = {}): RailB
 });
 
 /**
- * The sell counterpart: no wallet address, no fiat amount, and a crypto amount at a precision
- * the fiat validator could not express. Separate rather than a flag, because the two carry
- * different fields and a builder with both would hand a rail a shape the port does not have.
+ * The sell counterpart: the seller's own sending address, no fiat amount, and a crypto amount at
+ * a precision the fiat validator could not express. Separate rather than a flag, because the two
+ * carry different fields and a builder with both would hand a rail a shape the port does not have.
  */
 export const railSellSessionInput = (overrides: Partial<RailSellSession> = {}): RailSellSession => ({
   direction: 'sell',
   destinationCode: 'DOT',
+  walletAddress: ALICE,
   cryptoAmount: '12.3456789012',
   fiat: 'GBP',
   countryCode: 'GB',
@@ -262,7 +294,8 @@ export const fundingRecord = (overrides: Partial<FundingRecord> = {}): FundingRe
  * Its own builder rather than an override bag at each call site, because the three differences
  * travel together (no address, no fiat amount, a crypto amount) and the database refuses any
  * two of the three. A test that overrode one by hand would be asserting against a row Postgres
- * would not accept.
+ * would not accept. A row with the seller's account overrides `wallet_address` and
+ * `seller_account` together, as `sellRequest` pins them.
  */
 export const sellRecord = (overrides: Partial<FundingRecord> = {}): FundingRecord =>
   fundingRecord({
@@ -298,6 +331,8 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
   // In-memory supported-corridors cache, keyed `${code}|${direction}|${country}`, mirroring the
   // real table's v7 -> v8 primary key.
   const corridors = new Map<string, SupportedCorridorRow>();
+  // Sale vault proxy rows by funding request id, a repeat insert ignored as the real one is
+  const saleVaultProxies = new Map<string, NewSaleVaultProxyRow>();
 
   /** The row already holding this record's (alias, product, reference), if any. */
   const held = (record: FundingRecord): FundingRecord | undefined =>
@@ -328,6 +363,7 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
 
   return {
     rows,
+    saleVaultProxies,
     reserve: async (record: FundingRecord) => {
       checkTerms(record);
       const clash = held(record);
@@ -454,6 +490,21 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       [...corridors.values()]
         .filter((r) => r.destination_currency_code === code && r.direction === direction && r.updated_at >= freshAfter)
         .map((r) => structuredClone(r)),
+    insertSaleVaultProxy: async (row: NewSaleVaultProxyRow) => {
+      if (saleVaultProxies.has(row.funding_request_id)) return;
+      saleVaultProxies.set(row.funding_request_id, {
+        ...row,
+        factory: row.factory.toLowerCase(),
+        implementation: row.implementation.toLowerCase(),
+        claimer: row.claimer.toLowerCase(),
+        home: row.home.toLowerCase(),
+        proxy: row.proxy.toLowerCase(),
+        ref: row.ref.toLowerCase(),
+      });
+    },
+    deleteSaleVaultProxy: async (id: string) => {
+      saleVaultProxies.delete(id);
+    },
     close: async () => undefined,
   };
 }

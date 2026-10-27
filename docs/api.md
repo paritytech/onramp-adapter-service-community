@@ -3,10 +3,11 @@
 Every route, its request and response shape, and the errors it returns.
 See [README.md](../README.md) for what the service is and how to run it.
 
-Twelve routes are authenticated by the short-lived JWT the handshake mints: `GET /assets`,
+Fifteen routes are authenticated by the short-lived JWT the handshake mints: `GET /assets`,
 `POST /quote`, `POST /session`, `GET /supported`, `GET /supported/countries`,
 `GET /supported/corridors`, `GET /supported/offramp`, `GET /supported/offramp/corridors`,
-`GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel` and `GET /transaction/:id`. The
+`GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel`, `GET /offramp/sale/:id`,
+`POST /offramp/returns/:id`, `POST /offramp/relay` and `GET /transaction/:id`. The
 unauthenticated remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
 
 | Endpoint | Proxies | Purpose |
@@ -17,13 +18,16 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Rows not refreshed within three routes passes are retired, but when none is fresh (a boot after a long idle, or a refresh that keeps failing) the last catalog written is served instead, windowed back from its newest row so an already-retired country stays retired, for up to a day past the freshness window. After that, and for a crypto the refresh has never written, it returns `[]`, which the client falls back from. Buy rows exist for every deliverable asset the config names (`dot@assethub`, `usdt@assethub`, `usdc@assethub`); sell rows for DOT and each offramp lane. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
-| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{asset, code, chain, min, max, currency}]}]}]}`. No query parameters (strict). See "Offramp lanes" below. |
-| `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
+| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the sellable offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{asset, code, chain, min, max, currency}]}]}], saleVaultProxy?}`. No query parameters (strict). See "Offramp lanes" below. |
+| `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the sellable offramp lanes, read live: `{country, fiat, methods: [...], saleVaultProxy?}`. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
 | `GET /transaction/:id` | `GET /payments/transactions/{id}` | Status, projected onto the five fields this service declares. |
 | `GET /funding` | `?includeRefused=true` | The caller's open and past funding requests, newest first, capped at 100. **Locally refused requests are excluded by default**: `GET /supported` publishes Meld's live bound but not the tightening a `limits` row applies, so being refused is still how a caller learns the *effective* minimum, and a hundred of them would push the request the buyer is waiting on out of the window. |
 | `GET /funding/:id` | none | One funding request's status + timeline + terms, and, on a live sell whose provider has disclosed one, the deposit address, amount and currency to send to. |
+| `GET /offramp/sale/:id` | none (reads Arbitrum) | The on-chain state of one of the caller's Arbitrum sells: `{sale}`. See "Sale vault proxies" below. |
+| `POST /offramp/returns/:id` | none (asks the keeper) | Asks the keeper to act on that sale's proxy now, then answers `{sale}` as the GET does. Body-less. |
+| `POST /offramp/relay` | USDC `transferWithAuthorization` (sent by the keeper) | Moves USDC off a seller claimer that holds no ETH, from the claimer's own EIP-3009 signature: `202 {relay}`. See "Relaying USDC off a claimer" below. |
 | `POST /funding/:id/cancel` | none | Withdraw a request the buyer no longer wants. Takes away the settlement surface; **does not conclude the request**, so a payment already in flight is still observed and still settles. Refused once a payment has been seen, or, on a sell, once a deposit address has been disclosed. Idempotent. |
 | `GET /health` | none | Liveness. No auth. |
 | `GET /meld/return` | `?flow=sell` | The completion page the widget redirects to, served from this origin so it frames cleanly. Posts `meld:paid` to its parent frame, or `meld:verified` with `?flow=sell` (the seller is back from KYC, nothing was paid). Carries no status and needs no auth; the caller's own `GET /funding/:id` poll stays authoritative. |
@@ -82,7 +86,9 @@ reinterpreted:
 | --- | --- | --- |
 | amount field | `sourceAmount`, the fiat charged | `cryptoAmount`, the crypto sold |
 | format | decimal, at most **2** fraction digits | exact decimal, kept as a string end to end and never rounded or parsed; **this service accepts** up to 30 fraction digits (see the note below on what the provider has been observed to accept) |
-| `walletAddress` | **required** on `/session` | **refused**: the provider issues the deposit address after the session exists |
+| `walletAddress` | **required** on `/session` | **refused**: the service derives it from `sellerAccount`, see "The seller's own address" below |
+| `sellerAccount` | **refused** | optional on `/session` on Asset Hub, **required** on Arbitrum, refused on `/quote` |
+| `sellerClaimer` | **refused** | **required** on `/session` on Arbitrum, refused on Asset Hub and on `/quote` |
 
 **What "30 fraction digits" is and is not a promise about.** 30 is this service's own accepted
 bound, chosen to be wider than any asset's precision so that nothing is ever silently truncated on
@@ -108,8 +114,43 @@ one number and handing back a settlement surface committed to the other one. Sen
 bytes on a retry that you sent the first time.
 
 The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount` or
-`walletAddress`, a buy carrying `cryptoAmount`, or either direction missing its own amount, is a
-local `400 MALFORMED_REQUEST` before any upstream call.
+`walletAddress`, a buy carrying `cryptoAmount`, `sellerAccount` or `sellerClaimer`, or either direction missing its
+own amount, is a local `400 MALFORMED_REQUEST` before any upstream call.
+
+### The seller's own address
+
+A sell's `walletAddress` is the seller's own sending and refund address, never the deposit address
+(the provider issues that after the session exists). Meld marks it optional on a SELL, but Banxa
+refuses a sell without it (`400 CRYPTO_INVALID_DESTINATION_WALLET`), because its sell order names
+the wallet the crypto comes from, which is also where a refund goes.
+
+A caller does not send it. It sends `sellerAccount`, the seller's own Asset Hub account as SS58
+under any prefix, and the service derives `walletAddress` per lane:
+
+| lane chain | `walletAddress` |
+| --- | --- |
+| Asset Hub | the account itself, normalised to prefix 0. Without a `sellerAccount` no address is sent. |
+| Arbitrum | the seller's SaleVaultProxy, EIP-55, predicted from the verified factory and implementation, the account's 32-byte key (the home) and `sellerClaimer`. Needs `sellerAccount` (`400 Other{ SELLER_ACCOUNT_REQUIRED }`), `sellerClaimer` (`400 Other{ SELLER_CLAIMER_REQUIRED }`) and a deployment verified on chain (`503 Other{ SALE_VAULT_PROXY_UNAVAILABLE }`). `cryptoAmount` must be a USDC amount with at most 6 decimals, which the keeper reads in base units (`400 Other{ MALFORMED_REQUEST }`). |
+| Solana | none: the lane is refused `400 RegionUnavailable` on `/quote` and `/session` (operator detail `SELL_LANE_UNSUPPORTED`), even when configured. |
+
+`sellerClaimer` is the seller's own Arbitrum address that the proxy releases USDC to when it cannot
+send it home (the factory retired, a balance too small to return or stale, or returns that keep
+refunding). The client derives it from the seller's own keys; the service never picks one. It is
+`0x` and 40 hex digits, EIP-55 when mixed case, never the zero address, stored lowercase. The
+proxy address is `CREATE2(factory, salt, initcode)` over clone args `home || claimer` (52 bytes)
+with `salt = keccak256(home || claimer)`, exactly the factory's `predict(home, claimer)`, so a
+different claimer is a different proxy. It is a term like the seller account: echoed in `pinned`
+and on `GET /funding/:id`, and a replay naming another claimer is `409 IDEMPOTENCY_KEY_REUSED`. On
+an Asset Hub sell, which pays from the account itself, a claimer is `400 Other{ SELLER_CLAIMER_UNEXPECTED }`.
+
+A `sellerAccount` that is not a 32-byte SS58 account is `400 Other{ INVALID_ADDRESS }`. Both values
+are echoed in `pinned` and on `GET /funding/:id`, and the seller account is a term of the request:
+a replay naming another seller is `409 IDEMPOTENCY_KEY_REUSED`, while the same account under
+another prefix is the same request. A client derives the same `walletAddress` on its own and drops
+the session on any mismatch, before money moves. The derivation runs only on the Meld rail, so a
+Chainflip sell still meets `DIRECTION_UNSUPPORTED` first. A deposit address the provider discloses
+that names the row's own `walletAddress` is never disclosed: Meld may echo the seller's address
+back, and the crypto must not go there.
 
 **The Meld rail serves a sell.** Chainflip still refuses one with
 `400 Other{ DIRECTION_UNSUPPORTED }`, permanently: it has no fiat leg to pay a seller from, and no
@@ -268,6 +309,22 @@ refused `400 RegionUnavailable` before any rail call. Taking the Chainflip swap 
 therefore turns the swap route off for every client, and a country only they routed answers with no
 payout method.
 
+Only **sellable** lanes are listed by the two `/supported/offramp*` routes: Asset Hub always,
+Arbitrum only while the sale vault proxy deployment is verified on chain, Solana never. A configured but
+unsellable lane still boots, logs a warning, and is refused at runtime. While the deployment is
+verified both routes carry it, so a client can check its own build-time values against it:
+
+```json
+"saleVaultProxy": {
+  "chain": "arbitrum",
+  "chainId": 421614,
+  "factory": "0x1111111111111111111111111111111111111111",
+  "implementation": "0x2222222222222222222222222222222222222222"
+}
+```
+
+`factory` and `implementation` are EIP-55. The key is absent, not null, while unverified.
+
 Merge rule, per country: the set of countries is the union across lanes. For each
 `paymentMethodType`, the method lists **every** configured lane (in configuration order) whose corridor
 offers it, as `lanes: [{asset, code, chain, min, max, currency}]`, each with that lane's own limits. `asset`
@@ -297,7 +354,8 @@ rule as `GET /supported/corridors` except that sell rows age out after three *se
 per lane in sell direction.
 
 The sell-only codes (`USDT_SOLANA`, `USDC_SOLANA`, `USDC_ARBITRUM` in the shipped config) are
-accepted wherever `direction=sell` is, and refused with `WrongAssetOrChain` on every buy path. The disclosed
+accepted wherever `direction=sell` is on the discovery routes, and refused with `WrongAssetOrChain`
+on every buy path. A Solana code is still refused on a sell `/quote` and `/session`, see above. The disclosed
 deposit address is validated per chain: a Solana sell discloses a base58 32-byte address, stored and compared
 exactly as given (case-sensitive), not SS58-normalised; an Arbitrum sell discloses an EVM address (`0x` plus 40
 hex), stored lowercased so comparisons are case-insensitive; an Asset Hub sell discloses an SS58 address,
@@ -438,7 +496,7 @@ guarantee about what the provider's widget will allow.
 ```
 
 A sell sends the same body with `direction: "sell"`, `cryptoAmount` in place of `sourceAmount`,
-and no `walletAddress`:
+and `sellerAccount` in place of `walletAddress`:
 
 ```json
 {
@@ -447,6 +505,7 @@ and no `walletAddress`:
   "country": "GB",
   "fiat": "GBP",
   "destinationCurrencyCode": "DOT",
+  "sellerAccount": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
   "cryptoAmount": "12.3456789012",
   "paymentMethodType": "PAYOUT_TO_BANK",
   "serviceProvider": "TRANSAK"
@@ -488,11 +547,12 @@ Rejected as `REDIRECT_NOT_ALLOWED`, locally.
 }
 ```
 
-On a sell, `pinned` carries `cryptoAmount` and no `walletAddress` or `sourceAmount`: those are
-terms a sell does not commit, and they are absent rather than empty. **`cryptoAmount` is the term
-a resuming client compares against.** On a buy the wallet address distinguishes two purchases in
-one corridor; a sell has none, so this is the only thing between two sales of the same asset in
-the same corridor, and a mismatch must be treated as "this is a different sale", not a warning.
+On a sell, `pinned` carries `cryptoAmount`, the normalised `sellerAccount` and the derived
+`walletAddress` when a seller was sent, `sellerClaimer` on Arbitrum, and no `sourceAmount`: absent terms are absent rather than
+empty. **`cryptoAmount` is the term a resuming client compares against.** On a buy the wallet
+address distinguishes two purchases in one corridor; a sell may have none, so this is the only
+thing between two sales of the same asset in the same corridor, and a mismatch must be treated as
+"this is a different sale", not a warning.
 
 `serviceProviderWidgetUrl` is the provider's capture page, always present. `widgetUrl` is Meld's
 own hosted widget for the session, present only when Meld returns one; a product embedding Meld's
@@ -601,8 +661,9 @@ for another caller's alike.
 }
 ```
 
-`direction` is always present. On a sell row, `walletAddress` and `sourceAmount` are absent and
-`cryptoAmount` carries the committed crypto at full precision; see `direction` above for why that
+`direction` is always present. On a sell row, `sourceAmount` is absent, `walletAddress`,
+`sellerAccount` and on Arbitrum `sellerClaimer` are the seller's own when one was sent, and `cryptoAmount` carries the committed
+crypto at full precision; see `direction` above for why that
 echo is load-bearing rather than informational. A sell moves through the **same** eight states a
 buy does: the direction is a term of the request, not a stage of its life.
 
@@ -659,6 +720,149 @@ the request is non-terminal, the rail's expiry has not passed, and the caller ha
 a buyer who closed the tab can be sent back. A dead capture page would invite a second payment. No
 Meld session or transaction id is carried: those are internal join keys.
 
+## Sale vault proxies
+
+An Arbitrum sell pays from the seller's own SaleVaultProxy, a contract at the `walletAddress` the
+session pinned. Chainflip delivers the swapped USDC to the factory, which deploys the proxy if
+needed and has it pay the provider. Each sale is booked on the proxy under its own terms (its `ref`,
+the provider's deposit address and the committed amount), and pays only its own committed amount
+from its own delivery, so one seller's later sale on the same proxy is a separate record. Anything a
+sale cannot pay out, or a provider refund, stays on the proxy until it goes back to the seller's
+Asset Hub account. An in-process keeper watches the factory's logs and every USDC transfer to a
+watched proxy (a Chainflip or provider refund), and acts on the proxies they name; nobody holds funds
+on the seller's behalf.
+
+`GET /offramp/sale/:id` answers `{ "sale": ... }` for one of the caller's sells.
+`POST /offramp/returns/:id` takes no body, evaluates that sale's proxy at once (it waits only for the
+signing step, never for a whole keeper pass), and answers `200` with the same object whatever it did:
+what happened shows in `call` and `blockedReason`.
+
+```json
+{
+  "fundingRequestId": "3f1a9c04-8e2b-4d77-9a10-1c5b7e0d2f43",
+  "chain": "arbitrum",
+  "chainId": 421614,
+  "factory": "0x1111111111111111111111111111111111111111",
+  "implementation": "0x2222222222222222222222222222222222222222",
+  "proxy": "0x4444444444444444444444444444444444444444",
+  "home": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "claimer": "0x3333333333333333333333333333333333333333",
+  "ref": "0x...",
+  "deployed": true,
+  "status": "paid",
+  "recipient": "0x5555555555555555555555555555555555555555",
+  "committed": "50000000",
+  "amount": "50400000",
+  "leftover": "400000",
+  "balance": "400000",
+  "pending": "0",
+  "deferred": "0",
+  "waiting": "400000",
+  "minReturn": "1000000",
+  "returnable": false,
+  "attempts": 0,
+  "nextReturnAt": null,
+  "releaseAt": 1800086400000,
+  "releasable": "0",
+  "claimerBalance": "0",
+  "released": [],
+  "flushedToClaimer": [],
+  "blockedReason": "below-minimum",
+  "call": null
+}
+```
+
+Amounts are USDC base units as decimal strings. Per sale, read with the proxy's
+`delivery(ref, recipient, committed)`: `status` is `none` (nothing booked under these terms), `paid`
+(the provider was paid, `leftover` may remain) or `held` (short, bad terms, delivered after the
+sale's payment deadline or a failed payout, the whole `amount` goes home); `recipient` and `committed` are the provider's deposit address and the
+committed crypto in base units off the funding row, `null` and `"0"` until the provider discloses the
+address; `amount` is what this sale delivered and `leftover` what the provider was not owed at pay
+time. `deferred` is this sale's delivery the factory held back for gas, summed over every payment
+deadline a `DeliveryDeferred` log recorded for these terms (`pendingDelivery` per deadline, `"0"`
+before any such log is read), which the keeper releases with `deliver`. Per proxy: `claimer`, the seller's Arbitrum address bound
+into the proxy address (EIP-55), the only place `release()` and a refused flush can pay; `balance`;
+`pending`, the factory's funds-only booking for the home and claimer; `waiting`, balance below
+`minReturn`, which Chainflip cannot carry and which goes to the claimer at `releaseAt`;
+`attempts` and `nextReturnAt` (epoch ms, `null` before the first return since the last delivery);
+`releaseAt`, the proxy's own `state()` release time in epoch ms (last activity plus `RELEASE_DELAY`
+below `minReturn`, plus `STALE_DELAY` otherwise; `0` once the factory is retired or `RELEASE_ATTEMPTS`
+returns were sent and the balance is at least `minReturn` above what the last return left behind while that return's refund window (`lastReturnAt` plus `RELEASE_DELAY`) is open, meaning open now; `null` before the deploy and while a balance of at least
+`minReturn` has no delivery or return yet, when the contract has no release time for it); `releasable`, what `release()` would
+send the claimer right now (the whole balance once `releaseAt` passed, else `"0"`); `claimerBalance`,
+the claimer's live USDC balance in base units, read on every request, which is what a relay can move
+off it; `released`, every
+`Released` log of the proxy the keeper read, whoever sent the release; `flushedToClaimer`, every `PendingFlushed` log whose
+`to` is the claimer (the proxy refused the credit). Both lists are `[{ "amount", "txHash", "at" }]`,
+oldest first, `amount` in base units and `at` the epoch ms the keeper read the log.
+`returnable` is `pending > 0 || (balance >= minReturn && (attempts < RELEASE_ATTEMPTS || releasable == 0))`
+while the factory is not retired, deferred not counted, the same condition the keeper returns under: at
+the attempt cap the contract opens release only on a balance at least `minReturn` above what the last return left behind and only within `RELEASE_DELAY` of that return, so a later refund goes home. The keeper sends a balance home while it can (at least `minReturn`, not retired, fewer than
+`RELEASE_ATTEMPTS` returns or release still shut) and releases it to the claimer once `releasable` is above zero and the
+return is not possible or held back.
+`blockedReason` is `not-due`, `below-minimum` (waiting for `releaseAt`), `not-swappable` (Chainflip would ignore or confiscate the chunk, or the quote misses the floor), `route-refused` (Chainflip would refund it: retry window over its cap or broker unregistered), `vault-changed` (Chainflip's live Arbitrum Vault is no longer the proxy's immutable one, so a return would be lost), `chain-unavailable` or `null`.
+On the GET, `not-swappable`, `route-refused`, `vault-changed` and `chain-unavailable` are the keeper's
+own last judgement of the proxy, from its latest pass or `POST /offramp/returns/:id`, and stay until a
+later judgement returns, releases, finds the proxy empty or finds another reason. They are held in the
+keeper's memory, not stored, since every pass judges a held proxy again: after a restart, or on a
+replica that is not running the keeper, the GET falls back to what one read tells, `not-due`,
+`below-minimum` or `null`, until the next judgement there. The `POST` always answers with the reason it
+just judged.
+`call` is the latest keeper call on the proxy, `action` one of `deliver`, `expire`, `flush`, `deploy`,
+`return` or `release`, `status` one of `sending`, `sent`, `mined`, `reverted` or `dropped`.
+
+Both routes answer `404` for an unknown id and for another caller's alike, `409 Other{ SALE_NOT_VAULT_PROXY }`
+for a sell that does not pay through a proxy, `503 Other{ SALE_VAULT_PROXY_UNAVAILABLE }` while the
+sale's deployment is not configured or not verified (a sale of a `sale_vault_proxy.retired` factory
+is still served), and `503 Other{ SALE_VAULT_PROXY_CHAIN_UNAVAILABLE }` when Arbitrum could not be read.
+
+### Relaying USDC off a claimer
+
+USDC a proxy releases lands on the seller's claimer, an address that usually holds no ETH for gas.
+`POST /offramp/relay` sends a USDC `transferWithAuthorization` (EIP-3009) the claimer signed, with
+the keeper's key paying the gas:
+
+```json
+{
+  "from": "0x6666666666666666666666666666666666666666",
+  "to": "0x5555555555555555555555555555555555555555",
+  "value": "1500000",
+  "validAfter": "0",
+  "validBefore": "1900000000",
+  "nonce": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+  "signature": "0x<r><s><v>"
+}
+```
+
+The client signs EIP-712 typed data `TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)`
+under the USDC token's own domain (on both Arbitrum networks `name` is `USD Coin` and `version` is
+`2`; the service reads the token's `DOMAIN_SEPARATOR()` rather than assuming them). `value` is USDC
+base units and must be the claimer's whole balance, the window is unix seconds, `nonce` is any unused 32 bytes, `signature` is 65 bytes
+`r || s || v` with `v` 27 or 28. `202` answers `{ "relay": { "status": "sent", "chainId", "txHash" } }`
+once the keeper broadcast it; read the outcome on chain.
+
+Before any gas is spent the service refuses, in this order:
+
+| Status | Code | When |
+| --- | --- | --- |
+| 503 | `SALE_VAULT_PROXY_UNAVAILABLE` | No verified deployment, the keeper loop is off, or the token's `TRANSFER_WITH_AUTHORIZATION_TYPEHASH()` is not the struct above. |
+| 400 | `RELAY_SELF_TRANSFER` | `to` equals `from`. |
+| 400 | `RELAY_OUTSIDE_WINDOW` | Now is not strictly after `validAfter` and strictly before `validBefore`, the token's own rule. |
+| 403 | `RELAY_NOT_CLAIMER` | `from` is not the `sellerClaimer` of any sale under the caller's product. |
+| 400 | `RELAY_TO_SALE_ADDRESS` | `to` is a recorded claimer or proxy, which would let one balance cycle through relays on the keeper's gas. |
+| 400 | `RELAY_BAD_SIGNATURE` | The signature does not recover to `from`, or is one the token refuses (high `s`, `v` not 27 or 28). |
+| 409 | `RELAY_NONCE_USED` | The token's `authorizationState(from, nonce)` says it was used or cancelled. |
+| 409 | `RELAY_INSUFFICIENT_BALANCE` | `balanceOf(from)` is below `value`. |
+| 409 | `RELAY_NOT_WHOLE_BALANCE` | `balanceOf(from)` is above `value`: a relay moves the whole balance, so each keeper-paid relay empties the claimer and refilling it costs the sender gas. Re-read the balance and sign again. |
+| 422 | `RELAY_WOULD_REVERT` | Gas estimation reverts (the token is paused, either side is blacklisted, or the state changed). |
+| 409 | `RELAY_BUSY` | A relay from this claimer is still in flight. Retry shortly. |
+| 503 | `RELAY_KEEPER_BUSY` | Another keeper pass holds the keeper lock, on this replica or another. Retry shortly. |
+| 503 | `SALE_VAULT_PROXY_CHAIN_UNAVAILABLE` | Arbitrum could not be read, before or while preparing the send. |
+
+`to` is the seller's choice: the token pays only the `to` they signed, so nobody relaying it can
+redirect it. A replay is refused by the token's nonce. The route counts against the caller's rate
+limit, and one relay per claimer is in flight at a time.
+
 ## Durable funding
 
 `POST /session` writes a row to Postgres (CloudSQL; the schema is versioned and migrated under an
@@ -704,10 +908,17 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 409 | `Other{ REQUEST_CONCLUDED }` | The key belongs to a request that ended as `expired` or `failed`. On a buy the rail answered and nothing was paid; start a new one with a new key. On a sell, `failed` can follow a deposit the seller already sent (the provider failed or refunded the payout), so this is not a promise that nothing left the seller: read the request before opening another sale for the same funds. (`refused` shares this code but never reaches the path: a refused row holds no key.) |
 | 409 | `Other{ REQUEST_ALREADY_SETTLED }` | The key belongs to a request the buyer **already paid**. Do not start another for it. Split out of `REQUEST_CONCLUDED` because a client cannot act on one code for both: told "start a new one" after a settled purchase, it opens a second payable surface for money already taken. |
 | 409 | `Other{ REQUEST_OUTCOME_UNKNOWN }` | The key belongs to a request that concluded as `unobserved`: we stopped being able to ask the rail and never learned whether the buyer paid. Distinct from **both** other 409 conclusions: `REQUEST_CONCLUDED` says it finished and nothing was paid, `REQUEST_ALREADY_SETTLED` says it finished and *was* paid, this one says nobody knows which. Starting a new request means accepting the risk of paying twice. |
-| 400 | `RegionUnavailable` | A real destination this deployment has not configured, or a sell of a code that is not one of `supported.offramp_lanes`. |
+| 400 | `RegionUnavailable` | A real destination this deployment has not configured, a sell of a code that is not one of `supported.offramp_lanes`, or a sell on a lane this service cannot derive a sending address for (Solana). |
 | 400 | `BelowMinimum` / `AboveMaximum` | On a **buy**, outside the effective fiat bounds (Meld's live corridor bound, tightened by a `limits` row when one names that pair), carrying `value: { amount, currency }` in fiat. On a **sell**, the provider's own crypto-denominated bound, refused upstream and carrying **no** `value`; see `direction` above for why a crypto threshold is not put on the wire. |
 | 400 | `Other{ CORRIDOR_UNAVAILABLE }` | A configured `limits` row does not overlap the live corridor bound, so this deployment cannot serve the corridor within its own limits. Refused rather than widened to the upstream bound. |
-| 400 | `Other{ INVALID_ADDRESS }` | Address failed to decode, or is not a 32-byte account. |
+| 400 | `Other{ INVALID_ADDRESS }` | Address or `sellerAccount` failed to decode, or is not a 32-byte account. |
+| 400 | `Other{ SELLER_ACCOUNT_REQUIRED }` | An Arbitrum sell without `sellerAccount`, which its sending address is derived from. |
+| 400 | `Other{ SELLER_CLAIMER_REQUIRED }` | An Arbitrum sell without `sellerClaimer`, which its sending address is derived from. |
+| 400 | `Other{ SELLER_CLAIMER_UNEXPECTED }` | A `sellerClaimer` on an Asset Hub sell, which has no proxy to bind it to. |
+| 400 to 503 | `Other{ RELAY_* }` | `POST /offramp/relay` refusals, see "Relaying USDC off a claimer". |
+| 503 | `Other{ SALE_VAULT_PROXY_UNAVAILABLE }` | An Arbitrum sell `/quote` or `/session`, or a sale route, while the sale vault proxy deployment is not configured or not verified on chain, or its sale vault proxy could not be recorded. Retry later. |
+| 503 | `Other{ SALE_VAULT_PROXY_CHAIN_UNAVAILABLE }` | A sale route could not read Arbitrum. Retry later. |
+| 409 | `Other{ SALE_NOT_VAULT_PROXY }` | A sale route for a sell that does not pay through a sale vault proxy. |
 | 400 | `Other{ CURRENCY_UNSUPPORTED }` | No provider routes this `(country, fiat, destination)` in the requested `direction` (buy or sell). Checked locally against the live corridor, before any provider call. |
 | 400 | `Other{ PAYMENT_METHOD_UNSUPPORTED }` | The live corridor for this `(country, fiat, destination, direction)` does not offer the requested `paymentMethodType`. Ask `GET /supported` for the ones it does. Not retryable as sent. |
 | 400 | `Other{ MALFORMED_REQUEST }` | Body did not parse, named an unexpected field, or a field failed its bounds. **Which field is in the log against this `request_id`, never in the body**, so an integrator debugging a 400 needs the server's log line and not just the response. |

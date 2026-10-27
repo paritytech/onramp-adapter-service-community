@@ -198,9 +198,9 @@ describe('createWidgetSession', () => {
     // `sessionType` is `SELL` (the enum is `BUY, SELL, TRANSFER`); `sourceCurrencyCode` is the
     // crypto and `destinationCurrencyCode` the fiat, which the server enforces rather than
     // merely accepts; `sourceAmount` is the crypto committed, at a precision the fiat field
-    // could not hold; there is no `walletAddress` at all, because Meld does not require one
-    // on a SELL and issues the deposit address itself; and `redirectFlow` asks the providers
-    // that honour it for Meld's preferred off-ramp flow.
+    // could not hold. There is no `walletAddress` when the sell pinned none, and Meld issues the
+    // deposit address itself. And `redirectFlow` asks the providers that honour it for Meld's
+    // preferred off-ramp flow.
     expect(JSON.parse(sentInit(fetchMock).body as string)).toEqual({
       sessionType: 'SELL',
       sessionData: {
@@ -238,17 +238,26 @@ describe('createWidgetSession', () => {
     );
   });
 
-  it('omits walletAddress from a sell entirely, rather than sending it empty', async () => {
+  it('omits walletAddress from a sell that pinned none, rather than sending it empty', async () => {
     // Asserted on its own as well as inside the whole-body case above, because this endpoint
-    // accepts unknown and meaningless fields with a `200` — a bad address, and an invented key,
+    // accepts unknown and meaningless fields with a `200`, a bad address and an invented key
     // both succeed. So nothing upstream would ever complain about an empty or placeholder
-    // `walletAddress` on a sell; it would simply sit in the request looking like a pinned
-    // destination to anyone auditing it, and be read by nobody.
+    // `walletAddress` on a sell, it would simply sit in the request looking like a pinned
+    // address to anyone auditing it.
     const fetchMock = stub(200, session);
     await client().createWidgetSession(sellParams());
 
     const body = sentBody(fetchMock) as { sessionData: Record<string, unknown> };
     expect(body.sessionData).not.toHaveProperty('walletAddress');
+  });
+
+  it("sends a sell's own sending address when one is pinned", async () => {
+    // Banxa refuses a sell without it: 400 CRYPTO_INVALID_DESTINATION_WALLET
+    const fetchMock = stub(200, session);
+    await client().createWidgetSession({ ...sellParams(), walletAddress: '0xfb63126B916e3bD2497702a0139AD2B344aC7536' });
+
+    const body = sentBody(fetchMock) as { sessionData: Record<string, unknown> };
+    expect(body.sessionData.walletAddress).toBe('0xfb63126B916e3bD2497702a0139AD2B344aC7536');
   });
 
   it('derives sessionType from the direction rather than from any other field', async () => {

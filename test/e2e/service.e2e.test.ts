@@ -275,10 +275,14 @@ async function fakeMeld(
             json({ code: 'BAD_REQUEST', errors: ['[sessionType] value is not one of: BUY, SELL, TRANSFER'] }, 400);
             return;
           }
-          // The one field whose requirement genuinely differs by direction (verified): a BUY
-          // without `walletAddress` is refused, a SELL without one is accepted.
+          // A BUY without `walletAddress` is refused (verified). A SELL without one is refused
+          // as Meld answers it for BANXA, whose sell order needs the wallet the crypto comes from.
           if (body.sessionType === 'BUY' && typeof data.walletAddress !== 'string') {
             json({ code: 'BAD_REQUEST', errors: ['[sessionData.walletAddress] must not be blank'] }, 400);
+            return;
+          }
+          if (body.sessionType === 'SELL' && typeof data.walletAddress !== 'string') {
+            json({ code: 'CRYPTO_INVALID_DESTINATION_WALLET', message: 'The walletAddress is required.' }, 400);
             return;
           }
           // And the same source-must-be-crypto rule as the quote, which is server-enforced on
@@ -904,9 +908,9 @@ describe('the funding journey over real HTTP', () => {
   it('quotes and opens a sell against a Meld that enforces the direction rules', async () => {
     /**
      * The sell path end to end, through the built artifact, over a real socket, against a real
-     * Postgres — and against a fake Meld that enforces the two rules the real one enforces: the
-     * source currency must be the crypto on a sell, and `walletAddress` is required on a buy and
-     * not on a sell. That is what makes this more than a smoke test.
+     * Postgres, and against a fake Meld that enforces the rules the real one enforces: the
+     * source currency must be the crypto on a sell, and `walletAddress` is required on a buy and,
+     * as Banxa requires it, on a sell. That is what makes this more than a smoke test.
      *
      * Be precise about what catches a regression here, because the two calls differ. A crossed
      * sell **session** is refused by the fake with "Source currency is not a valid crypto
@@ -971,6 +975,7 @@ describe('the funding journey over real HTTP', () => {
         country: 'GB',
         fiat: 'GBP',
         destinationCurrencyCode: 'DOT',
+        sellerAccount: WALLET,
         cryptoAmount: '12.3456789012',
         paymentMethodType: 'PAYOUT_TO_BANK',
         serviceProvider: 'TRANSAK',
@@ -982,8 +987,11 @@ describe('the funding journey over real HTTP', () => {
       expiresAt?: number;
       pinned: Record<string, unknown>;
     };
+    // The service derives the seller's own address from the account and echoes both
     expect(created.pinned).toEqual({
       destinationCurrencyCode: 'DOT',
+      walletAddress: WALLET,
+      sellerAccount: WALLET,
       cryptoAmount: '12.3456789012',
       fiat: 'GBP',
       country: 'GB',
@@ -997,14 +1005,15 @@ describe('the funding journey over real HTTP', () => {
     // observes the seller's deposit.
     const rows = await rawQuery(
       schema,
-      'SELECT direction, crypto_amount, source_amount, wallet_address, status, expires_at FROM funding_requests',
+      'SELECT direction, crypto_amount, source_amount, wallet_address, seller_account, status, expires_at FROM funding_requests',
     );
     expect(rows).toEqual([
       {
         direction: 'sell',
         crypto_amount: '12.3456789012',
         source_amount: null,
-        wallet_address: null,
+        wallet_address: WALLET,
+        seller_account: WALLET,
         status: 'session_opened',
         expires_at: null,
       },

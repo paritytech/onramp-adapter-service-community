@@ -11,14 +11,16 @@
  * neutral rail input, calls through the seam, and persists the neutral result.
  */
 
-import { normalizeAddress } from './address.js';
+import { normalizeAddress, normalizeSellerAccount, saleVaultProxyUnverified, sellLaneUnsupported, sellWalletFor } from './address.js';
 import { railRefusal } from './meld/refusal.js';
 import type { AuditEvent, AuditLog } from './audit.js';
 import type { Subject } from './auth.js';
 import { originAllowed, type Config } from './config.js';
 import {
+  malformedRequest,
   Refusal,
   reject,
+  saleVaultProxyUnavailable,
   type CreateSessionRequest,
   type CreateSessionResponse,
   type QuoteRequest,
@@ -28,7 +30,7 @@ import {
 } from './contract.js';
 import { TERMINAL_STATES } from './funding/state.js';
 import type { FundingRecord } from './funding/types.js';
-import type { FundingStore, StoredMethod } from './funding/store.js';
+import type { FundingStore, NewSaleVaultProxyRow, StoredMethod } from './funding/store.js';
 import type {
   Direction,
   FundingRail,
@@ -43,15 +45,19 @@ import {
   mergeOfframpCorridors,
   type LaneCorridor,
   type OfframpCorridor,
+  type OfframpLane,
   type OfframpMethod,
+  laneSellable,
 } from './offramp.js';
-import { toMinorUnits } from './money.js';
+import { toMinorUnits, USDC_AMOUNT, USDC_DECIMALS } from './money.js';
 import type { Corridor, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
+import { saleRef } from './salevaultproxy/abi.js';
+import { saleVaultProxyPayload, type SaleVaultProxyLookup, type SaleVaultProxyPayload, type VerifiedSaleVaultProxy } from './salevaultproxy/verify.js';
 
 /** Just the store surface onramp touches, injectable in a test. */
 export type FundingPort = Pick<
   FundingStore,
-  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel' | 'readCorridors'
+  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel' | 'readCorridors' | 'insertSaleVaultProxy' | 'deleteSaleVaultProxy'
 >;
 
 /** One corridor as the bulk endpoint serves it: the stored row without the internal keys. */
@@ -89,6 +95,8 @@ export type Clock = () => number;
 interface Committed {
   pinned: CreateSessionResponse['pinned'];
   redirectUrl: string | undefined;
+  /** The proxy an Arbitrum sell pays from, for the keeper to watch once the session opens. */
+  saleVaultProxy: Omit<NewSaleVaultProxyRow, 'funding_request_id' | 'ref'> | undefined;
 }
 
 /**
@@ -134,11 +142,13 @@ function auditDirection(direction: Direction): { direction?: Direction } {
  */
 function auditTerms(terms: CreateSessionResponse['pinned']): Pick<
   AuditEvent,
-  'destinationCurrencyCode' | 'walletAddress' | 'sourceAmount' | 'cryptoAmount' | 'fiat'
+  'destinationCurrencyCode' | 'walletAddress' | 'sellerAccount' | 'sellerClaimer' | 'sourceAmount' | 'cryptoAmount' | 'fiat'
 > {
   return {
     destinationCurrencyCode: terms.destinationCurrencyCode,
     ...(terms.walletAddress === undefined ? {} : { walletAddress: terms.walletAddress }),
+    ...(terms.sellerAccount === undefined ? {} : { sellerAccount: terms.sellerAccount }),
+    ...(terms.sellerClaimer === undefined ? {} : { sellerClaimer: terms.sellerClaimer }),
     ...(terms.sourceAmount === undefined ? {} : { sourceAmount: terms.sourceAmount }),
     ...(terms.cryptoAmount === undefined ? {} : { cryptoAmount: terms.cryptoAmount }),
     fiat: terms.fiat,
@@ -156,12 +166,14 @@ function auditTerms(terms: CreateSessionResponse['pinned']): Pick<
  *
  * The `cryptoAmount` echo is load-bearing on a sell. A resuming client compares it against the
  * sale it believes it is resuming and refuses on a mismatch; on a buy the wallet address does
- * that job, and a sell has none.
+ * that job, and a sell may have none.
  */
 function pinnedOf(record: FundingRecord): CreateSessionResponse['pinned'] {
   return {
     destinationCurrencyCode: record.destination_currency_code,
     ...(record.wallet_address === undefined ? {} : { walletAddress: record.wallet_address }),
+    ...(record.seller_account === undefined ? {} : { sellerAccount: record.seller_account }),
+    ...(record.seller_claimer === undefined ? {} : { sellerClaimer: record.seller_claimer }),
     ...(record.source_amount === undefined ? {} : { sourceAmount: record.source_amount }),
     ...(record.crypto_amount === undefined ? {} : { cryptoAmount: record.crypto_amount }),
     fiat: record.fiat,
@@ -182,7 +194,19 @@ export class Onramp {
     // meaning unchanged. Absent, the limit gate falls back to `config.limits`, which is also the
     // degraded path when discovery is present but Meld's public catalog is briefly unreachable.
     private readonly discovery?: Discovery,
+    // The verified sale vault proxy deployment, read per request because the keeper can verify it later
+    private readonly saleVaultProxy?: SaleVaultProxyLookup,
   ) {}
+
+  /** The deployment, only once it is verified on chain. */
+  private verifiedSaleVaultProxy(): VerifiedSaleVaultProxy | undefined {
+    return this.saleVaultProxy?.();
+  }
+
+  /** Lanes a sell can be opened on now, Arbitrum only once its proxy is verified. */
+  private sellableLanes(proxy: VerifiedSaleVaultProxy | undefined): OfframpLane[] {
+    return this.cfg.supported.offramp_lanes.filter((lane) => laneSellable(lane.chain, proxy !== undefined));
+  }
 
   /** The methods + fiat min/max a corridor offers, for the buyer's (or seller's) amount screen.
    *  Refuses an unknown crypto as `WrongAssetOrChain` before any probe. `direction` is absent
@@ -243,7 +267,7 @@ export class Onramp {
   async offrampCorridors(): Promise<OfframpCorridor[]> {
     const freshAfter = this.clock() - this.cfg.supported.sell_routes_interval_ms * STALE_PASSES;
     const rows: LaneCorridor[] = [];
-    for (const lane of this.cfg.supported.offramp_lanes) {
+    for (const lane of this.sellableLanes(this.verifiedSaleVaultProxy())) {
       for (const r of await this.funding.readCorridors(lane.code, 'sell', freshAfter)) {
         rows.push({ lane, country: r.country, name: r.name, fiat: r.fiat, methods: r.methods });
       }
@@ -251,8 +275,10 @@ export class Onramp {
     return mergeOfframpCorridors(rows);
   }
 
-  /** One country's sell methods across the configured lanes, live from discovery. */
-  async offramp(country: string): Promise<{ country: string; fiat: string; methods: OfframpMethod[] }> {
+  /** One country's sell methods across the sellable lanes, live from discovery, with the deployment once verified. */
+  async offramp(
+    country: string,
+  ): Promise<{ country: string; fiat: string; methods: OfframpMethod[]; saleVaultProxy?: SaleVaultProxyPayload }> {
     if (this.discovery === undefined) {
       throw reject(
         { tag: 'Other', value: { code: 'DISCOVERY_UNAVAILABLE', message: 'Capability discovery is not configured.' } },
@@ -261,13 +287,14 @@ export class Onramp {
       );
     }
     const discovery = this.discovery;
+    const proxy = this.verifiedSaleVaultProxy();
     // Each lane reads its own route, so one lane's failure (a 429 or a 5xx from Meld) counts as that
     // lane having no methods rather than failing the whole answer while the others replied. When
     // every lane fails there is no answer to give, and an empty-but-OK reply would read as "this
     // country has no sell routes" during a total Meld outage, so the first failure is rethrown.
     const failures: unknown[] = [];
     const views: LaneCorridor[] = await Promise.all(
-      this.cfg.supported.offramp_lanes.map(async (lane): Promise<LaneCorridor> => {
+      this.sellableLanes(proxy).map(async (lane): Promise<LaneCorridor> => {
         try {
           const c = await discovery.corridorForCountry(country, lane.code, 'sell');
           return { lane, country: c.country, fiat: c.fiat, methods: c.methods };
@@ -280,7 +307,12 @@ export class Onramp {
     if (failures.length > 0 && failures.length === views.length) throw failures[0];
     const fiat = views.find((v) => v.methods.length > 0)?.fiat ?? views.find((v) => v.fiat !== '')?.fiat ?? '';
     const methods = mergeMethods(views, fiat);
-    return { country, fiat, methods };
+    return {
+      country,
+      fiat,
+      methods,
+      ...(proxy === undefined ? {} : { saleVaultProxy: saleVaultProxyPayload(proxy) }),
+    };
   }
 
   /**
@@ -447,7 +479,7 @@ export class Onramp {
       if (cause instanceof Refusal) await this.refuse(subject, requestId, request, cause, name, direction);
       throw cause;
     }
-    const { pinned, redirectUrl } = committed;
+    const { pinned, redirectUrl, saleVaultProxy } = committed;
 
     const now = this.clock();
     const fundingId = this.newId();
@@ -471,6 +503,8 @@ export class Onramp {
         direction,
         destinationCurrencyCode: pinned.destinationCurrencyCode,
         walletAddress: pinned.walletAddress,
+        sellerAccount: pinned.sellerAccount,
+        sellerClaimer: pinned.sellerClaimer,
         sourceAmount: pinned.sourceAmount,
         cryptoAmount: pinned.cryptoAmount,
         fiat: pinned.fiat,
@@ -521,7 +555,12 @@ export class Onramp {
       // committed term, so this needs no column and no migration.
       const differs =
         already.destination_currency_code !== pinned.destinationCurrencyCode ||
-        already.wallet_address !== pinned.walletAddress ||
+        // A factory rotation between attempts is the same request, the stored address is replayed
+        (already.seller_account === undefined && already.wallet_address !== pinned.walletAddress) ||
+        // The seller is a term too, two sellers on one key are two sales
+        already.seller_account !== pinned.sellerAccount ||
+        // The claimer picks the proxy address and who a release pays, so a different one is a different sale
+        already.seller_claimer !== pinned.sellerClaimer ||
         already.source_amount !== pinned.sourceAmount ||
         // Both new terms are in from the first day they exist, rather than added after someone
         // notices. The v1 -> v2 `country` migration is here because a committed term was left out
@@ -556,10 +595,37 @@ export class Onramp {
       return this.replay(subject, requestId, already);
     }
 
+    // Recorded before the rail call, so an opened sale always has its proxy watched, and dropped again if the rail refuses
+    if (saleVaultProxy !== undefined) {
+      try {
+        await this.funding.insertSaleVaultProxy({ funding_request_id: fundingId, ref: saleRef(fundingId), ...saleVaultProxy });
+      } catch {
+        // Nothing opened upstream yet, so the key is freed for the retry
+        const refusal = saleVaultProxyUnavailable(`sale vault proxy for funding request ${fundingId} could not be recorded`);
+        await this.funding
+          .update(fundingId, 'refused', this.clock(), { releaseReference: true, reason: refusal.failure.tag })
+          .catch(() => undefined);
+        this.audit.info(
+          {
+            event: 'session.refused',
+            alias: subject.alias,
+            productId: subject.productId,
+            requestId,
+            rail: name,
+            ...auditDirection(direction),
+            ...auditTerms(pinned),
+            reason: 'sale_vault_proxy_record_failed',
+          },
+          'sale vault proxy could not be recorded',
+        );
+        throw refusal;
+      }
+    }
+
     let session;
     try {
       // The same split as `quote`: one set of legs, and the committed amount the direction
-      // actually has. A sell additionally carries no address, because there is none to carry.
+      // actually has. A sell carries the seller's own address only when one was derived.
       const opening = {
         destinationCode: pinned.destinationCurrencyCode,
         fiat: pinned.fiat,
@@ -572,7 +638,12 @@ export class Onramp {
       };
       session = await rail.createSession(
         direction === 'sell'
-          ? { ...opening, direction, cryptoAmount: committedTerm(pinned.cryptoAmount, 'cryptoAmount', direction) }
+          ? {
+              ...opening,
+              direction,
+              cryptoAmount: committedTerm(pinned.cryptoAmount, 'cryptoAmount', direction),
+              walletAddress: pinned.walletAddress,
+            }
           : {
               ...opening,
               direction,
@@ -631,6 +702,8 @@ export class Onramp {
           'reservation left open after the rail refused',
         );
       }
+      // No session opened, so its proxy row would only crowd the keeper
+      if (definitive && saleVaultProxy !== undefined) await this.funding.deleteSaleVaultProxy(fundingId).catch(() => undefined);
       // A refusal by the rail is a thing this service did, and the audit stream is where a dispute
       // is answered from. Every local refusal was recorded and every provider-side one was not,
       // so "what was attempted for this person" had a hole exactly where the money was.
@@ -1183,8 +1256,13 @@ export class Onramp {
    * rail call, whatever a client asks for.
    */
   private async sellCorridorCheck(code: string, currency: string, country: string, method: string): Promise<void> {
-    if (!this.cfg.supported.offramp_lanes.some((lane) => lane.code === code)) {
-      throw reject({ tag: 'RegionUnavailable' }, `${code} is not a configured offramp lane.`);
+    const lane = this.cfg.supported.offramp_lanes.find((l) => l.code === code);
+    if (lane === undefined) throw reject({ tag: 'RegionUnavailable' }, `${code} is not a configured offramp lane.`);
+    // A configured lane that cannot sell still boots, it is refused here at runtime on /quote and /session alike
+    if (!laneSellable(lane.chain, this.verifiedSaleVaultProxy() !== undefined)) {
+      throw lane.chain === 'arbitrum'
+        ? saleVaultProxyUnverified(code)
+        : sellLaneUnsupported(code);
     }
     if (this.discovery === undefined) return;
     await this.corridorMethod(this.discovery, code, currency, country, method, 'sell');
@@ -1224,12 +1302,14 @@ export class Onramp {
   ): Promise<Committed> {
     const destination = resolveForDirection(request.destinationCurrencyCode, direction);
     const currency = request.fiat.toUpperCase();
-    // Only a buy has an address to pin. On a sell the schema has already refused one, and the
-    // deposit address the seller will use is the provider's, issued after the session exists.
-    const walletAddress =
+    // A buy pins its delivery address, a Meld sell derives the seller address below
+    let walletAddress =
       direction === 'sell'
         ? undefined
         : normalizeAddress(committedTerm(request.walletAddress, 'walletAddress', direction));
+    let sellerAccount: string | undefined;
+    let sellerClaimer: string | undefined;
+    let saleVaultProxy: Committed['saleVaultProxy'];
 
     // The fiat corridor gate is Meld's own question; only the fiat rail has one. A non-fiat rail
     // (chainflip) has no fiat corridor and refuses at the rail with its own reason (`RAIL_REFUSED`),
@@ -1274,6 +1354,25 @@ export class Onramp {
         }
       } else {
         await this.sellCorridorCheck(destination.code, currency, request.country, request.paymentMethodType);
+        // Here and not before the rail split, so a Chainflip sell keeps its own refusal
+        sellerAccount = request.sellerAccount === undefined ? undefined : normalizeSellerAccount(request.sellerAccount);
+        const proxy = this.verifiedSaleVaultProxy();
+        const wallet = sellWalletFor(destination.code, sellerAccount, request.sellerClaimer, proxy);
+        walletAddress = wallet?.walletAddress;
+        sellerClaimer = wallet?.claimer;
+        if (proxy !== undefined && wallet?.home !== undefined && wallet.claimer !== undefined) {
+          // The keeper reads the committed amount in USDC base units, so finer precision is refused here
+          const amount = committedTerm(request.cryptoAmount, 'cryptoAmount', direction);
+          if (!USDC_AMOUNT.test(amount)) throw malformedRequest(`cryptoAmount ${amount} is not a USDC amount with at most ${String(USDC_DECIMALS)} decimals.`);
+          saleVaultProxy = {
+            chain_id: proxy.chainId,
+            factory: proxy.factory,
+            implementation: proxy.implementation,
+            home: wallet.home,
+            claimer: wallet.claimer,
+            proxy: wallet.walletAddress.toLowerCase(),
+          };
+        }
       }
     }
 
@@ -1287,6 +1386,8 @@ export class Onramp {
       pinned: {
         destinationCurrencyCode: destination.code,
         ...(walletAddress === undefined ? {} : { walletAddress }),
+        ...(sellerAccount === undefined ? {} : { sellerAccount }),
+        ...(sellerClaimer === undefined ? {} : { sellerClaimer }),
         ...(direction === 'sell'
           ? { cryptoAmount: committedTerm(request.cryptoAmount, 'cryptoAmount', direction) }
           : { sourceAmount: committedTerm(request.sourceAmount, 'sourceAmount', direction) }),
@@ -1294,6 +1395,7 @@ export class Onramp {
         country: request.country,
       },
       redirectUrl,
+      saleVaultProxy,
     };
   }
 
@@ -1316,8 +1418,12 @@ export class Onramp {
     /** Which way this request moves value; decides which of the two amounts below is set. */
     direction: Direction;
     destinationCurrencyCode: string;
-    /** Absent on a sell: no caller supplies the address, the provider issues it. */
+    /** On a sell, the seller's own sending address the service derived, if any. */
     walletAddress: string | undefined;
+    /** The seller's normalised account on a sell, the source of `walletAddress`. */
+    sellerAccount?: string | undefined;
+    /** The seller's lowercase claimer on an Arbitrum sell, bound into `walletAddress`. */
+    sellerClaimer?: string | undefined;
     /** The committed fiat, on a buy. */
     sourceAmount: string | undefined;
     /** The committed crypto, on a sell, at full precision. */
@@ -1341,6 +1447,8 @@ export class Onramp {
       direction: terms.direction,
       destination_currency_code: terms.destinationCurrencyCode,
       wallet_address: terms.walletAddress,
+      seller_account: terms.sellerAccount,
+      seller_claimer: terms.sellerClaimer,
       source_amount: terms.sourceAmount,
       crypto_amount: terms.cryptoAmount,
       fiat: terms.fiat,
@@ -1438,10 +1546,12 @@ export class Onramp {
         rail,
         ...auditDirection(direction),
         destinationCurrencyCode: request.destinationCurrencyCode,
-        // Submitted, not pinned, and only where the caller sent one. A sell sends no address and
-        // no fiat amount; emitting a key with `undefined` would put a field on the stream that
-        // says nothing, and a `''` would say something false.
+        // Submitted, not pinned, and only where the caller sent one. A sell sends its account, no
+        // address and no fiat amount. Emitting a key with `undefined` would put a field on the
+        // stream that says nothing, and a `''` would say something false.
         ...(request.walletAddress === undefined ? {} : { walletAddress: request.walletAddress }),
+        ...(request.sellerAccount === undefined ? {} : { sellerAccount: request.sellerAccount }),
+        ...(request.sellerClaimer === undefined ? {} : { sellerClaimer: request.sellerClaimer }),
         ...(request.sourceAmount === undefined ? {} : { sourceAmount: request.sourceAmount }),
         ...(request.cryptoAmount === undefined ? {} : { cryptoAmount: request.cryptoAmount }),
         fiat: request.fiat,

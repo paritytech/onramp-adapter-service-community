@@ -10,12 +10,15 @@
  * never a fragment of it, never a token granting direct Meld access.
  */
 
+import { hexToU8a } from '@polkadot/util';
+import { ethereumEncode } from '@polkadot/util-crypto';
 import { z } from 'zod';
 
 import { isKnownCrypto } from './meld/catalog.js';
 import { MINOR_UNIT_DECIMAL } from './money.js';
 
 import { DEFAULT_DIRECTION, DIRECTIONS, RAIL_NAMES } from './rail.js';
+import { EVM_ADDRESS } from './salevaultproxy/abi.js';
 
 // --- failures ---------------------------------------------------------------
 
@@ -77,6 +80,14 @@ export const reject = (failure: FundingFailure, detail: string, status = 400) =>
 /** `503`: Meld did not answer. */
 export const upstreamUnavailable = (detail: string) =>
   new Refusal(503, { tag: 'ProviderTimeout' }, detail);
+
+/** `503`: the sale vault proxy deployment is not configured or not verified on chain. One wording for every route. */
+export const saleVaultProxyUnavailable = (detail: string) =>
+  new Refusal(
+    503,
+    { tag: 'Other', value: { code: 'SALE_VAULT_PROXY_UNAVAILABLE', message: 'Sale vault proxies are not available right now.' } },
+    detail,
+  );
 
 /** The one 401. Identical wording at every site, so a caller cannot tell the failures apart. */
 export const unauthorized = (detail: string) =>
@@ -358,10 +369,11 @@ const direction = z.enum(DIRECTIONS).optional();
  *
  * So the wrong combination is refused rather than ignored, in both directions:
  *
- * - buy: `sourceAmount` required, `cryptoAmount` refused. On `/session`, `walletAddress` required.
- * - sell: `cryptoAmount` required, `sourceAmount` refused, and `walletAddress` refused because
- *   the provider issues the deposit address later; a caller-supplied one is read by nobody and
- *   accepting it would let a seller believe they had pinned a destination.
+ * - buy: `sourceAmount` required, `cryptoAmount` refused. On `/session`, `walletAddress` required
+ *   and `sellerAccount` and `sellerClaimer` refused.
+ * - sell: `cryptoAmount` required, `sourceAmount` refused, and `walletAddress` refused because the
+ *   service derives the seller's own sending address from `sellerAccount`. The deposit address is
+ *   the provider's, issued later.
  *
  * `requireSessionFields` is what the two schemas disagree about: `/quote` prices a corridor and
  * has no address in either direction.
@@ -372,6 +384,8 @@ function directionalFields(
     sourceAmount?: string | undefined;
     cryptoAmount?: string | undefined;
     walletAddress?: string | undefined;
+    sellerAccount?: string | undefined;
+    sellerClaimer?: string | undefined;
   },
   ctx: z.RefinementCtx,
   requireSessionFields: boolean,
@@ -385,10 +399,12 @@ function directionalFields(
       absent('sourceAmount', 'A sell commits crypto, not fiat: send cryptoAmount instead.');
     }
     if (value.walletAddress !== undefined) {
-      absent('walletAddress', 'A sell has no caller-supplied wallet address; the provider issues one.');
+      absent('walletAddress', "A sell's wallet address is derived from sellerAccount, send sellerAccount.");
     }
     return;
   }
+  if (value.sellerAccount !== undefined) absent('sellerAccount', 'A buy has no seller account.');
+  if (value.sellerClaimer !== undefined) absent('sellerClaimer', 'A buy has no seller claimer.');
   if (value.sourceAmount === undefined) absent('sourceAmount', 'A buy requires sourceAmount.');
   if (value.cryptoAmount !== undefined) {
     absent('cryptoAmount', 'A buy commits fiat, not crypto: send sourceAmount instead.');
@@ -418,6 +434,18 @@ export const quoteRequest = z
     directionalFields(value, ctx, false);
   });
 
+/** An EVM account: 0x and 40 hex digits, EIP-55 when mixed case, never the zero address, lowercased. */
+export const evmAccount = z
+  .string()
+  // Aborts, so the checksum refine never decodes a malformed string
+  .regex(EVM_ADDRESS, { message: 'Must be 0x and 40 hex digits.', abort: true })
+  .refine((v) => !/^0x0{40}$/.test(v), 'Must not be the zero address.')
+  .refine((v) => {
+    const digits = v.slice(2);
+    return digits === digits.toLowerCase() || digits === digits.toUpperCase() || ethereumEncode(hexToU8a(v)) === v;
+  }, 'A mixed-case address must carry a valid EIP-55 checksum.')
+  .transform((v) => v.toLowerCase());
+
 /** The body behind `POST /session`: everything needed to open one chargeable settlement surface. */
 export const createSessionRequest = z
   .object({
@@ -432,10 +460,14 @@ export const createSessionRequest = z
     /**
      * SS58 address that receives the tokens. Normalised and validated before use.
      *
-     * Required on a buy and refused on a sell, where the crypto travels the other way and the
-     * provider issues the deposit address after the session exists.
+     * Required on a buy and refused on a sell, where the service derives the seller's own address
+     * from `sellerAccount` and the provider issues the deposit address after the session exists.
      */
     walletAddress: z.string().min(1).max(128).optional(),
+    /** The seller's own Asset Hub account, sell only, the source of the derived walletAddress. */
+    sellerAccount: z.string().min(1).max(128).optional(),
+    /** The seller's own Arbitrum address a sale vault proxy releases to, bound into the proxy address. Arbitrum sells only. */
+    sellerClaimer: evmAccount.optional(),
     paymentMethodType,
     /**
      * Which onramp to open the session on, e.g. `TRANSAK`.
@@ -467,6 +499,33 @@ export const createSessionRequest = z
   .superRefine((value, ctx) => {
     directionalFields(value, ctx, true);
   });
+
+// A uint256 as a decimal string without leading zeros
+const uint256Decimal = z
+  .string()
+  // Aborts, so BigInt never sees a string that is not a whole number
+  .regex(/^(0|[1-9][0-9]*)$/, { message: 'Must be a whole number.', abort: true })
+  .refine((v) => BigInt(v) < 2n ** 256n, 'Must fit in a uint256.');
+
+/** The POST /offramp/relay body, one EIP-3009 transferWithAuthorization a claimer signed. */
+export const relayRequest = z
+  .object({
+    from: evmAccount,
+    to: evmAccount,
+    /** USDC base units, a transfer of nothing only spends gas. */
+    value: uint256Decimal.refine((v) => v !== '0', 'Must be greater than zero.'),
+    /** Unix seconds, the token accepts the transfer strictly after it. */
+    validAfter: uint256Decimal,
+    /** Unix seconds, the token accepts the transfer strictly before it. */
+    validBefore: uint256Decimal,
+    nonce: z.string().regex(/^0x[0-9a-fA-F]{64}$/, 'Must be 32 bytes of hex.'),
+    /** r, s and v as 65 bytes of hex, v 27 or 28. */
+    signature: z.string().regex(/^0x[0-9a-fA-F]{130}$/, 'Must be 65 bytes of hex.'),
+  })
+  .strict();
+
+/** A validated `POST /offramp/relay` body. */
+export type RelayRequest = z.infer<typeof relayRequest>;
 
 /** A validated `POST /quote` body. */
 export type QuoteRequest = z.infer<typeof quoteRequest>;
@@ -564,14 +623,19 @@ export interface CreateSessionResponse {
   pinned: {
     destinationCurrencyCode: string;
     /**
-     * Present on a buy, absent on a sell.
+     * Present on a buy. On a sell, the seller's own sending and refund address, derived by the
+     * service, when there is one.
      *
      * An approved narrowing of a shipped contract, so it is spelled out rather than left to be
-     * inferred: a sell has no caller-supplied address, the provider issues the deposit address
-     * after the session exists, and echoing an empty string would be a claim about a destination
-     * nobody pinned. A buy's response is byte-identical to what it was.
+     * inferred: the provider issues a sell's deposit address after the session exists, and
+     * echoing an empty string would be a claim about an address nobody pinned. A buy's response
+     * is byte-identical to what it was.
      */
     walletAddress?: string;
+    /** The seller's account on a sell, normalised to prefix 0, when one was sent. */
+    sellerAccount?: string;
+    /** The seller's claimer on an Arbitrum sell, lowercase, the address its proxy releases to. */
+    sellerClaimer?: string;
     /** The fiat committed, on a buy. Absent on a sell, which commits no fiat, only an estimate. */
     sourceAmount?: string;
     /** The crypto committed, on a sell. Absent on a buy. */

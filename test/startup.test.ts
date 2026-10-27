@@ -15,9 +15,14 @@ import type { FundingRecord } from '../src/funding/types.js';
 import { MeldHttpError } from '../src/meld/client.js';
 import { mintChallenge } from '../src/personhood/challenge.js';
 import { mintToken } from '../src/personhood/token.js';
-import { buildPersonhood, start, verifyAssetCodes, verifyKey } from '../src/startup.js';
+import { buildKeeper, buildPersonhood, configuredSellLanes, start, verifyAssetCodes, verifyKey, warnSellLanes } from '../src/startup.js';
+import { SaleVaultProxyChain } from '../src/salevaultproxy/chain.js';
+import { SaleVaultProxyKeeper, type KeeperStore } from '../src/salevaultproxy/keeper.js';
+import { ReturnLimits } from '../src/salevaultproxy/limits.js';
+import { Secret } from '../src/secret.js';
+import { FACTORY, IMPL, SEPOLIA, SEPOLIA_VAULT_BYTES, SEPOLIA_VAULT_SWAP, chainflipOf, fakeNode } from './salevaultproxy/fakes.js';
 import { upstreamUnavailable } from '../src/contract.js';
-import type { Config } from '../src/config.js';
+import { parseConfig, type Config } from '../src/config.js';
 import { TEST_ASSETS, config, createRequest, fakeSocket, fundingRecord, personhoodConfig, rawConfig, withSocket } from './fixtures.js';
 
 /** Just the levels `verifyKey` uses, so a plain object substitutes for pino. */
@@ -1079,5 +1084,280 @@ describe('buildPersonhood key derivation', () => {
 
     await expect(redeem(derive('onramp:challenge'))).rejects.toThrow(/is not authorized on this instance/);
     await expect(redeem(derive('onramp:jwt'))).rejects.toThrow(/challenge rejected/);
+  });
+});
+
+describe('start with a sale vault proxy', () => {
+  let dir: string;
+  let handle: { app: FastifyInstance; close: () => Promise<void> } | undefined;
+  const servers: http.Server[] = [];
+  const PORT = 30000 + (process.pid % 10000);
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'onramp-salevaultproxy-'));
+  });
+
+  afterEach(async () => {
+    await handle?.close();
+    handle = undefined;
+    for (const server of servers.splice(0)) server.close();
+  });
+
+  const listen = async (handler: http.RequestListener): Promise<string> => {
+    const server = http.createServer(handler);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    servers.push(server);
+    const address = server.address();
+    return `http://127.0.0.1:${String(typeof address === 'object' && address ? address.port : 0)}`;
+  };
+
+  // A JSON-RPC node over HTTP, answering from the shared fake or with a fixed status
+  const rpcServer = async (node: Parameters<typeof fakeNode>[0], status = 200): Promise<string> => {
+    const { rpc } = fakeNode(node);
+    return listen((req, res) => {
+      let body = '';
+      req.on('data', (chunk: Buffer) => (body += chunk.toString()));
+      req.on('end', () => {
+        void (async () => {
+          const { method, params } = JSON.parse(body) as { method: string; params: unknown[] };
+          let reply: unknown;
+          try {
+            reply = { jsonrpc: '2.0', id: 1, result: await rpc(method, params) };
+          } catch (error) {
+            reply = { jsonrpc: '2.0', id: 1, error: { message: String(error) } };
+          }
+          res.writeHead(status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(reply));
+        })();
+      });
+    });
+  };
+
+  // A live Chainflip that agrees with the deployment: the State Chain RPC and the swap backend's encoder
+  const chainflipServers = async () => ({
+    rpc_url: await rpcServer({
+      methods: {
+        system_chain: 'Chainflip-Perseverance',
+        cf_get_vault_addresses: { arbitrum: { Arb: SEPOLIA_VAULT_BYTES } },
+        // Perseverance's live window: no minimum deposit, a 100 USDC maximum swap, a 600 block retry cap, the default broker registered
+        cf_ingress_egress_environment: { minimum_deposit_amounts: { Arbitrum: { USDC: null } }, egress_fees: { Arbitrum: { USDC: '0x12d9' } } },
+        cf_swapping_environment: {
+          maximum_swap_amounts: { Arbitrum: { USDC: '0x5f5e100' } },
+          network_fees: { regular_network_fee: { standard_rate_and_minimum: { minimum: 1_000 } } },
+          max_swap_retry_duration_blocks: 600,
+        },
+        system_properties: { ss58Format: 2112 },
+        cf_account_info: { role: 'broker' },
+      },
+    }),
+    backend_url: await listen((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(SEPOLIA_VAULT_SWAP));
+    }),
+  });
+
+  const writeConfig = async (
+    name: string,
+    rpcUrl: string,
+    key = `0x${'46'.repeat(32)}`,
+    keeper: Record<string, unknown> = {},
+    network: { chain_id: number; chainflip: { rpc_url: string; backend_url: string } } = {
+      chain_id: 421614,
+      chainflip: { rpc_url: 'http://perseverance.invalid', backend_url: 'http://perseverance.invalid' },
+    },
+  ) => {
+    const meldUrl = await listen((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ quotes: [] }));
+    });
+    const meldKey = join(dir, `${name}.meld`);
+    await writeFile(meldKey, 'a-thirty-two-byte-or-longer-test-signing-key\n');
+    const keeperKey = join(dir, `${name}.keeper`);
+    await writeFile(keeperKey, `${key}\n`);
+    const raw = rawConfig({
+      environment: 'development',
+      store: storeConfigFor(await createSchema()),
+      server: { port: PORT, host: '127.0.0.1', log_level: 'info' },
+      meld: { ...(rawConfig().meld as Record<string, unknown>), base_url: meldUrl, api_key: { mode: 'file', path: meldKey } },
+      sale_vault_proxy: {
+        chain_id: network.chain_id,
+        factory: FACTORY,
+        chainflip_vault: SEPOLIA.vault,
+        usdc: SEPOLIA.usdc,
+        rpc_url: rpcUrl,
+        keeper_key: { mode: 'file', path: keeperKey },
+        keeper,
+        chainflip: network.chainflip,
+      },
+    });
+    const path = join(dir, `${name}.json`);
+    await writeFile(path, JSON.stringify(raw));
+    return path;
+  };
+
+  // A well-formed relay from an address no sale recorded as its claimer
+  const relay = async (app: FastifyInstance) =>
+    app.inject({
+      method: 'POST',
+      url: '/offramp/relay',
+      headers: { 'x-dev-product-id': 'app.dot' },
+      payload: {
+        from: `0x${'19'.repeat(20)}`,
+        to: `0x${'3c'.repeat(20)}`,
+        value: '1',
+        validAfter: '0',
+        validBefore: '99999999999',
+        nonce: `0x${'cd'.repeat(32)}`,
+        signature: `0x${'11'.repeat(64)}1b`,
+      },
+    });
+
+  const corridors = async (app: FastifyInstance) =>
+    (await app.inject({ method: 'GET', url: '/supported/offramp/corridors', headers: { 'x-dev-product-id': 'app.dot' } })).json<{
+      saleVaultProxy?: unknown;
+    }>();
+
+  it('verifies the deployment once listening, serves it, checks gas and stops the keeper on close', async () => {
+    const rpcUrl = await rpcServer({ methods: { eth_getBalance: '0x0' } });
+    const lines: string[] = [];
+    const network = { chain_id: 421614, chainflip: await chainflipServers() };
+    handle = await start(await writeConfig('verified', rpcUrl, undefined, {}, network), { write: (line) => lines.push(line) });
+    const app = handle.app;
+    await vi.waitFor(async () => {
+      expect((await corridors(app)).saleVaultProxy).toBeDefined();
+    });
+    expect((await corridors(handle.app)).saleVaultProxy).toEqual({
+      chain: 'arbitrum',
+      chainId: 421614,
+      factory: FACTORY,
+      implementation: IMPL,
+    });
+    expect(lines.some((line) => line.includes('below keeper.min_eth'))).toBe(true);
+    // The relay runs beside the keeper loop and asks the store who is a claimer
+    expect((await relay(handle.app)).json()).toMatchObject({ error: { value: { code: 'RELAY_NOT_CLAIMER' } } });
+    const stop = vi.spyOn(SaleVaultProxyKeeper.prototype, 'stop');
+    try {
+      await handle.close();
+      handle = undefined;
+      expect(stop).toHaveBeenCalledTimes(1);
+    } finally {
+      stop.mockRestore();
+    }
+  });
+
+  it('boots unverified through an RPC outage, serves no payload, and keeps retrying verification with the keeper off', async () => {
+    const rpcUrl = await rpcServer({}, 503);
+    const lines: string[] = [];
+    const retry = vi.spyOn(SaleVaultProxyKeeper.prototype, 'startVerifying');
+    try {
+      handle = await start(await writeConfig('outage', rpcUrl, undefined, { enabled: false }), { write: (line) => lines.push(line) });
+      await vi.waitFor(() => {
+        expect(lines.some((line) => line.includes('is unverified, the chain did not answer'))).toBe(true);
+      });
+      expect((await corridors(handle.app)).saleVaultProxy).toBeUndefined();
+      expect(retry).toHaveBeenCalledTimes(1);
+      // No keeper loop to settle what it sends, so no relay
+      expect((await relay(handle.app)).statusCode).toBe(503);
+    } finally {
+      retry.mockRestore();
+    }
+  });
+
+  it('boots on a deployment that disagrees with the chain, with only the Arbitrum lane unavailable', async () => {
+    const rpcUrl = await rpcServer({ chainId: 1n });
+    const lines: string[] = [];
+    handle = await start(await writeConfig('mismatch', rpcUrl), { write: (line) => lines.push(line) });
+    await vi.waitFor(() => {
+      expect(lines.some((line) => line.includes('is unavailable') && line.includes('answers chain 1'))).toBe(true);
+    });
+    expect((await corridors(handle.app)).saleVaultProxy).toBeUndefined();
+    const health = await handle.app.inject({ method: 'GET', url: '/health' });
+    expect(health.statusCode).toBe(200);
+  });
+
+  it('listens and answers /health while an RPC that never replies holds verification', async () => {
+    // Accepts the request and never answers, a black-holed peer
+    const rpcUrl = await listen(() => undefined);
+    handle = await start(await writeConfig('blackhole', rpcUrl, undefined, { enabled: false }), { write: () => undefined });
+    expect((await handle.app.inject({ method: 'GET', url: '/health' })).statusCode).toBe(200);
+    expect((await corridors(handle.app)).saleVaultProxy).toBeUndefined();
+  }, 15_000);
+
+  it('refuses a keeper key that is not a 32-byte hex key', async () => {
+    const rpcUrl = await rpcServer({});
+    await expect(start(await writeConfig('badkey', rpcUrl, 'z'.repeat(64)))).rejects.toThrow(/32-byte hex private key/);
+    // A short key gets the hex key error, never the base64 secret advice
+    await expect(start(await writeConfig('shortkey', rpcUrl, '0x1234'))).rejects.toThrow(/32-byte hex private key/);
+  });
+});
+
+describe('buildKeeper', () => {
+  it('verifies each retired deployment against its own configured Vault and USDC', async () => {
+    const sp = parseConfig(
+      rawConfig({
+        sale_vault_proxy: {
+          chain_id: 421614,
+          factory: '0x5555555555555555555555555555555555555555',
+          chainflip_vault: `0x${'99'.repeat(20)}`,
+          usdc: SEPOLIA.usdc,
+          retired: [{ factory: FACTORY, chainflip_vault: SEPOLIA.vault, usdc: SEPOLIA.usdc }],
+          rpc_url: 'https://sepolia-rollup.arbitrum.io/rpc',
+          keeper_key: { mode: 'file', path: '/run/secrets/sale-vault-proxy-keeper-key' },
+          chainflip: { rpc_url: 'https://archive.perseverance.chainflip.io' },
+        },
+      }),
+    ).sale_vault_proxy as NonNullable<Config['sale_vault_proxy']>;
+    const keeper = buildKeeper(
+      sp,
+      new Secret('46'.repeat(32)),
+      {} as KeeperStore,
+      vi.fn(),
+      new SaleVaultProxyChain(fakeNode({}).rpc),
+      chainflipOf() as unknown as ReturnLimits,
+      { failedCcms: async () => [] },
+    );
+    await keeper.verify();
+    expect(keeper.verifiedFor(421614, FACTORY)).toMatchObject({ vault: SEPOLIA.vault, usdc: SEPOLIA.usdc });
+    expect(keeper.current()).toBeUndefined();
+  });
+
+  it.each([
+    [421614, 'https://chainflip-swap-perseverance.chainflip.io'],
+    [42161, 'https://chainflip-swap.chainflip.io'],
+  ])('reads chain %i limits from its own swap backend when no backend_url is set', (chainId, backendUrl) => {
+    const sp = parseConfig(
+      rawConfig({
+        sale_vault_proxy: {
+          chain_id: chainId,
+          factory: FACTORY,
+          chainflip_vault: SEPOLIA.vault,
+          usdc: SEPOLIA.usdc,
+          rpc_url: 'https://sepolia-rollup.arbitrum.io/rpc',
+          keeper_key: { mode: 'file', path: '/run/secrets/sale-vault-proxy-keeper-key' },
+          chainflip: { rpc_url: 'https://archive.perseverance.chainflip.io' },
+        },
+      }),
+    ).sale_vault_proxy as NonNullable<Config['sale_vault_proxy']>;
+    const create = vi.spyOn(ReturnLimits, 'create');
+    try {
+      buildKeeper(sp, new Secret('46'.repeat(32)), {} as KeeperStore, vi.fn(), new SaleVaultProxyChain(fakeNode({}).rpc));
+      expect(create).toHaveBeenCalledWith({ rpcUrl: 'https://archive.perseverance.chainflip.io', backendUrl, ttlMs: sp.chainflip.limits_ttl_ms });
+    } finally {
+      create.mockRestore();
+    }
+  });
+});
+
+describe('warnSellLanes', () => {
+  it('warns about Solana lanes and an Arbitrum lane without a sale vault proxy, and nothing else', () => {
+    const { log, warn } = recorder();
+    const lanes = [{ asset: 'usdt@assethub' }, { asset: 'usdc@solana' }, { asset: 'usdc@arbitrum' }];
+    const cfg = config({ supported: { ...(rawConfig().supported as object), offramp_lanes: lanes } });
+    warnSellLanes(cfg, log);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledWith({ asset: 'usdc@solana', chain: 'solana' }, expect.stringMatching(/refused at runtime/));
+    expect(warn).toHaveBeenCalledWith({ asset: 'usdc@arbitrum', chain: 'arbitrum' }, expect.stringMatching(/refused at runtime/));
+    // The refresh walks the same sellable lanes, never one a sell cannot open on
+    expect(configuredSellLanes(cfg).map((lane) => lane.asset)).toEqual(['usdt@assethub']);
   });
 });

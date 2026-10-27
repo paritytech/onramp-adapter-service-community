@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { encodeAddress } from '@polkadot/util-crypto';
 
-import { canonicalizeDisclosedAddress, normalizeAddress } from '../src/address.js';
+import { canonicalizeDisclosedAddress, normalizeAddress, normalizeSellerAccount, sellWalletFor } from '../src/address.js';
 import { Refusal } from '../src/contract.js';
+import { ALICE_CLAIMER, ALICE_HOME, ALICE_SALE_VAULT_PROXY, SALE_VAULT_PROXY } from './fixtures.js';
 
 // Alice, the canonical well-known account.
 const ALICE_PUBKEY = new Uint8Array([
@@ -112,5 +113,81 @@ describe('canonicalizeDisclosedAddress for an EVM sell-only code', () => {
   it('is not accepted for the other codes', () => {
     expect(canonicalizeDisclosedAddress(MIXED, 'USDC_SOLANA')).toBeUndefined();
     expect(canonicalizeDisclosedAddress(MIXED, 'DOT')).toBeUndefined();
+  });
+});
+
+/** The refusal a call throws, as status, tag and code, or 'accepted'. */
+const refusedAs = (fn: () => unknown) => {
+  try {
+    fn();
+  } catch (error) {
+    if (!(error instanceof Refusal)) return 'other';
+    return { status: error.status, tag: error.failure.tag, code: error.failure.tag === 'Other' ? error.failure.value.code : undefined };
+  }
+  return 'accepted';
+};
+
+describe('normalizeSellerAccount', () => {
+  it('normalises a seller under any prefix to prefix 0', () => {
+    expect(normalizeSellerAccount(ALICE_PREFIX_42)).toBe(ALICE_PREFIX_0);
+    expect(normalizeSellerAccount(ALICE_PREFIX_0)).toBe(ALICE_PREFIX_0);
+  });
+
+  it('refuses a malformed account, a short key and an EVM address as a seller account', () => {
+    for (const bad of ['not-an-address', encodeAddress(ALICE_PUBKEY.slice(0, 8), 0), `0x${'1'.repeat(40)}`]) {
+      expect(refusedAs(() => normalizeSellerAccount(bad))).toEqual({ status: 400, tag: 'Other', code: 'INVALID_ADDRESS' });
+    }
+    try {
+      normalizeSellerAccount('not-an-address');
+    } catch (error) {
+      expect(error instanceof Refusal && error.failure.tag === 'Other' ? error.failure.value.message : '').toBe('The seller account is not valid.');
+    }
+  });
+});
+
+describe('sellWalletFor', () => {
+  it('is the seller itself on Asset Hub, and nothing when no seller was sent', () => {
+    expect(sellWalletFor('DOT', ALICE_PREFIX_0, undefined, undefined)).toEqual({ walletAddress: ALICE_PREFIX_0, home: undefined, claimer: undefined });
+    expect(sellWalletFor('USDT_DOT', undefined, undefined, SALE_VAULT_PROXY)).toBeUndefined();
+  });
+
+  it('refuses a claimer on Asset Hub, where no proxy binds one', () => {
+    expect(refusedAs(() => sellWalletFor('DOT', ALICE_PREFIX_0, ALICE_CLAIMER, undefined))).toEqual({
+      status: 400,
+      tag: 'Other',
+      code: 'SELLER_CLAIMER_UNEXPECTED',
+    });
+  });
+
+  it("is the seller's EIP-55 SaleVaultProxy for the claimer on Arbitrum, with the home and claimer it is derived from", () => {
+    expect(sellWalletFor('USDC_ARBITRUM', ALICE_PREFIX_0, ALICE_CLAIMER, SALE_VAULT_PROXY)).toEqual({
+      walletAddress: ALICE_SALE_VAULT_PROXY,
+      home: ALICE_HOME,
+      claimer: ALICE_CLAIMER,
+    });
+  });
+
+  it('needs a seller, a claimer and a verified deployment on Arbitrum', () => {
+    expect(refusedAs(() => sellWalletFor('USDC_ARBITRUM', undefined, ALICE_CLAIMER, SALE_VAULT_PROXY))).toEqual({
+      status: 400,
+      tag: 'Other',
+      code: 'SELLER_ACCOUNT_REQUIRED',
+    });
+    expect(refusedAs(() => sellWalletFor('USDC_ARBITRUM', ALICE_PREFIX_0, undefined, SALE_VAULT_PROXY))).toEqual({
+      status: 400,
+      tag: 'Other',
+      code: 'SELLER_CLAIMER_REQUIRED',
+    });
+    expect(refusedAs(() => sellWalletFor('USDC_ARBITRUM', ALICE_PREFIX_0, ALICE_CLAIMER, undefined))).toEqual({
+      status: 503,
+      tag: 'Other',
+      code: 'SALE_VAULT_PROXY_UNAVAILABLE',
+    });
+  });
+
+  it('refuses Solana and any code it does not know', () => {
+    for (const code of ['USDC_SOLANA', 'USDT_SOLANA', 'NOT_A_CODE']) {
+      expect(refusedAs(() => sellWalletFor(code, ALICE_PREFIX_0, ALICE_CLAIMER, SALE_VAULT_PROXY))).toEqual({ status: 400, tag: 'RegionUnavailable', code: undefined });
+    }
   });
 });
