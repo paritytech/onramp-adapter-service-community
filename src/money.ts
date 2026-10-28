@@ -22,6 +22,23 @@ export const MINOR_UNIT_DECIMAL = /^\d{1,9}(\.\d{1,2})?$/;
  * unreachable but required, since the destructured type is `string | undefined`.
  */
 export function toMinorUnits(decimal: string): bigint {
-  const [whole = '0', fraction = ''] = decimal.split('.');
-  return BigInt(whole + fraction.padEnd(MINOR_UNIT_DIGITS, '0'));
+  return toBaseUnits(decimal, MINOR_UNIT_DIGITS);
 }
+
+/** A decimal string as integer base units, for a value its schema already bounded to `decimals`. */
+export function toBaseUnits(value: string, decimals: number): bigint {
+  const [whole = '0', fraction = ''] = value.split('.');
+  return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(fraction.padEnd(decimals, '0') || '0');
+}
+
+/** Circle USDC's decimals, which every USDC amount is written in and the token must report. */
+export const USDC_DECIMALS = 6;
+
+/** A USDC amount `toBaseUnits` converts at `USDC_DECIMALS`. */
+export const USDC_AMOUNT = new RegExp(`^\\d{1,12}(\\.\\d{1,${String(USDC_DECIMALS)}})?$`);
+
+/** Ether's decimals, the wei a native balance is read in. */
+export const ETH_DECIMALS = 18;
+
+/** An ETH amount `toBaseUnits` converts at `ETH_DECIMALS`. */
+export const ETH_AMOUNT = new RegExp(`^\\d{1,6}(\\.\\d{1,${String(ETH_DECIMALS)}})?$`);

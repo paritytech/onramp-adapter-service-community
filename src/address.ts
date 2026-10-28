@@ -16,8 +16,11 @@
 
 import { base58Decode, decodeAddress, encodeAddress } from '@polkadot/util-crypto';
 
-import { reject } from './contract.js';
+import { Refusal, reject, saleVaultProxyUnavailable } from './contract.js';
 import { chainOf } from './meld/catalog.js';
+import { EVM_ADDRESS } from './salevaultproxy/abi.js';
+import { checksum, homeOf, predictSaleVaultProxy } from './salevaultproxy/derive.js';
+import type { VerifiedSaleVaultProxy } from './salevaultproxy/verify.js';
 
 /** Polkadot Asset Hub. Passed explicitly at every call site; never defaulted. */
 const POLKADOT_SS58_PREFIX = 0;
@@ -33,6 +36,10 @@ const PUBLIC_KEY_BYTES = 32;
  */
 const invalidAddress = (detail: string) =>
   reject({ tag: 'Other', value: { code: 'INVALID_ADDRESS', message: 'The destination address is not valid.' } }, detail);
+
+/** The same refusal for a seller's own account, which is not a destination. */
+const invalidSellerAccount = (detail: string) =>
+  reject({ tag: 'Other', value: { code: 'INVALID_ADDRESS', message: 'The seller account is not valid.' } }, detail);
 
 /**
  * Normalise to the Polkadot prefix, or refuse.
@@ -56,6 +63,69 @@ export function normalizeAddress(input: string): string {
   }
 
   return encodeAddress(publicKey, POLKADOT_SS58_PREFIX);
+}
+
+/** A seller's own Asset Hub account under any prefix, normalised to prefix 0, or refused. */
+export function normalizeSellerAccount(input: string): string {
+  try {
+    return normalizeAddress(input);
+  } catch (error) {
+    throw error instanceof Refusal ? invalidSellerAccount(error.message) : error;
+  }
+}
+
+/** A sell's own sending address, and on Arbitrum the 32-byte home and the claimer its proxy is derived from. */
+export interface SellWallet {
+  readonly walletAddress: string;
+  readonly home: string | undefined;
+  readonly claimer: string | undefined;
+}
+
+/** The sell's own sending address from the seller account: itself on Asset Hub, its SaleVaultProxy for the claimer on Arbitrum, refused elsewhere. */
+export function sellWalletFor(
+  code: string,
+  seller: string | undefined,
+  claimer: string | undefined,
+  proxy: VerifiedSaleVaultProxy | undefined,
+): SellWallet | undefined {
+  const chain = chainOf(code);
+  if (chain === 'assethub') {
+    if (claimer !== undefined) {
+      throw reject(
+        { tag: 'Other', value: { code: 'SELLER_CLAIMER_UNEXPECTED', message: 'This sell takes no seller claimer.' } },
+        `A sell of ${code} pays from the seller account itself and has no sale vault proxy to bind a claimer to.`,
+      );
+    }
+    return seller === undefined ? undefined : { walletAddress: seller, home: undefined, claimer: undefined };
+  }
+  if (chain === 'arbitrum') {
+    if (seller === undefined) {
+      throw reject(
+        { tag: 'Other', value: { code: 'SELLER_ACCOUNT_REQUIRED', message: 'This sell needs the seller account.' } },
+        `A sell of ${code} needs sellerAccount to derive its sale vault proxy.`,
+      );
+    }
+    if (claimer === undefined) {
+      throw reject(
+        { tag: 'Other', value: { code: 'SELLER_CLAIMER_REQUIRED', message: 'This sell needs the seller claimer.' } },
+        `A sell of ${code} needs sellerClaimer, the address its sale vault proxy releases to.`,
+      );
+    }
+    if (proxy === undefined) throw saleVaultProxyUnverified(code);
+    const home = homeOf(seller);
+    return { walletAddress: checksum(predictSaleVaultProxy(proxy.factory, proxy.implementation, home, claimer)), home, claimer };
+  }
+  throw sellLaneUnsupported(code);
+}
+
+/** An Arbitrum sell with no verified sale vault proxy deployment. */
+export function saleVaultProxyUnverified(code: string): Refusal {
+  return saleVaultProxyUnavailable(`A sell of ${code} needs a sale vault proxy deployment verified on chain.`);
+}
+
+/** A sell lane with no derivable sending address. RegionUnavailable carries no code, so the detail names it. */
+export function sellLaneUnsupported(code: string): Refusal {
+  return reject({ tag: 'RegionUnavailable' }, `SELL_LANE_UNSUPPORTED: ${code} cannot be sold through this service.`);
 }
 
 /**
@@ -107,5 +177,5 @@ function solanaAddress(input: string): string | undefined {
 
 /** An EVM account: `0x` and 40 hex digits (checksum casing is not verified). Lowercased, or `undefined`. */
 function evmAddress(input: string): string | undefined {
-  return /^0x[0-9a-fA-F]{40}$/.test(input) ? input.toLowerCase() : undefined;
+  return EVM_ADDRESS.test(input) ? input.toLowerCase() : undefined;
 }

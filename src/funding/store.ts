@@ -30,6 +30,7 @@ import { TERMINAL_STATES } from './state.js';
 import {
   MIGRATIONS,
   MIGRATIONS_TABLE,
+  KEEPER_LOCK_KEY,
   MIGRATION_LOCK_KEY,
   MIGRATION_LOCK_TIMEOUT_MS,
   SCHEMA_VERSION,
@@ -118,6 +119,346 @@ export interface SupportedCorridorRow {
   updated_at: number;
 }
 
+/** A sale vault proxy as the session path records it, addresses and ref lowercase. */
+export interface NewSaleVaultProxyRow {
+  funding_request_id: string;
+  chain_id: number;
+  factory: string;
+  implementation: string;
+  home: string;
+  /** The seller's claimer, bound into the proxy address with the home. */
+  claimer: string;
+  proxy: string;
+  ref: string;
+}
+
+/** A sale vault proxy row with the keeper's schedule. */
+export interface SaleVaultProxyRow extends NewSaleVaultProxyRow {
+  due_at: number | null;
+  /** When a factory log or a transfer of at least MIN_RETURN last touched the proxy, the watch window's start. */
+  last_activity_at: number;
+  created_at: number;
+  updated_at: number;
+}
+
+/** A sale's exact terms on one factory, the key its gas-deferred deliveries are booked under bar the deadline. */
+export interface DeferralTerms {
+  chain_id: number;
+  factory: string;
+  home: string;
+  claimer: string;
+  ref: string;
+  recipient: string;
+  /** USDC base units. */
+  committed: bigint;
+}
+
+/** One gas-deferred delivery's full key as DeliveryDeferred logs it. */
+export interface DeferralRow extends DeferralTerms {
+  /** The sale's payment deadline in epoch seconds. */
+  deadline: bigint;
+}
+
+/** One sale the keeper should look at, with the terms its delivery is booked under. */
+export interface KeeperCandidate extends NewSaleVaultProxyRow {
+  /** The provider's deposit address, undefined until disclosed. */
+  deposit_address: string | undefined;
+  /** The committed crypto as a decimal, undefined on a malformed row. */
+  crypto_amount: string | undefined;
+}
+
+/** The keeper's on-chain actions, pinned by a CHECK in `schema.ts`. */
+export type ProxyCallAction = 'deliver' | 'expire' | 'flush' | 'deploy' | 'return' | 'release' | 'skim' | 'relay';
+
+/** USDC that reached a claimer: a proxy's release or a factory flush the proxy refused. */
+export type PayoutKind = 'released' | 'flushed';
+
+/** One payout to a claimer as its log recorded it, keyed by the log. */
+export interface PayoutRow {
+  chain_id: number;
+  tx_hash: string;
+  log_index: number;
+  factory: string;
+  home: string;
+  claimer: string;
+  kind: PayoutKind;
+  /** USDC base units. */
+  amount: bigint;
+}
+
+/** A proxy the keeper watches, with the home and claimer its address is derived from. */
+export interface WatchedProxy {
+  proxy: string;
+  factory: string;
+  home: string;
+  claimer: string;
+}
+
+/** A keeper call's lifecycle, pinned by a CHECK in `schema.ts`. */
+export type ProxyCallStatus = 'sending' | 'sent' | 'mined' | 'reverted' | 'dropped';
+
+/** A keeper call before it is signed. For a skim `proxy` holds the factory, for a relay the claimer. */
+export interface NewProxyCall {
+  id: string;
+  chain_id: number;
+  sender: string;
+  target: string;
+  proxy: string;
+  action: ProxyCallAction;
+  amount: string | null;
+}
+
+/** A keeper call as stored. */
+export interface ProxyCallRow extends NewProxyCall {
+  nonce: number | null;
+  tx_hash: string | null;
+  status: ProxyCallStatus;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+const SALE_VAULT_PROXY_COLUMNS =
+  'funding_request_id, chain_id, factory, implementation, home, claimer, proxy, ref, due_at, last_activity_at, created_at, updated_at';
+
+const PROXY_CALL_COLUMNS =
+  'id, chain_id, sender, target, proxy, action, amount, nonce, tx_hash, status, error, created_at, updated_at';
+
+// The query surface both a pool and one checked-out client offer
+type Queryable = Pick<PoolClient, 'query'>;
+
+// A sale joined to its funding row's terms, as Postgres returns it
+type CandidateRow = Omit<KeeperCandidate, 'deposit_address' | 'crypto_amount'> & { deposit_address: string | null; crypto_amount: string | null };
+
+const CANDIDATE_SELECT =
+  'SELECT p.funding_request_id, p.chain_id, p.factory, p.implementation, p.home, p.claimer, p.proxy, p.ref, f.deposit_address, f.crypto_amount ' +
+  'FROM sale_vault_proxies p JOIN funding_requests f ON f.id = p.funding_request_id';
+
+const toCandidate = (row: CandidateRow): KeeperCandidate => ({
+  ...row,
+  deposit_address: row.deposit_address ?? undefined,
+  crypto_amount: row.crypto_amount ?? undefined,
+});
+
+/** The keeper's rows, bound to one connection so a locked pass runs on the connection that holds the lock. */
+export class KeeperRows {
+  constructor(private readonly db: Queryable) {}
+
+  // Sales of these factories active since `sinceMs` and due by `now`, with no call in flight on their proxy
+  async listKeeperCandidates(args: {
+    chainId: number;
+    factories: readonly string[];
+    sinceMs: number;
+    now: number;
+    limit: number;
+  }): Promise<KeeperCandidate[]> {
+    const result = await this.db.query<CandidateRow>(
+      `${CANDIDATE_SELECT} WHERE p.chain_id = $1 AND p.factory = ANY($2) AND p.last_activity_at >= $3 AND p.due_at IS NOT NULL AND p.due_at <= $4 ` +
+        'AND NOT EXISTS (SELECT 1 FROM sale_vault_proxy_calls c ' +
+        "WHERE c.chain_id = p.chain_id AND c.proxy = p.proxy AND c.status IN ('sending', 'sent')) " +
+        'ORDER BY p.due_at ASC, p.created_at ASC LIMIT $5',
+      [args.chainId, args.factories.map((f) => f.toLowerCase()), args.sinceMs, args.now, args.limit],
+    );
+    return result.rows.map(toCandidate);
+  }
+
+  // Every sale of one proxy, so a proxy is judged with all its sales at once
+  async salesOfProxy(chainId: number, proxy: string): Promise<KeeperCandidate[]> {
+    const result = await this.db.query<CandidateRow>(`${CANDIDATE_SELECT} WHERE p.chain_id = $1 AND p.proxy = $2 ORDER BY p.created_at ASC`, [
+      chainId,
+      proxy.toLowerCase(),
+    ]);
+    return result.rows.map(toCandidate);
+  }
+
+  // Distinct proxies of these factories' sales active since `sinceMs`, the ones a USDC transfer can make due
+  async watchedProxies(args: { chainId: number; factories: readonly string[]; sinceMs: number }): Promise<WatchedProxy[]> {
+    const result = await this.db.query<WatchedProxy>(
+      'SELECT DISTINCT proxy, factory, home, claimer FROM sale_vault_proxies WHERE chain_id = $1 AND factory = ANY($2) AND last_activity_at >= $3 ORDER BY proxy',
+      [args.chainId, args.factories.map((f) => f.toLowerCase()), args.sinceMs],
+    );
+    return result.rows;
+  }
+
+  // Which of these addresses are recorded proxies of these factories, at any age
+  async recordedProxies(args: { chainId: number; factories: readonly string[]; proxies: readonly string[] }): Promise<WatchedProxy[]> {
+    const result = await this.db.query<WatchedProxy>(
+      'SELECT DISTINCT proxy, factory, home, claimer FROM sale_vault_proxies WHERE chain_id = $1 AND factory = ANY($2) AND proxy = ANY($3) ORDER BY proxy',
+      [args.chainId, args.factories.map((f) => f.toLowerCase()), args.proxies.map((p) => p.toLowerCase())],
+    );
+    return result.rows;
+  }
+
+  // Proxies of these factories with no sale active since `sinceMs`, longest unchecked first
+  async idleProxies(args: { chainId: number; factories: readonly string[]; sinceMs: number; limit: number }): Promise<{ proxy: string; factory: string }[]> {
+    const result = await this.db.query<{ proxy: string; factory: string }>(
+      'SELECT proxy, factory FROM sale_vault_proxies WHERE chain_id = $1 AND factory = ANY($2) ' +
+        'GROUP BY proxy, factory HAVING MAX(last_activity_at) < $3 ORDER BY MAX(updated_at) ASC, proxy ASC LIMIT $4',
+      [args.chainId, args.factories.map((f) => f.toLowerCase()), args.sinceMs, args.limit],
+    );
+    return result.rows;
+  }
+
+  // Record that idle proxies were checked, so the next batch takes others
+  async markChecked(args: { chainId: number; proxies: readonly string[]; at: number }): Promise<void> {
+    if (args.proxies.length === 0) return;
+    await this.db.query('UPDATE sale_vault_proxies SET updated_at = $3 WHERE chain_id = $1 AND proxy = ANY($2)', [
+      args.chainId,
+      args.proxies.map((p) => p.toLowerCase()),
+      args.at,
+    ]);
+  }
+
+  // Make sales due now when a log names their home or proxy, after any schedule a running evaluation reads, a dust proxy due but not active
+  async markDue(args: { chainId: number; homes: readonly string[]; proxies: readonly string[]; dust: readonly string[]; at: number }): Promise<void> {
+    if (args.homes.length === 0 && args.proxies.length === 0 && args.dust.length === 0) return;
+    await this.db.query(
+      'UPDATE sale_vault_proxies SET due_at = $5, updated_at = $5, ' +
+        'last_activity_at = CASE WHEN home = ANY($2) OR proxy = ANY($3) THEN $5 ELSE last_activity_at END ' +
+        'WHERE chain_id = $1 AND (home = ANY($2) OR proxy = ANY($3) OR proxy = ANY($4))',
+      [
+        args.chainId,
+        args.homes.map((h) => h.toLowerCase()),
+        args.proxies.map((p) => p.toLowerCase()),
+        args.dust.map((p) => p.toLowerCase()),
+        args.at,
+      ],
+    );
+  }
+
+  // Make every sale of these factories active since `sinceMs` due, for a first scan with no cursor
+  async markAllDue(args: { chainId: number; factories: readonly string[]; sinceMs: number; at: number }): Promise<void> {
+    await this.db.query(
+      'UPDATE sale_vault_proxies SET due_at = $4, updated_at = $4 WHERE chain_id = $1 AND factory = ANY($2) AND last_activity_at >= $3',
+      [args.chainId, args.factories.map((f) => f.toLowerCase()), args.sinceMs, args.at],
+    );
+  }
+
+  // Make every sale of these factories due and active, at any age
+  async markFactoriesActive(args: { chainId: number; factories: readonly string[]; at: number }): Promise<void> {
+    if (args.factories.length === 0) return;
+    await this.db.query('UPDATE sale_vault_proxies SET due_at = $3, updated_at = $3, last_activity_at = $3 WHERE chain_id = $1 AND factory = ANY($2)', [
+      args.chainId,
+      args.factories.map((f) => f.toLowerCase()),
+      args.at,
+    ]);
+  }
+
+  // Set when a proxy is next looked at, keeping a due time an event set after `startedAt`
+  async schedule(args: { chainId: number; proxy: string; dueAt: number | null; startedAt: number; at: number }): Promise<void> {
+    await this.db.query(
+      'UPDATE sale_vault_proxies SET due_at = CASE WHEN due_at > $4 THEN due_at ELSE $3 END, updated_at = $5 ' +
+        'WHERE chain_id = $1 AND proxy = $2',
+      [args.chainId, args.proxy.toLowerCase(), args.dueAt, args.startedAt, args.at],
+    );
+  }
+
+  // The last block scanned on this chain, or undefined before the first scan
+  async readCursor(chainId: number): Promise<bigint | undefined> {
+    const result = await this.db.query<{ block: number }>('SELECT block FROM sale_vault_proxy_cursors WHERE chain_id = $1', [chainId]);
+    const row = result.rows[0];
+    return row === undefined ? undefined : BigInt(row.block);
+  }
+
+  async writeCursor(chainId: number, block: bigint): Promise<void> {
+    await this.db.query(
+      'INSERT INTO sale_vault_proxy_cursors (chain_id, block, updated_at) VALUES ($1, $2, $3) ' +
+        'ON CONFLICT (chain_id) DO UPDATE SET block = EXCLUDED.block, updated_at = EXCLUDED.updated_at',
+      [chainId, block.toString(), Date.now()],
+    );
+  }
+
+  // Record deferred deliveries read off the logs, a range read again adding nothing
+  async recordDeferrals(deferrals: readonly DeferralRow[]): Promise<void> {
+    const now = Date.now();
+    for (const d of deferrals) {
+      await this.db.query(
+        'INSERT INTO sale_vault_proxy_deferrals (chain_id, factory, home, claimer, ref, recipient, committed, deadline, created_at) ' +
+          'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING',
+        [
+          d.chain_id,
+          d.factory.toLowerCase(),
+          d.home.toLowerCase(),
+          d.claimer.toLowerCase(),
+          d.ref.toLowerCase(),
+          d.recipient.toLowerCase(),
+          d.committed.toString(),
+          d.deadline.toString(),
+          now,
+        ],
+      );
+    }
+  }
+
+  // Every recorded deadline of a sale's exact terms, earliest first
+  async deferralDeadlines(terms: DeferralTerms): Promise<bigint[]> {
+    const result = await this.db.query<{ deadline: string }>(
+      'SELECT deadline FROM sale_vault_proxy_deferrals ' +
+        'WHERE chain_id = $1 AND factory = $2 AND home = $3 AND claimer = $4 AND ref = $5 AND recipient = $6 AND committed = $7 ' +
+        'ORDER BY length(deadline), deadline',
+      [
+        terms.chain_id,
+        terms.factory.toLowerCase(),
+        terms.home.toLowerCase(),
+        terms.claimer.toLowerCase(),
+        terms.ref.toLowerCase(),
+        terms.recipient.toLowerCase(),
+        terms.committed.toString(),
+      ],
+    );
+    return result.rows.map((row) => BigInt(row.deadline));
+  }
+
+  // Record payouts to claimers read off the logs, a range read again adding nothing
+  async recordPayouts(payouts: readonly PayoutRow[]): Promise<void> {
+    const now = Date.now();
+    for (const p of payouts) {
+      await this.db.query(
+        'INSERT INTO sale_vault_proxy_payouts (chain_id, tx_hash, log_index, factory, home, claimer, kind, amount, created_at) ' +
+          'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING',
+        [p.chain_id, p.tx_hash.toLowerCase(), p.log_index, p.factory.toLowerCase(), p.home.toLowerCase(), p.claimer.toLowerCase(), p.kind, p.amount.toString(), now],
+      );
+    }
+  }
+
+  // Claim a call before signing it. False when another call on this proxy is in flight.
+  async claimProxyCall(call: NewProxyCall): Promise<boolean> {
+    const now = Date.now();
+    const result = await this.db.query(
+      'INSERT INTO sale_vault_proxy_calls (id, chain_id, sender, target, proxy, action, amount, created_at, updated_at) ' +
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) ON CONFLICT (chain_id, proxy) WHERE status IN ('sending', 'sent') DO NOTHING",
+      [call.id, call.chain_id, call.sender.toLowerCase(), call.target.toLowerCase(), call.proxy.toLowerCase(), call.action, call.amount, now],
+    );
+    return result.rowCount === 1;
+  }
+
+  // Record the signed hash and nonce before the broadcast leaves
+  async markProxyCallSent(id: string, txHash: string, nonce: number): Promise<void> {
+    await this.db.query(
+      "UPDATE sale_vault_proxy_calls SET status = 'sent', tx_hash = $2, nonce = $3, updated_at = $4 WHERE id = $1 AND status = 'sending'",
+      [id, txHash, nonce, Date.now()],
+    );
+  }
+
+  // Settle an in-flight call. A settled call is never moved again.
+  async settleProxyCall(id: string, status: 'mined' | 'reverted' | 'dropped', error?: string): Promise<void> {
+    await this.db.query(
+      'UPDATE sale_vault_proxy_calls SET status = $2, error = $3, updated_at = $4 ' + "WHERE id = $1 AND status IN ('sending', 'sent')",
+      [id, status, error ?? null, Date.now()],
+    );
+  }
+
+  // Every sender's calls on one chain still sending or sent, oldest first, so a rotated key's calls still settle
+  async readInflightProxyCalls(chainId: number): Promise<ProxyCallRow[]> {
+    const result = await this.db.query<ProxyCallRow>(
+      `SELECT ${PROXY_CALL_COLUMNS} FROM sale_vault_proxy_calls WHERE chain_id = $1 ` +
+        "AND status IN ('sending', 'sent') ORDER BY created_at ASC, id ASC",
+      [chainId],
+    );
+    return result.rows;
+  }
+}
+
 /** The outcome of a reservation attempt. See `reserve`. */
 export type Reservation =
   /** The row belongs to this caller: nothing else held their key. */
@@ -172,6 +513,10 @@ export const COLUMN_LIST = [
   'deposit_conflict_address',
   'deposit_conflict_reason',
   'deposit_conflict_at',
+  // The seller's own account on a sell. Written once at create, never by `UPDATE_QUERY`.
+  'seller_account',
+  // The seller's claimer on an Arbitrum sell, written once at create like the account.
+  'seller_claimer',
   'status_history',
   'created_at',
   'updated_at',
@@ -753,6 +1098,100 @@ export class FundingStore {
     return result.rows;
   }
 
+  // Record the proxy and ref an Arbitrum sell pays from, once. Not due until a log touches it.
+  async insertSaleVaultProxy(row: NewSaleVaultProxyRow): Promise<void> {
+    const now = Date.now();
+    await this.pool.query(
+      'INSERT INTO sale_vault_proxies (funding_request_id, chain_id, factory, implementation, home, claimer, proxy, ref, last_activity_at, created_at, updated_at) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9) ON CONFLICT (funding_request_id) DO NOTHING',
+      [
+        row.funding_request_id,
+        row.chain_id,
+        row.factory.toLowerCase(),
+        row.implementation.toLowerCase(),
+        row.home.toLowerCase(),
+        row.claimer.toLowerCase(),
+        row.proxy.toLowerCase(),
+        row.ref.toLowerCase(),
+        now,
+      ],
+    );
+  }
+
+  // Drop the proxy row of a sell whose session never opened
+  async deleteSaleVaultProxy(fundingRequestId: string): Promise<void> {
+    await this.pool.query('DELETE FROM sale_vault_proxies WHERE funding_request_id = $1', [fundingRequestId]);
+  }
+
+  // The proxy row for a funding request, or undefined for a sale without one
+  async readSaleVaultProxy(fundingRequestId: string): Promise<SaleVaultProxyRow | undefined> {
+    const result = await this.pool.query<SaleVaultProxyRow>(
+      `SELECT ${SALE_VAULT_PROXY_COLUMNS} FROM sale_vault_proxies WHERE funding_request_id = $1`,
+      [fundingRequestId],
+    );
+    return result.rows[0];
+  }
+
+  // Whether a sale of this product recorded this claimer, the relay's only gate on whose USDC it moves
+  async isSellerClaimer(productId: string, claimer: string): Promise<boolean> {
+    const result = await this.pool.query(
+      'SELECT 1 FROM funding_requests WHERE seller_claimer = $1 AND product_id = $2 LIMIT 1',
+      [claimer.toLowerCase(), productId],
+    );
+    return result.rowCount === 1;
+  }
+
+  // Whether an address is any sale's claimer or one of the chain's recorded proxies
+  async isSaleAddress(chainId: number, address: string): Promise<boolean> {
+    const result = await this.pool.query(
+      'SELECT 1 FROM funding_requests WHERE seller_claimer = $1 ' +
+        'UNION ALL SELECT 1 FROM sale_vault_proxies WHERE chain_id = $2 AND proxy = $1 LIMIT 1',
+      [address.toLowerCase(), chainId],
+    );
+    return result.rowCount === 1;
+  }
+
+  // Every payout recorded to one home and claimer on a factory, oldest first, with when the keeper read it
+  async readPayouts(terms: Pick<PayoutRow, 'chain_id' | 'factory' | 'home' | 'claimer'>): Promise<(PayoutRow & { created_at: number })[]> {
+    const result = await this.pool.query<Omit<PayoutRow, 'amount'> & { amount: string; created_at: number }>(
+      'SELECT chain_id, tx_hash, log_index, factory, home, claimer, kind, amount, created_at FROM sale_vault_proxy_payouts ' +
+        'WHERE chain_id = $1 AND factory = $2 AND home = $3 AND claimer = $4 ORDER BY created_at ASC, tx_hash ASC, log_index ASC',
+      [terms.chain_id, terms.factory.toLowerCase(), terms.home.toLowerCase(), terms.claimer.toLowerCase()],
+    );
+    return result.rows.map((row) => ({ ...row, amount: BigInt(row.amount) }));
+  }
+
+  // The newest call on one proxy, or undefined when none was ever made
+  async readLatestProxyCall(chainId: number, proxy: string): Promise<ProxyCallRow | undefined> {
+    const result = await this.pool.query<ProxyCallRow>(
+      `SELECT ${PROXY_CALL_COLUMNS} FROM sale_vault_proxy_calls WHERE chain_id = $1 AND proxy = $2 ` +
+        'ORDER BY created_at DESC, id DESC LIMIT 1',
+      [chainId, proxy.toLowerCase()],
+    );
+    return result.rows[0];
+  }
+
+  // The keeper's rows over the pool, for reads that need no lock
+  keeperRows(): KeeperRows {
+    return new KeeperRows(this.pool);
+  }
+
+  // Run `fn` holding the keeper lock, every query on the locking connection, or undefined when another replica holds it
+  async withKeeperLock<T>(fn: (rows: KeeperRows) => Promise<T>): Promise<T | undefined> {
+    const client = await this.pool.connect();
+    try {
+      const taken = await client.query<{ locked: boolean }>('SELECT pg_try_advisory_lock($1) AS locked', [KEEPER_LOCK_KEY]);
+      if (taken.rows[0]?.locked !== true) return undefined;
+      try {
+        return await fn(new KeeperRows(client));
+      } finally {
+        await client.query('SELECT pg_advisory_unlock($1)', [KEEPER_LOCK_KEY]);
+      }
+    } finally {
+      client.release();
+    }
+  }
+
   /**
    * Close the pool. `startup`'s `close` calls this last, after the server.
    *
@@ -816,6 +1255,8 @@ interface Row {
   deposit_conflict_address: string | null;
   deposit_conflict_reason: DepositConflictReason | null;
   deposit_conflict_at: number | null;
+  seller_account: string | null;
+  seller_claimer: string | null;
   status_history: string;
   created_at: number;
   updated_at: number;
@@ -846,6 +1287,8 @@ function rowToRecord(row: Row): FundingRecord {
     deposit_conflict_address: row.deposit_conflict_address ?? undefined,
     deposit_conflict_reason: row.deposit_conflict_reason ?? undefined,
     deposit_conflict_at: row.deposit_conflict_at ?? undefined,
+    seller_account: row.seller_account ?? undefined,
+    seller_claimer: row.seller_claimer ?? undefined,
     status_history: JSON.parse(row.status_history) as TimelineEntry[],
   } satisfies FundingRecord;
 }
@@ -890,6 +1333,8 @@ function recordToRow(r: FundingRecord): unknown[] {
     deposit_conflict_address: r.deposit_conflict_address ?? null,
     deposit_conflict_reason: r.deposit_conflict_reason ?? null,
     deposit_conflict_at: r.deposit_conflict_at ?? null,
+    seller_account: r.seller_account ?? null,
+    seller_claimer: r.seller_claimer ?? null,
     status_history: JSON.stringify(r.status_history),
     created_at: r.created_at,
     updated_at: r.updated_at,

@@ -35,9 +35,11 @@ import {
   supportedOfframpCorridorsQuery,
   supportedOfframpQuery,
   redeemRequest,
+  relayRequest,
   malformedRequest,
   notFound,
   Refusal,
+  saleVaultProxyUnavailable,
   transactionId,
   type ErrorResponse,
   fundingListQuery,
@@ -46,6 +48,9 @@ import { AssetCatalog } from './meld/catalog.js';
 import { toCorridorDto } from './meld/discovery.js';
 import { toFundingRequestDto } from './funding/types.js';
 import { MeldHttpError } from './meld/client.js';
+import type { SaleVaultProxyRelay } from './salevaultproxy/relay.js';
+import type { SaleVaultProxyService } from './salevaultproxy/service.js';
+import { saleVaultProxyPayload } from './salevaultproxy/verify.js';
 import { railRefusal } from './meld/refusal.js';
 import type { Onramp } from './onramp.js';
 
@@ -89,6 +94,8 @@ export async function buildServer(
   makeOnramp: OnrampFactory,
   personhood?: PersonhoodService,
   logDestination?: LogDestination,
+  saleVaultProxy?: SaleVaultProxyService,
+  relay?: SaleVaultProxyRelay,
 ): Promise<FastifyInstance> {
   const app = Fastify({
     // A request id on every log line and every error body, so a support conversation can
@@ -348,7 +355,12 @@ export async function buildServer(
   // Sell corridors merged across the configured offramp lanes: cached (all countries) and live (one).
   app.get<{ Querystring: Record<string, string> }>('/supported/offramp/corridors', asCaller, async (request, reply) => {
     parse(supportedOfframpCorridorsQuery, request.query);
-    return reply.send({ corridors: await onramp.offrampCorridors() });
+    // The deployment rides the bulk read the app loads once, and only once it is verified on chain
+    const verified = saleVaultProxy?.verified();
+    return reply.send({
+      corridors: await onramp.offrampCorridors(),
+      ...(verified === undefined ? {} : { saleVaultProxy: saleVaultProxyPayload(verified) }),
+    });
   });
   app.get<{ Querystring: Record<string, string> }>('/supported/offramp', asCaller, async (request, reply) => {
     const q = parse(supportedOfframpQuery, request.query);
@@ -409,6 +421,40 @@ export async function buildServer(
       } satisfies ErrorResponse);
     }
     return reply.send({ funding: toFundingRequestDto(record, Date.now()) });
+  });
+
+  // The on-chain sale vault proxy for one of the caller's sells. 404 for unknown or another caller's.
+  app.get<{ Params: { id: string } }>('/offramp/sale/:id', asCaller, async (request, reply) => {
+    const subject = gate.subjectOf(request);
+    const id = parse(transactionId, request.params.id);
+    if (saleVaultProxy === undefined) throw saleVaultProxyUnavailable('sale vault proxy service is not wired');
+    const sale = await saleVaultProxy.status(subject, id);
+    if (sale === undefined) {
+      const missing = notFound('No such funding request.');
+      return reply.code(missing.status).send({ error: missing.failure, request_id: request.id } satisfies ErrorResponse);
+    }
+    return reply.send({ sale });
+  });
+
+  // Ask the keeper to act on the caller's sale vault proxy now. Body-less, answers 200 whatever was done.
+  app.post<{ Params: { id: string } }>('/offramp/returns/:id', asCaller, async (request, reply) => {
+    const subject = gate.subjectOf(request);
+    const id = parse(transactionId, request.params.id);
+    if (saleVaultProxy === undefined) throw saleVaultProxyUnavailable('sale vault proxy service is not wired');
+    const sale = await saleVaultProxy.trigger(subject, id);
+    if (sale === undefined) {
+      const missing = notFound('No such funding request.');
+      return reply.code(missing.status).send({ error: missing.failure, request_id: request.id } satisfies ErrorResponse);
+    }
+    return reply.send({ sale });
+  });
+
+  // Relay a claimer's signed USDC transferWithAuthorization through the keeper. 202 once broadcast.
+  app.post('/offramp/relay', asCaller, async (request, reply) => {
+    const subject = gate.subjectOf(request);
+    const body = parse(relayRequest, request.body);
+    if (relay === undefined) throw saleVaultProxyUnavailable('the relay needs a running sale vault proxy keeper');
+    return reply.code(202).send({ relay: await relay.relay(subject, body) });
   });
 
   // A body-less `POST` must not depend on the caller omitting a header.

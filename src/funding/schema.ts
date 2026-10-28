@@ -3,10 +3,11 @@
  *
  * The SQLite migration chain is gone, and deleting it was the point of moving. v0->v1->v2->v3
  * existed to bring an on-disk SQLite file forward in place; the Postgres chain is
- * 1->2->3->4->5->6->7->8, with 3->4 adding `cancelled_at`, 4->5 adding the supported-corridors
+ * 1->2->3->4->5->6->7->8->9->10, with 3->4 adding `cancelled_at`, 4->5 adding the supported-corridors
  * cache, 5->6 adding the sell direction and the terms only a sell commits, 6->7 recording a
- * deposit-address disclosure conflict, and 7->8 putting a direction into the supported-corridors
- * cache. Nothing was ever
+ * deposit-address disclosure conflict, 7->8 putting a direction into the supported-corridors
+ * cache, 8->9 standing in for another build's `vault_sales`, which stays untouched, and 9->10 adding the
+ * seller account, claimer and sale vault proxy tables. Nothing was ever
  * deployed, so that chain migrated a population of
  * zero, and CloudSQL starts from an empty database, so porting it would have meant carrying three
  * migrations for no rows, expressed against an engine this service has left. The v3 shape is the v1 shape
@@ -22,7 +23,7 @@ import { DIRECTIONS } from '../rail.js';
 import { FUNDING_STATES } from './state.js';
 
 /** The current schema version. Bump with each migration added here. */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 10;
 
 /** A migration: bring the previous version's rows to this version's shape. */
 export interface Migration {
@@ -154,6 +155,7 @@ const CRYPTO_AMOUNT_COLUMN = ' crypto_amount TEXT';
  * The other two replace what the dropped `NOT NULL`s used to guarantee, per direction rather
  * than globally. `wallet_address` and `source_amount` became nullable because a sell has
  * neither, and without these a buy could now be written missing both.
+ * A sell may also carry the seller's own sending address in `wallet_address`.
  *
  * `crypto_amount` is the one worth spelling out. A consumer resuming a sell hard-compares the
  * committed crypto against its own record to detect being resumed into a *different* sale, and
@@ -224,12 +226,140 @@ const DEPOSIT_CONFLICT_CONSTRAINT =
   'CONSTRAINT funding_deposit_conflict_reason_known CHECK (' +
   "deposit_conflict_reason IS NULL OR deposit_conflict_reason IN ('address_changed', 'address_malformed', 'terms_changed'))";
 
+// The seller's own account on a sell, appended after the conflict columns on both paths
+const SELLER_ACCOUNT_COLUMN = ' seller_account TEXT';
+
+// A seller account only on a sell that also carries its derived wallet address
+const SELLER_ACCOUNT_CONSTRAINT =
+  "CONSTRAINT funding_seller_account CHECK (seller_account IS NULL OR (direction = 'sell' AND wallet_address IS NOT NULL))";
+
+// The seller's Arbitrum claimer, appended after the seller account on both paths
+const SELLER_CLAIMER_COLUMN = ' seller_claimer TEXT';
+
+// A claimer only beside the seller account its proxy is derived from, lowercase hex
+const SELLER_CLAIMER_CONSTRAINT =
+  "CONSTRAINT funding_seller_claimer CHECK (seller_claimer IS NULL OR (seller_account IS NOT NULL AND seller_claimer ~ '^0x[0-9a-f]{40}$'))";
+
+// The relay's lookup of a claimer under one product
+const SELLER_CLAIMER_INDEX =
+  'CREATE INDEX IF NOT EXISTS funding_by_seller_claimer ON funding_requests (seller_claimer, product_id) WHERE seller_claimer IS NOT NULL';
+
+// One row per Arbitrum sell, naming the proxy and sale ref the keeper watches from its last activity, due when an event touches it
+const SALE_VAULT_PROXIES_TABLE =
+  'CREATE TABLE IF NOT EXISTS sale_vault_proxies (' +
+  ' funding_request_id TEXT PRIMARY KEY,' +
+  ' chain_id BIGINT NOT NULL,' +
+  ' factory TEXT NOT NULL,' +
+  ' implementation TEXT NOT NULL,' +
+  ' home TEXT NOT NULL,' +
+  ' claimer TEXT NOT NULL,' +
+  ' proxy TEXT NOT NULL,' +
+  ' ref TEXT NOT NULL,' +
+  ' due_at BIGINT,' +
+  ' last_activity_at BIGINT NOT NULL,' +
+  ' created_at BIGINT NOT NULL,' +
+  ' updated_at BIGINT NOT NULL,' +
+  " CONSTRAINT sale_vault_proxies_hex CHECK (factory ~ '^0x[0-9a-f]{40}$' AND implementation ~ '^0x[0-9a-f]{40}$'" +
+  " AND proxy ~ '^0x[0-9a-f]{40}$' AND home ~ '^0x[0-9a-f]{64}$' AND claimer ~ '^0x[0-9a-f]{40}$' AND ref ~ '^0x[0-9a-f]{64}$')" +
+  ')';
+
+const SALE_VAULT_PROXIES_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS sale_vault_proxies_proxy ON sale_vault_proxies (chain_id, proxy)',
+  'CREATE INDEX IF NOT EXISTS sale_vault_proxies_home ON sale_vault_proxies (chain_id, factory, home)',
+  'CREATE INDEX IF NOT EXISTS sale_vault_proxies_due ON sale_vault_proxies (chain_id, due_at) WHERE due_at IS NOT NULL',
+  'CREATE INDEX IF NOT EXISTS sale_vault_proxies_activity ON sale_vault_proxies (chain_id, factory, last_activity_at)',
+];
+
+// Every keeper transaction, claimed before it is signed and settled from its receipt
+const SALE_VAULT_PROXY_CALLS_TABLE =
+  'CREATE TABLE IF NOT EXISTS sale_vault_proxy_calls (' +
+  ' id TEXT PRIMARY KEY,' +
+  ' chain_id BIGINT NOT NULL,' +
+  ' sender TEXT NOT NULL,' +
+  ' target TEXT NOT NULL,' +
+  ' proxy TEXT NOT NULL,' +
+  ' action TEXT NOT NULL,' +
+  ' amount TEXT,' +
+  ' nonce BIGINT,' +
+  ' tx_hash TEXT,' +
+  " status TEXT NOT NULL DEFAULT 'sending'," +
+  ' error TEXT,' +
+  ' created_at BIGINT NOT NULL,' +
+  ' updated_at BIGINT NOT NULL,' +
+  " CONSTRAINT sale_vault_proxy_calls_action_known CHECK (action IN ('deliver', 'expire', 'flush', 'deploy', 'return', 'release', 'skim', 'relay'))," +
+  " CONSTRAINT sale_vault_proxy_calls_status_known CHECK (status IN ('sending', 'sent', 'mined', 'reverted', 'dropped'))" +
+  ')';
+
+// At most one call in flight per proxy, so two keepers cannot race one nonce
+const SALE_VAULT_PROXY_CALLS_INFLIGHT =
+  "CREATE UNIQUE INDEX IF NOT EXISTS sale_vault_proxy_calls_one_inflight ON sale_vault_proxy_calls (chain_id, proxy) WHERE status IN ('sending', 'sent')";
+
+// The last block whose factory and refund logs the keeper has read, per chain
+const SALE_VAULT_PROXY_CURSORS_TABLE =
+  'CREATE TABLE IF NOT EXISTS sale_vault_proxy_cursors (' +
+  ' chain_id BIGINT PRIMARY KEY,' +
+  ' block BIGINT NOT NULL,' +
+  ' updated_at BIGINT NOT NULL' +
+  ')';
+
+// Each gas-deferred delivery's terms off DeliveryDeferred, the only source of the deadline deliver needs
+const SALE_VAULT_PROXY_DEFERRALS_TABLE =
+  'CREATE TABLE IF NOT EXISTS sale_vault_proxy_deferrals (' +
+  ' chain_id BIGINT NOT NULL,' +
+  ' factory TEXT NOT NULL,' +
+  ' home TEXT NOT NULL,' +
+  ' claimer TEXT NOT NULL,' +
+  ' ref TEXT NOT NULL,' +
+  ' recipient TEXT NOT NULL,' +
+  ' committed TEXT NOT NULL,' +
+  ' deadline TEXT NOT NULL,' +
+  ' created_at BIGINT NOT NULL,' +
+  ' PRIMARY KEY (chain_id, factory, home, claimer, ref, recipient, committed, deadline),' +
+  " CONSTRAINT sale_vault_proxy_deferrals_hex CHECK (factory ~ '^0x[0-9a-f]{40}$' AND recipient ~ '^0x[0-9a-f]{40}$'" +
+  " AND home ~ '^0x[0-9a-f]{64}$' AND claimer ~ '^0x[0-9a-f]{40}$' AND ref ~ '^0x[0-9a-f]{64}$')," +
+  " CONSTRAINT sale_vault_proxy_deferrals_uint CHECK (committed ~ '^[0-9]{1,78}$' AND deadline ~ '^[0-9]{1,78}$')" +
+  ')';
+
+// USDC that reached a claimer, a proxy's Released or a factory's PendingFlushed to the claimer, keyed by its log
+const SALE_VAULT_PROXY_PAYOUTS_TABLE =
+  'CREATE TABLE IF NOT EXISTS sale_vault_proxy_payouts (' +
+  ' chain_id BIGINT NOT NULL,' +
+  ' tx_hash TEXT NOT NULL,' +
+  ' log_index BIGINT NOT NULL,' +
+  ' factory TEXT NOT NULL,' +
+  ' home TEXT NOT NULL,' +
+  ' claimer TEXT NOT NULL,' +
+  ' kind TEXT NOT NULL,' +
+  ' amount TEXT NOT NULL,' +
+  ' created_at BIGINT NOT NULL,' +
+  ' PRIMARY KEY (chain_id, tx_hash, log_index),' +
+  " CONSTRAINT sale_vault_proxy_payouts_hex CHECK (tx_hash ~ '^0x[0-9a-f]{64}$' AND factory ~ '^0x[0-9a-f]{40}$'" +
+  " AND home ~ '^0x[0-9a-f]{64}$' AND claimer ~ '^0x[0-9a-f]{40}$')," +
+  " CONSTRAINT sale_vault_proxy_payouts_kind_known CHECK (kind IN ('released', 'flushed'))," +
+  " CONSTRAINT sale_vault_proxy_payouts_uint CHECK (amount ~ '^[0-9]{1,78}$')" +
+  ')';
+
+const SALE_VAULT_PROXY_PAYOUTS_INDEX =
+  'CREATE INDEX IF NOT EXISTS sale_vault_proxy_payouts_claimer ON sale_vault_proxy_payouts (chain_id, factory, home, claimer)';
+
+// The sale vault proxy tables, the same text on the fresh and migrated paths
+const SALE_VAULT_PROXY_SCHEMA = [
+  SALE_VAULT_PROXIES_TABLE,
+  ...SALE_VAULT_PROXIES_INDEXES,
+  SALE_VAULT_PROXY_CALLS_TABLE,
+  SALE_VAULT_PROXY_CALLS_INFLIGHT,
+  SALE_VAULT_PROXY_CURSORS_TABLE,
+  SALE_VAULT_PROXY_DEFERRALS_TABLE,
+  SALE_VAULT_PROXY_PAYOUTS_TABLE,
+  SALE_VAULT_PROXY_PAYOUTS_INDEX,
+];
+
 /**
  * The ordered migration list.
  *
  * A fresh database is created at `SCHEMA_VERSION` directly by `freshSchema()`, so this list is
  * what an existing database walks through, one step at a time. The next migration appends
- * `{ from: 8, to: 9, sql: [...] }` and bumps `SCHEMA_VERSION`; `store.ts` needs no change.
+ * `{ from: 10, to: 11, sql: [...] }` and bumps `SCHEMA_VERSION`. `store.ts` needs no change.
  *
  * This chain is one-way. A build expecting v1 refuses a v2 database: the version check is
  * `!==`, deliberately, because reading a shape you do not understand is worse than not starting.
@@ -490,6 +620,25 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE supported_corridors ADD ${SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT}`,
     ],
   },
+  {
+    from: 8,
+    to: 9,
+    // v8 -> v9: a no-op, so a database already at another build's v9 still runs v9 -> v10
+    sql: [],
+  },
+  {
+    from: 9,
+    to: 10,
+    // v9 -> v10: add the seller account and claimer and the sale vault proxy tables, legacy rows pass the new checks
+    sql: [
+      `ALTER TABLE funding_requests ADD COLUMN${SELLER_ACCOUNT_COLUMN}`,
+      `ALTER TABLE funding_requests ADD ${SELLER_ACCOUNT_CONSTRAINT}`,
+      `ALTER TABLE funding_requests ADD COLUMN${SELLER_CLAIMER_COLUMN}`,
+      `ALTER TABLE funding_requests ADD ${SELLER_CLAIMER_CONSTRAINT}`,
+      SELLER_CLAIMER_INDEX,
+      ...SALE_VAULT_PROXY_SCHEMA,
+    ],
+  },
 ];
 
 /**
@@ -547,6 +696,9 @@ export function freshSchema(): string[] {
       // table.
       DEPOSIT_COLUMNS.map((column) => `${column},`).join('') +
       DEPOSIT_CONFLICT_COLUMNS.map((column) => `${column},`).join('') +
+      // The seller account and claimer, in the v9 -> v10 append position
+      `${SELLER_ACCOUNT_COLUMN},` +
+      `${SELLER_CLAIMER_COLUMN},` +
       // The vocabulary, enforced by the database rather than only by the state machine.
       // `update()` validates transitions inside its transaction, but `create()` writes whatever
       // status it is handed; both production callers are correct and nothing at the storage layer
@@ -557,6 +709,8 @@ export function freshSchema(): string[] {
       // an existing table. Same text on both paths, so the two tables are the same table.
       DIRECTION_CONSTRAINTS.map((constraint) => ` ${constraint}`).join(',') +
       `, ${DEPOSIT_CONFLICT_CONSTRAINT}` +
+      `, ${SELLER_ACCOUNT_CONSTRAINT}` +
+      `, ${SELLER_CLAIMER_CONSTRAINT}` +
       ')',
     'CREATE INDEX funding_by_alias ON funding_requests (subject_alias, product_id, created_at DESC, id DESC)',
     // Partial, matching the `WHERE client_reference IS NOT NULL` predicate exactly: a refused row
@@ -569,6 +723,9 @@ export function freshSchema(): string[] {
     // The supported-corridors cache, at the current (v8) shape. See the v7 -> v8 migration for
     // what an existing database walks through to reach the same table.
     SUPPORTED_CORRIDORS_TABLE_CURRENT,
+    SELLER_CLAIMER_INDEX,
+    // The sale vault proxy tables, the same statements the v9 -> v10 migration runs
+    ...SALE_VAULT_PROXY_SCHEMA,
   ];
 }
 
@@ -587,6 +744,9 @@ export const MIGRATIONS_TABLE =
  * on one pooled connection.
  */
 export const MIGRATION_LOCK_KEY = 0x0117_ad07;
+
+// The advisory-lock key the sale vault proxy keeper serializes on, distinct from the migration key
+export const KEEPER_LOCK_KEY = 0x0117_ad08;
 
 /**
  * How long a booting replica waits for that lock before giving up.

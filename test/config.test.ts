@@ -1417,3 +1417,156 @@ describe('preview pattern is a development-only affordance', () => {
     ).not.toThrow();
   });
 });
+
+describe('sale_vault_proxy', () => {
+  const sepolia = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    chain_id: 421614,
+    factory: '0x1111111111111111111111111111111111111111',
+    chainflip_vault: '0x2bb150e6d4366a1bdbc4275d1f35892cd63f27e3',
+    usdc: '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d',
+    rpc_url: 'https://sepolia-rollup.arbitrum.io/rpc',
+    keeper_key: { mode: 'file', path: '/run/secrets/sale-vault-proxy-keeper-key' },
+    chainflip: { rpc_url: 'https://archive.perseverance.chainflip.io' },
+    ...overrides,
+  });
+  const mainnet = (overrides: Record<string, unknown> = {}): Record<string, unknown> =>
+    sepolia({
+      chain_id: 42161,
+      rpc_url: 'https://arb1.arbitrum.io/rpc',
+      chainflip: { rpc_url: 'https://mainnet-archive.chainflip.io' },
+      ...overrides,
+    });
+
+  it('is optional and fills the keeper defaults', () => {
+    expect(parseConfig(rawConfig()).sale_vault_proxy).toBeUndefined();
+    const parsed = parseConfig(rawConfig({ sale_vault_proxy: sepolia() })).sale_vault_proxy;
+    expect(parsed?.keeper).toEqual({
+      enabled: true,
+      interval_ms: 60_000,
+      batch: 25,
+      resend_ms: 600_000,
+      log_range: 10_000,
+      min_skim: '5',
+      min_eth: '0.002',
+    });
+    expect(parsed?.chainflip.quote_margin_bps).toBe(50);
+    expect(parsed?.chainflip.limits_ttl_ms).toBe(30_000);
+    expect(parsed?.retired).toEqual([]);
+    expect(parsed?.chainflip.backend_url).toBeUndefined();
+  });
+
+  it('takes retired deployments, each a non-zero factory with its own Vault and USDC, and no factory twice', () => {
+    const retired = [
+      {
+        factory: '0x5555555555555555555555555555555555555555',
+        chainflip_vault: '0x7777777777777777777777777777777777777777',
+        usdc: '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d',
+      },
+    ];
+    expect(parseConfig(rawConfig({ sale_vault_proxy: sepolia({ retired }) })).sale_vault_proxy?.retired).toEqual(retired);
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: sepolia({ retired: [{ ...retired[0], factory: `0x${'0'.repeat(40)}` }] }) }))).toThrow(/zero address/);
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: sepolia({ retired: [{ ...retired[0], chainflip_vault: undefined }] }) }))).toThrow(/chainflip_vault/);
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: sepolia({ retired: [{ ...retired[0], implementation: retired[0]?.factory }] }) }))).toThrow(/implementation/);
+    // Case does not make a different factory
+    const again = [...retired, { ...retired[0], factory: '0x1111111111111111111111111111111111111111' }];
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: sepolia({ retired: again }) }))).toThrow(/retired\.1\.factory: sale_vault_proxy factory 0x1111111111111111111111111111111111111111 is listed twice/);
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: sepolia({ retired: [retired[0], { ...retired[0], factory: retired[0]?.factory.toUpperCase().replace('0X', '0x') }] }) }))).toThrow(/listed twice/);
+  });
+
+  it('lowercases every address and refuses a mixed-case one with a bad EIP-55 checksum', () => {
+    const checksummed = '0x2bB150e6d4366A1BDBC4275D1F35892CD63F27e3';
+    expect(parseConfig(rawConfig({ sale_vault_proxy: sepolia({ chainflip_vault: '0x2BB150E6D4366A1BDBC4275D1F35892CD63F27E3' }) })).sale_vault_proxy?.chainflip_vault).toBe(
+      '0x2bb150e6d4366a1bdbc4275d1f35892cd63f27e3',
+    );
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: sepolia({ chainflip_vault: checksummed }) }))).toThrow(/EIP-55/);
+  });
+
+  it.each<[string, Record<string, unknown>, RegExp]>([
+    ['the zero factory', { factory: `0x${'0'.repeat(40)}` }, /zero address/],
+    ['the removed implementation, read off the factory', { implementation: '0x2222222222222222222222222222222222222222' }, /implementation/],
+    ['the removed chain label', { chain: 'arbitrum' }, /chain/],
+    ['the removed watch window, the deployment STALE_DELAY', { keeper: { watch_days: 60 } }, /watch_days/],
+    ['a zero gas alert', { keeper: { min_eth: '0.000' } }, /min_eth must be above 0/],
+    ['the zero Chainflip vault', { chainflip_vault: `0x${'0'.repeat(40)}` }, /zero address/],
+    ['a USDC that is not an address', { usdc: 'usdc' }, /usdc/],
+    ['a short mixed-case factory', { factory: '0xAbC' }, /factory: Must be 0x and 40 hex digits/],
+    ['a short mixed-case retired factory', { retired: [{ factory: '0xAb' }] }, /retired.*Must be 0x and 40 hex digits/],
+    ['no Chainflip vault', { chainflip_vault: undefined }, /chainflip_vault/],
+    ['an unknown field', { owner: 'me' }, /owner/],
+    ['a keeper interval under 15s', { keeper: { interval_ms: 14_999 } }, /interval_ms/],
+    ['a keeper batch over 200', { keeper: { batch: 201 } }, /batch/],
+    ['a skim with too many decimals', { keeper: { min_skim: '0.0000001' } }, /6 decimals/],
+    ['an unknown keeper field', { keeper: { min_sweep: '0.5' } }, /min_sweep/],
+    ['an ETH amount that is not a number', { keeper: { min_eth: 'lots' } }, /18 decimals/],
+    ['a quote margin over 1000', { chainflip: { ...(sepolia().chainflip as object), quote_margin_bps: 1_001 } }, /quote_margin_bps/],
+    ['a limits TTL over 600000', { chainflip: { ...(sepolia().chainflip as object), limits_ttl_ms: 600_001 } }, /limits_ttl_ms/],
+    ['a negative limits TTL', { chainflip: { ...(sepolia().chainflip as object), limits_ttl_ms: -1 } }, /limits_ttl_ms/],
+    ['a log range over 30000', { keeper: { log_range: 30_001 } }, /log_range/],
+    ['a chain with no pinned network', { chain_id: 1 }, /chain_id must be one of 42161, 421614/],
+    ['a keeper with a single pooled connection', { keeper: { enabled: true } }, /pool_max must be at least 2/],
+  ])('refuses %s', (_name, overrides, message) => {
+    const store = overrides.keeper !== undefined && 'enabled' in (overrides.keeper as object) ? { store: { ...(rawConfig().store as Record<string, unknown>), pool_max: 1 } } : {};
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: sepolia(overrides), ...store }))).toThrow(message);
+  });
+
+  it('pins the hosts per chain outside development, so a mainnet deployment never prices on Perseverance', () => {
+    const meld = { ...(productionConfig().meld as Record<string, unknown>), base_url: 'https://api-sb.meld.io' };
+    const sandbox = (sp: Record<string, unknown>) => () => parseConfig({ ...productionConfig(), environment: 'sandbox', meld, sale_vault_proxy: sp });
+    expect(sandbox(sepolia())).not.toThrow();
+    const swapped = mainnet({ chainflip: { rpc_url: 'https://archive.perseverance.chainflip.io', backend_url: 'https://chainflip-swap-perseverance.chainflip.io' } });
+    expect(sandbox(swapped)).toThrow(/backend_url is for development only, chain 42161 uses https:\/\/chainflip-swap\.chainflip\.io[\s\S]*rpc_url must be a Chainflip-Berghain endpoint/);
+    expect(sandbox(sepolia({ chainflip: { rpc_url: 'https://archive.perseverance.chainflip.io', backend_url: 'https://chainflip-swap-perseverance.chainflip.io' } }))).toThrow(
+      /backend_url is for development only, chain 421614 uses https:\/\/chainflip-swap-perseverance\.chainflip\.io/,
+    );
+    expect(sandbox(sepolia({ chainflip: { rpc_url: 'https://mainnet-archive.chainflip.io' } }))).toThrow(/rpc_url must be a Chainflip-Perseverance endpoint/);
+    // Development points at local fakes, the State Chain name is proven at verification instead
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: swapped }))).not.toThrow();
+  });
+
+  it('refuses a single pooled connection even with the keeper loop off, since a returns call still takes the lock', () => {
+    const store = { ...(rawConfig().store as Record<string, unknown>), pool_max: 1 };
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: sepolia({ keeper: { enabled: false } }), store }))).toThrow(/pool_max must be at least 2/);
+    expect(() => parseConfig(rawConfig({ store }))).not.toThrow();
+  });
+
+  it('refuses plaintext endpoints and an env-mode key outside development', () => {
+    const plain = mainnet({
+      rpc_url: 'http://arb.internal',
+      keeper_key: { mode: 'env', var: 'KEEPER_KEY' },
+      chainflip: { rpc_url: 'http://cf.internal' },
+    });
+    const run = () => parseConfig({ ...productionConfig(), sale_vault_proxy: plain });
+    expect(run).toThrow(/sale_vault_proxy\.rpc_url must use https/);
+    expect(run).toThrow(/sale_vault_proxy\.chainflip\.rpc_url must use https/);
+    expect(run).toThrow(/sale_vault_proxy\.keeper_key must be mounted as a file/);
+    // Development keeps plaintext for a local node
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: sepolia({ rpc_url: 'http://localhost:8545' }) }))).not.toThrow();
+  });
+
+  it('pins production to Arbitrum One and mainnet Chainflip', () => {
+    expect(() => parseConfig({ ...productionConfig(), sale_vault_proxy: mainnet() })).not.toThrow();
+    expect(() => parseConfig({ ...productionConfig(), sale_vault_proxy: sepolia() })).toThrow(/42161/);
+    expect(() => parseConfig({ ...productionConfig(), sale_vault_proxy: mainnet({ chainflip: { rpc_url: 'https://perseverance.chainflip.xyz' } }) })).toThrow(
+      /rpc_url must be a Chainflip-Berghain endpoint/,
+    );
+    expect(() =>
+      parseConfig({ ...productionConfig(), sale_vault_proxy: mainnet({ chainflip: { rpc_url: 'https://mainnet-archive.chainflip.io', backend_url: 'not a url' } }) }),
+    ).toThrow(/backend_url/);
+  });
+
+  it('reports a malformed State Chain URL outside development by its field', () => {
+    const meld = { ...(productionConfig().meld as Record<string, unknown>), base_url: 'https://api-sb.meld.io' };
+    const parse = () => parseConfig({ ...productionConfig(), environment: 'sandbox', meld, sale_vault_proxy: sepolia({ chainflip: { rpc_url: 'not a url' } }) });
+    expect(parse).toThrow(/sale_vault_proxy\.chainflip\.rpc_url/);
+    expect(parse).not.toThrow(TypeError);
+  });
+
+  it('accepts a log range at the public RPCs\' topic-only limit', () => {
+    expect(() => parseConfig(rawConfig({ sale_vault_proxy: sepolia({ keeper: { log_range: 30_000 } }) }))).not.toThrow();
+  });
+
+  it('still validates a Solana lane and an Arbitrum lane without a sale vault proxy', () => {
+    const lanes = { offramp_lanes: [{ asset: 'usdt@assethub' }, { asset: 'usdc@solana' }, { asset: 'usdc@arbitrum' }] };
+    expect(() => parseConfig(rawConfig({ supported: lanes }))).not.toThrow();
+  });
+});

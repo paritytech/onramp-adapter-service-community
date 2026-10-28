@@ -13,7 +13,7 @@ import {
   withTwoStores,
 } from '../pg.js';
 
-import { sslOptions, type FundingStore } from '../../src/funding/store.js';
+import { sslOptions, type FundingStore, type SaleVaultProxyRow } from '../../src/funding/store.js';
 import type { FundingRecord } from '../../src/funding/types.js';
 
 const record = (overrides: Partial<FundingRecord> = {}): FundingRecord => fundingRecord(overrides);
@@ -1182,5 +1182,350 @@ describe('closing the store', () => {
     } finally {
       await dropSchema(schema);
     }
+  });
+});
+
+describe('the sale vault proxy tables', () => {
+  const PROXY = '0xfb63126b916e3bd2497702a0139ad2b344ac7536';
+  const FACTORY = '0x1111111111111111111111111111111111111111';
+  const IMPL = '0x2222222222222222222222222222222222222222';
+  const HOME = '0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d';
+  const SELLER = '15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5';
+  const CLAIMER = '0xabababababababababababababababababababab';
+  const KEEPER = '0x9d8A62f656a8d1615C1294fd71e9CFb3E4855A4F';
+  const RECIPIENT = '0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc';
+  const ref = (id: string) => `0x${Buffer.from(id.padEnd(32, '-')).toString('hex')}`;
+  const proxyRow = (id: string, proxy = PROXY) => ({
+    funding_request_id: id,
+    chain_id: 421614,
+    factory: FACTORY,
+    implementation: IMPL,
+    home: HOME,
+    claimer: CLAIMER.toUpperCase().replace('0X', '0x'),
+    proxy: proxy.toUpperCase().replace('0X', '0x'),
+    ref: ref(id).toUpperCase().replace('0X', '0x'),
+  });
+  // A sale's funding row and its proxy row, as an opened Arbitrum sell writes them
+  const opened = async (store: FundingStore, id: string, proxy = PROXY, overrides: Partial<ReturnType<typeof proxyRow>> = {}) => {
+    await store.create(sell({ id, client_reference: id, wallet_address: proxy, seller_account: SELLER, crypto_amount: '50', deposit_address: RECIPIENT }));
+    await store.insertSaleVaultProxy({ ...proxyRow(id, proxy), ...overrides });
+  };
+  const call = (id: string, proxy = PROXY, sender = KEEPER) => ({
+    id,
+    chain_id: 421614,
+    sender,
+    target: proxy,
+    proxy,
+    action: 'return' as const,
+    amount: '25000000',
+  });
+  const listing = { chainId: 421614, factories: [FACTORY.toUpperCase().replace('0X', '0x')], sinceMs: 0, limit: 10 };
+
+  it('round-trips a sell carrying its seller account and claimer', async () => {
+    await withStore(async (store) => {
+      await store.create(sell({ wallet_address: PROXY, seller_account: SELLER, seller_claimer: CLAIMER }));
+      expect(await store.byId('funding-1')).toMatchObject({ wallet_address: PROXY, seller_account: SELLER, seller_claimer: CLAIMER });
+    });
+  });
+
+  it('knows a claimer only under the product whose sale recorded it', async () => {
+    await withStore(async (store) => {
+      await store.create(sell({ wallet_address: PROXY, seller_account: SELLER, seller_claimer: CLAIMER }));
+      await store.create(sell({ id: 'funding-2', client_reference: 'other', wallet_address: PROXY, seller_account: SELLER }));
+      expect(await store.isSellerClaimer('app.dot', CLAIMER.toUpperCase().replace('0X', '0x'))).toBe(true);
+      expect(await store.isSellerClaimer('another-product', CLAIMER)).toBe(false);
+      expect(await store.isSellerClaimer('app.dot', `0x${'cd'.repeat(20)}`)).toBe(false);
+    });
+  });
+
+  it('knows any sale claimer and the chain recorded proxies as sale addresses', async () => {
+    await withStore(async (store) => {
+      await opened(store, 'a');
+      await store.create(sell({ id: 'b', client_reference: 'b', wallet_address: PROXY, seller_account: SELLER, seller_claimer: CLAIMER, product_id: 'another-product' }));
+      expect(await store.isSaleAddress(421614, PROXY.toUpperCase().replace('0X', '0x'))).toBe(true);
+      expect(await store.isSaleAddress(42161, PROXY)).toBe(false);
+      expect(await store.isSaleAddress(42161, CLAIMER)).toBe(true);
+      expect(await store.isSaleAddress(421614, RECIPIENT)).toBe(false);
+    });
+  });
+
+  it('inserts once, lowercases addresses and the ref, reads back, and deletes', async () => {
+    await withStore(async (store) => {
+      await store.insertSaleVaultProxy(proxyRow('a'));
+      await store.insertSaleVaultProxy({ ...proxyRow('a'), home: `0x${'ab'.repeat(32)}` });
+      expect(await store.readSaleVaultProxy('a')).toMatchObject({ funding_request_id: 'a', proxy: PROXY, home: HOME, claimer: CLAIMER, ref: ref('a'), due_at: null });
+      expect(await store.readSaleVaultProxy('missing')).toBeUndefined();
+      await store.deleteSaleVaultProxy('a');
+      expect(await store.readSaleVaultProxy('a')).toBeUndefined();
+    });
+  });
+
+  it('refuses a malformed address or ref', async () => {
+    await withStore(async (store) => {
+      await expect(store.insertSaleVaultProxy({ ...proxyRow('a'), home: '0x12' })).rejects.toThrow(/sale_vault_proxies_hex/);
+      await expect(store.insertSaleVaultProxy({ ...proxyRow('b'), ref: '0x12' })).rejects.toThrow(/sale_vault_proxies_hex/);
+      await expect(store.insertSaleVaultProxy({ ...proxyRow('c'), claimer: '0x12' })).rejects.toThrow(/sale_vault_proxies_hex/);
+    });
+  });
+
+  it('lists only due sales with their terms, skipping in-flight proxies, old rows and other deployments', async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      const third = '0x3333333333333333333333333333333333333333';
+      await opened(store, 'a');
+      await opened(store, 'b', '0x5a8b0082b72d54cef53705de15fe844ff9027dfd');
+      await opened(store, 'c', third);
+      await opened(store, 'd', '0x4444444444444444444444444444444444444444', { chain_id: 42161 });
+      await opened(store, 'e', '0x5555555555555555555555555555555555555555', { factory: IMPL });
+      const now = Date.now();
+      expect(await rows.listKeeperCandidates({ ...listing, now })).toEqual([]);
+      await rows.markAllDue({ chainId: 421614, factories: [FACTORY, IMPL], sinceMs: 0, at: now });
+      expect(await rows.claimProxyCall(call('x', third))).toBe(true);
+      const listed = await rows.listKeeperCandidates({ ...listing, now });
+      expect(listed.map((c) => c.funding_request_id)).toEqual(['a', 'b']);
+      expect(listed[0]).toEqual({ ...proxyRow('a'), claimer: CLAIMER, proxy: PROXY, ref: ref('a'), deposit_address: RECIPIENT, crypto_amount: '50' });
+      expect(await rows.listKeeperCandidates({ ...listing, now: now - 1 })).toEqual([]);
+      expect(await rows.listKeeperCandidates({ ...listing, now, sinceMs: now + 60_000 })).toEqual([]);
+      expect(await rows.listKeeperCandidates({ ...listing, now, limit: 1 })).toHaveLength(1);
+      expect((await rows.salesOfProxy(421614, PROXY.toUpperCase().replace('0X', '0x'))).map((c) => c.funding_request_id)).toEqual(['a']);
+    });
+  });
+
+  it('makes sales due by home or proxy at the log time, so a running evaluation never overwrites it', async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      const other = '0x5a8b0082b72d54cef53705de15fe844ff9027dfd';
+      await opened(store, 'a');
+      await opened(store, 'b', other, { home: `0x${'cd'.repeat(32)}` });
+      await rows.markDue({ chainId: 421614, homes: [], proxies: [], dust: [], at: 5 });
+      await rows.markDue({ chainId: 421614, homes: [HOME.toUpperCase().replace('0X', '0x')], proxies: [], dust: [], at: 10 });
+      await rows.markDue({ chainId: 421614, homes: [], proxies: [other], dust: [], at: 20 });
+      await rows.markDue({ chainId: 421614, homes: [HOME], proxies: [], dust: [], at: 30 });
+      expect((await store.readSaleVaultProxy('a'))?.due_at).toBe(30);
+      expect((await store.readSaleVaultProxy('b'))?.due_at).toBe(20);
+      // An evaluation that began at 25 keeps the log's 30
+      await rows.schedule({ chainId: 421614, proxy: PROXY, dueAt: null, startedAt: 25, at: 40 });
+      expect((await store.readSaleVaultProxy('a'))?.due_at).toBe(30);
+    });
+  });
+
+  it('lists each watched proxy once, within the window and the deployments', async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      const other = '0x5a8b0082b72d54cef53705de15fe844ff9027dfd';
+      await opened(store, 'a');
+      await opened(store, 'b');
+      await opened(store, 'c', other);
+      await opened(store, 'd', '0x4444444444444444444444444444444444444444', { chain_id: 42161 });
+      await opened(store, 'e', '0x5555555555555555555555555555555555555555', { factory: IMPL });
+      const watched = { chainId: 421614, factories: [FACTORY.toUpperCase().replace('0X', '0x')], sinceMs: 0 };
+      expect(await rows.watchedProxies(watched)).toEqual([other, PROXY].sort().map((proxy) => ({ proxy, factory: FACTORY, home: HOME, claimer: CLAIMER })));
+      expect(await rows.watchedProxies({ ...watched, sinceMs: Date.now() + 60_000 })).toEqual([]);
+    });
+  });
+
+  it('finds recorded proxies of the deployments among any addresses, at any age', async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      const other = '0x5a8b0082b72d54cef53705de15fe844ff9027dfd';
+      await opened(store, 'a');
+      await opened(store, 'b');
+      await opened(store, 'c', other, { factory: IMPL });
+      await opened(store, 'd', '0x4444444444444444444444444444444444444444', { chain_id: 42161 });
+      const stranger = '0x7777777777777777777777777777777777777777';
+      const asked = { chainId: 421614, factories: [FACTORY], proxies: [PROXY.toUpperCase().replace('0X', '0x'), other, stranger, '0x4444444444444444444444444444444444444444'] };
+      expect(await rows.recordedProxies(asked)).toEqual([{ proxy: PROXY, factory: FACTORY, home: HOME, claimer: CLAIMER }]);
+      expect(await rows.recordedProxies({ ...asked, proxies: [] })).toEqual([]);
+    });
+  });
+
+  it("makes every sale of a factory due and active, an idle one too, and leaves other factories' alone", async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      const other = '0x5a8b0082b72d54cef53705de15fe844ff9027dfd';
+      await opened(store, 'a');
+      await opened(store, 'b', other, { factory: IMPL });
+      const before = (await store.readSaleVaultProxy('b')) as SaleVaultProxyRow;
+      await rows.markFactoriesActive({ chainId: 421614, factories: [], at: 1 });
+      await rows.markFactoriesActive({ chainId: 421614, factories: [FACTORY.toUpperCase().replace('0X', '0x')], at: before.created_at + 5 });
+      expect(await store.readSaleVaultProxy('a')).toMatchObject({ due_at: before.created_at + 5, last_activity_at: before.created_at + 5 });
+      expect(await store.readSaleVaultProxy('b')).toMatchObject({ due_at: before.due_at, last_activity_at: before.last_activity_at });
+    });
+  });
+
+  it('starts the watch at insert and moves it with each activity, a dust transfer only making the sale due', async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      const other = '0x5a8b0082b72d54cef53705de15fe844ff9027dfd';
+      await opened(store, 'a');
+      await opened(store, 'b', other, { home: `0x${'cd'.repeat(32)}` });
+      const inserted = (await store.readSaleVaultProxy('a')) as SaleVaultProxyRow;
+      expect(inserted.last_activity_at).toBe(inserted.created_at);
+      const later = inserted.created_at + 1_000;
+      await rows.markDue({ chainId: 421614, homes: [], proxies: [], dust: [PROXY, other], at: later });
+      expect(await store.readSaleVaultProxy('a')).toMatchObject({ due_at: later, last_activity_at: inserted.created_at });
+      await rows.markDue({ chainId: 421614, homes: [HOME], proxies: [other.toUpperCase().replace('0X', '0x')], dust: [], at: later + 1 });
+      expect(await store.readSaleVaultProxy('a')).toMatchObject({ due_at: later + 1, last_activity_at: later + 1 });
+      expect(await store.readSaleVaultProxy('b')).toMatchObject({ due_at: later + 1, last_activity_at: later + 1 });
+      const watched = { chainId: 421614, factories: [FACTORY], sinceMs: later + 1 };
+      expect(await rows.watchedProxies(watched)).toHaveLength(2);
+      expect(await rows.watchedProxies({ ...watched, sinceMs: later + 2 })).toEqual([]);
+    });
+  });
+
+  it('lists idle proxies once each, longest unchecked first, and marks them checked', async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      const other = '0x5a8b0082b72d54cef53705de15fe844ff9027dfd';
+      await opened(store, 'a');
+      await opened(store, 'b');
+      await opened(store, 'c', other);
+      await opened(store, 'd', '0x4444444444444444444444444444444444444444', { chain_id: 42161 });
+      const idle = { chainId: 421614, factories: [FACTORY.toUpperCase().replace('0X', '0x')], sinceMs: Date.now() + 60_000, limit: 10 };
+      await rows.markChecked({ chainId: 421614, proxies: [], at: 1 });
+      await rows.markChecked({ chainId: 421614, proxies: [PROXY.toUpperCase().replace('0X', '0x')], at: 1 });
+      expect(await rows.idleProxies(idle)).toEqual([PROXY, other].map((proxy) => ({ proxy, factory: FACTORY })));
+      expect(await rows.idleProxies({ ...idle, limit: 1 })).toEqual([{ proxy: PROXY, factory: FACTORY }]);
+      // Any sale of the proxy still inside the window keeps it watched
+      expect(await rows.idleProxies({ ...idle, sinceMs: 0 })).toEqual([]);
+    });
+  });
+
+  it('schedules the next look, keeping a due time a log set since the evaluation began', async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      await opened(store, 'a');
+      await rows.schedule({ chainId: 421614, proxy: PROXY, dueAt: 100, startedAt: 50, at: 60 });
+      expect(await store.readSaleVaultProxy('a')).toMatchObject({ due_at: 100, updated_at: 60 });
+      await rows.schedule({ chainId: 421614, proxy: PROXY, dueAt: null, startedAt: 99, at: 70 });
+      expect((await store.readSaleVaultProxy('a'))?.due_at).toBe(100);
+      await rows.schedule({ chainId: 421614, proxy: PROXY, dueAt: null, startedAt: 100, at: 80 });
+      expect((await store.readSaleVaultProxy('a'))?.due_at).toBeNull();
+    });
+  });
+
+  it('keeps one log cursor per chain', async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      expect(await rows.readCursor(421614)).toBeUndefined();
+      await rows.writeCursor(421614, 322_690_662n);
+      await rows.writeCursor(421614, 322_690_700n);
+      await rows.writeCursor(42161, 1n);
+      expect(await rows.readCursor(421614)).toBe(322_690_700n);
+    });
+  });
+
+  it("records each deferred delivery once and reads a sale's deadlines by its exact terms, earliest first", async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      const terms = { chain_id: 421614, factory: FACTORY, home: HOME, claimer: CLAIMER, ref: ref('a'), recipient: RECIPIENT, committed: 50_000_000n };
+      const upper = { ...terms, factory: FACTORY.toUpperCase().replace('0X', '0x'), claimer: CLAIMER.toUpperCase().replace('0X', '0x'), ref: ref('a').toUpperCase().replace('0X', '0x') };
+      await rows.recordDeferrals([]);
+      await rows.recordDeferrals([
+        { ...upper, deadline: 1_800_003_600n },
+        { ...terms, deadline: 999n },
+        { ...terms, committed: 1n, deadline: 5n },
+        { ...terms, chain_id: 42161, deadline: 6n },
+        // Same terms under another claimer are another entry
+        { ...terms, claimer: KEEPER, deadline: 7n },
+      ]);
+      // A range read again adds nothing
+      await rows.recordDeferrals([{ ...terms, deadline: 1_800_003_600n }]);
+      expect(await rows.deferralDeadlines(upper)).toEqual([999n, 1_800_003_600n]);
+      expect(await rows.deferralDeadlines({ ...terms, recipient: KEEPER })).toEqual([]);
+      expect(await rows.deferralDeadlines({ ...terms, claimer: KEEPER })).toEqual([7n]);
+      await expect(rows.recordDeferrals([{ ...terms, home: '0x12', deadline: 1n }])).rejects.toThrow(/sale_vault_proxy_deferrals_hex/);
+      await expect(rows.recordDeferrals([{ ...terms, claimer: '0x12', deadline: 1n }])).rejects.toThrow(/sale_vault_proxy_deferrals_hex/);
+    });
+  });
+
+  it('records each payout to a claimer once and reads them by home and claimer, oldest first', async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      const payout = {
+        chain_id: 421614,
+        tx_hash: `0x${'AB'.repeat(32)}`,
+        log_index: 1,
+        factory: FACTORY.toUpperCase().replace('0X', '0x'),
+        home: HOME,
+        claimer: CLAIMER.toUpperCase().replace('0X', '0x'),
+        kind: 'released' as const,
+        amount: 6_000_000n,
+      };
+      await rows.recordPayouts([]);
+      await rows.recordPayouts([payout, { ...payout, log_index: 2, kind: 'flushed', amount: 4n }, { ...payout, log_index: 3, claimer: KEEPER }]);
+      // A range read again adds nothing
+      await rows.recordPayouts([payout]);
+      const read = await store.readPayouts({ chain_id: 421614, factory: FACTORY, home: HOME, claimer: CLAIMER });
+      expect(read.map(({ created_at: _at, ...p }) => p)).toEqual([
+        { ...payout, tx_hash: `0x${'ab'.repeat(32)}`, factory: FACTORY, claimer: CLAIMER },
+        { ...payout, tx_hash: `0x${'ab'.repeat(32)}`, factory: FACTORY, claimer: CLAIMER, log_index: 2, kind: 'flushed', amount: 4n },
+      ]);
+      expect(read[0]?.created_at).toEqual(expect.any(Number));
+      await expect(rows.recordPayouts([{ ...payout, log_index: 9, kind: 'swept' as never }])).rejects.toThrow(/sale_vault_proxy_payouts_kind_known/);
+      await expect(rows.recordPayouts([{ ...payout, log_index: 9, tx_hash: '0x12' }])).rejects.toThrow(/sale_vault_proxy_payouts_hex/);
+    });
+  });
+
+  it('claims one call per proxy, marks it sent, settles it once, and frees the proxy', async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      expect(await rows.claimProxyCall(call('one'))).toBe(true);
+      expect(await rows.claimProxyCall(call('two'))).toBe(false);
+      await rows.markProxyCallSent('one', '0xhash', 7);
+      expect(await rows.readInflightProxyCalls(421614)).toMatchObject([
+        { id: 'one', sender: KEEPER.toLowerCase(), status: 'sent', tx_hash: '0xhash', nonce: 7 },
+      ]);
+      await rows.settleProxyCall('one', 'mined');
+      await rows.settleProxyCall('one', 'dropped', 'late');
+      expect(await store.readLatestProxyCall(421614, PROXY)).toMatchObject({ id: 'one', status: 'mined', error: null });
+      expect(await rows.readInflightProxyCalls(421614)).toEqual([]);
+      expect(await rows.claimProxyCall({ ...call('three'), action: 'deliver' })).toBe(true);
+      await rows.settleProxyCall('three', 'reverted', 'execution reverted');
+      expect(await store.readLatestProxyCall(421614, PROXY.toUpperCase().replace('0X', '0x'))).toMatchObject({
+        id: 'three',
+        action: 'deliver',
+        status: 'reverted',
+        error: 'execution reverted',
+      });
+      expect(await store.readLatestProxyCall(421614, '0x3333333333333333333333333333333333333333')).toBeUndefined();
+      // Release and expire are keeper actions, any other action is refused
+      for (const [id, action] of [['four', 'release'], ['five', 'expire']] as const) {
+        expect(await rows.claimProxyCall({ ...call(id), action })).toBe(true);
+        await rows.settleProxyCall(id, 'mined');
+      }
+      await expect(rows.claimProxyCall({ ...call('six'), action: 'sweep' as never })).rejects.toThrow(/sale_vault_proxy_calls_action_known/);
+    });
+  });
+
+  it("reads every sender's in-flight calls on this chain, a rotated key's included", async () => {
+    await withStore(async (store) => {
+      const rows = store.keeperRows();
+      await rows.claimProxyCall(call('mine'));
+      await rows.claimProxyCall(call('theirs', '0x3333333333333333333333333333333333333333', IMPL));
+      await rows.claimProxyCall({ ...call('elsewhere', '0x4444444444444444444444444444444444444444'), chain_id: 42161 });
+      expect((await rows.readInflightProxyCalls(421614)).map((c) => c.id)).toEqual(['mine', 'theirs']);
+    });
+  });
+
+  it('holds the keeper lock exclusively across two connections, running the body on the locking one', async () => {
+    await withTwoStores(async (a, b) => {
+      let inner: string | undefined = 'unset';
+      const outer = await a.withKeeperLock(async (rows) => {
+        inner = await b.withKeeperLock(async () => 'b ran');
+        await rows.writeCursor(421614, 9n);
+        return 'a ran';
+      });
+      expect(outer).toBe('a ran');
+      expect(inner).toBeUndefined();
+      expect(await b.withKeeperLock(async (rows) => rows.readCursor(421614))).toBe(9n);
+    });
+  });
+
+  it('releases the keeper lock when the body throws', async () => {
+    await withTwoStores(async (a, b) => {
+      await expect(a.withKeeperLock(async () => Promise.reject(new Error('boom')))).rejects.toThrow('boom');
+      expect(await b.withKeeperLock(async () => 'free')).toBe('free');
+    });
   });
 });

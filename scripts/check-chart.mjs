@@ -246,6 +246,23 @@ function issuePaths(error) {
     .filter((path) => path.length > 0 && !path.startsWith('Invalid configuration'));
 }
 
+/** values.yaml keeper and chainflip tuning must equal the schema defaults. */
+function saleVaultProxyDefaultsMatch(config) {
+  const [values] = loadAll(readFileSync(`${CHART}/values.yaml`, 'utf8'));
+  const sp = config.sale_vault_proxy;
+  const bare = { ...config, sale_vault_proxy: { ...sp, keeper: {}, chainflip: { rpc_url: sp.chainflip.rpc_url } } };
+  const schema = parseConfig(bare).sale_vault_proxy;
+  for (const block of ['keeper', 'chainflip']) {
+    for (const [key, value] of Object.entries(values.sale_vault_proxy[block])) {
+      if (key === 'rpc_url') continue;
+      if (String(schema[block][key]) !== String(value)) {
+        throw new Error(`values.yaml sale_vault_proxy.${block}.${key} is ${String(value)}, the schema default is ${String(schema[block][key])}`);
+      }
+    }
+  }
+  console.log('sale_vault_proxy tuning: values.yaml matches the schema defaults');
+}
+
 helm(['lint', CHART, ...RENDER_ARGS]);
 console.log('helm lint: ok');
 
@@ -329,6 +346,7 @@ for (const overlay of [undefined, ...overlays]) {
   }
 
   parseConfig(config);
+  if (config.sale_vault_proxy !== undefined) saleVaultProxyDefaultsMatch(config);
   const secrets = secretPathsAreMounted(output, config);
   console.log(`${label}: renders, the config parses, and its ${secrets} secret path(s) are mounted`);
 }
@@ -500,6 +518,57 @@ checkNetworkPolicy(
     'networkPolicy.peers.cloudsql.apiCidrs=["199.36.153.8/30"]',
   ]),
   [53, 443, 3307, 988],
+);
+
+/** The sale vault proxy lane on, with its keeper key, for the renders that need it. */
+const SALE_VAULT_PROXY_ON = [
+  '--set',
+  'sale_vault_proxy.enabled=true',
+  '--set',
+  'sale_vault_proxy.factory=0x1111111111111111111111111111111111111111',
+  '--set',
+  'secrets.saleVaultProxyKeeperKey.existingSecret=keeper',
+];
+
+// The sale vault proxy reaches its RPCs and the Chainflip backend through its own named peer
+checkNetworkPolicy(
+  'networkPolicy, sale vault proxy enabled',
+  helm([
+    'template',
+    'check',
+    CHART,
+    ...RENDER_ARGS,
+    ...NETPOL_BASE,
+    ...SALE_VAULT_PROXY_ON,
+    '--set-json',
+    'networkPolicy.peers.saleVaultProxy.cidrs=["10.4.0.0/24"]',
+  ]),
+  [53, 443, 5432],
+);
+
+refusesToRender(
+  'networkPolicy, sale vault proxy enabled without its egress peer',
+  [...NETPOL_BASE, ...SALE_VAULT_PROXY_ON],
+  'no egress peer is named for the sale vault proxy',
+);
+
+refusesToRender(
+  'sale_vault_proxy enabled without its keeper-key Secret',
+  ['--set', 'sale_vault_proxy.enabled=true'],
+  'secrets.saleVaultProxyKeeperKey.existingSecret is unset',
+);
+
+refusesToRender(
+  'sale_vault_proxy enabled without a factory',
+  [
+    '--set',
+    'sale_vault_proxy.enabled=true',
+    '--set',
+    'sale_vault_proxy.factory=',
+    '--set',
+    'secrets.saleVaultProxyKeeperKey.existingSecret=keeper',
+  ],
+  'sale_vault_proxy.factory is required',
 );
 
 refusesToRender(

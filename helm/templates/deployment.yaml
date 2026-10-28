@@ -278,6 +278,12 @@ spec:
               subPath: {{ .Values.secrets.jwtKey.key | quote }}
               readOnly: true
             {{- end }}
+            {{- if .Values.secrets.saleVaultProxyKeeperKey.existingSecret }}
+            - name: sale-vault-proxy-keeper-key
+              mountPath: {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.saleVaultProxyKeeperKey.key | quote }}
+              subPath: {{ .Values.secrets.saleVaultProxyKeeperKey.key | quote }}
+              readOnly: true
+            {{- end }}
       volumes:
         # `/tmp` carries a `sizeLimit`. Without one an `emptyDir` is bounded only by the node's
         # disk, and the kubelet evicts the pod under node disk pressure: with one replica, a full
@@ -309,6 +315,13 @@ spec:
         - name: jwt-key
           secret:
             secretName: {{ .Values.secrets.jwtKey.existingSecret }}
+            optional: false
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.secrets.saleVaultProxyKeeperKey.existingSecret }}
+        - name: sale-vault-proxy-keeper-key
+          secret:
+            secretName: {{ .Values.secrets.saleVaultProxyKeeperKey.existingSecret }}
             optional: false
             defaultMode: 0400
         {{- end }}
