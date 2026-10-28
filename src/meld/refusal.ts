@@ -132,6 +132,17 @@ export function meld400(error: MeldHttpError): Refusal {
     }
   }
 
+  // A provider turned the amount down without naming a bound (Meld's `INVALID_AMOUNT`: "a provider
+  // rejected the amount for this route"). Below the phrase match, so an `INVALID_AMOUNT` whose
+  // message still names a bound keeps it. Still the amount's fault rather than the route's, so it
+  // gets its own code: the remedy is a different amount, which `PROVIDER_REJECTED` cannot say.
+  if (error.code === 'INVALID_AMOUNT') {
+    return reject(
+      { tag: 'Other', value: { code: 'AMOUNT_REJECTED', message: 'The provider cannot take this amount.' } },
+      operatorDetail(error),
+    );
+  }
+
   // The cases above are the nameable ones; the rest (an unsupported payment method in that
   // country, an unserved corridor) are still not retryable. Falling through to the 503 degrade
   // told the caller to retry something that can never succeed.
