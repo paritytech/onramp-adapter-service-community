@@ -32,6 +32,12 @@ describe('an amount a provider turned down without naming a bound', () => {
     });
   });
 
+  it('keeps the bound when its message still names one', () => {
+    expect(
+      refusalOf('Amount is below the minimum allowed, which is 18.00 EUR', 'INVALID_AMOUNT').failure,
+    ).toEqual({ tag: 'BelowMinimum', value: { amount: '18.00', currency: 'EUR' } });
+  });
+
   it('leaves a combination the provider declines as the generic refusal', () => {
     expect(refusalOf('Incompatible request: Body does not match service providers', 'INCOMPATIBLE_REQUEST').failure).toEqual({
       tag: 'Other',
