@@ -228,8 +228,16 @@ export async function buildServer(
   // the 429 or its `retry-after`. Sharing the bucket meant preflights spent the allowance and the
   // first refusal a caller met was often that unreadable one. Apart, a real request runs out first
   // and its 429 arrives with the headers the app backs off from. Passing options is what gives the
-  // limiter a child store; a preflight has no person, so the address allowance is the one that fits.
-  const preflightLimit = app.rateLimit({ max: cfg.rate_limit.per_address_max });
+  // limiter a child store.
+  //
+  // Held to the larger allowance, not the address one. A preflight is never proven (`identify` is
+  // route-level), so it is keyed on the address, while a proven caller's requests count against
+  // `per_person_max`. Capped at `per_address_max`, the preflight would still be the first refusal
+  // in personhood mode, and shared by everyone behind one NAT. The ceiling on log amplification
+  // stays; it just no longer sits below what a real caller is allowed.
+  const preflightLimit = app.rateLimit({
+    max: Math.max(cfg.rate_limit.per_person_max, cfg.rate_limit.per_address_max),
+  });
   app.addHook('onRequest', async function preflightCeiling(request, reply) {
     // `function`, not an arrow: the plugin's hook reads `this` for the Fastify instance.
     if (request.method === 'OPTIONS') await preflightLimit.call(this, request, reply);

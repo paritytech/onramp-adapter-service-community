@@ -36,7 +36,8 @@ a service that runs in production with a development posture. See
 | `allowed_products[]` | Product ids permitted to spend the key. Empty means closed, not open. |
 | `cors.allowed_origins[]` | Browser origins permitted to call, **and** the allowlist a caller's `redirectUrl` must match. Never a wildcard. Empty disables browser access and refuses every redirect. Accepts `polkadot://...` and the literal `null` for the app running inside the Polkadot host; see the warning below before putting `null` in a production list. |
 | `rate_limit.per_person_max` | Requests per window for one proven person, who gets a bucket of their own. Default 120. |
-| `rate_limit.per_address_max` | Requests per window per address, shared by everyone with no proven person behind them: the handshake routes, `insecure_dev`, and failed authentication. Default 30. CORS preflights are held to the same number in a counter of their own, so they never spend a real request's allowance. |
+| `rate_limit.per_address_max` | Requests per window per address, shared by everyone with no proven person behind them: the handshake routes, `insecure_dev`, and failed authentication. Default 30. |
+| (CORS preflights) | Counted per address in a counter of their own, so they never spend a real request's allowance, and held to the larger of `per_person_max` and `per_address_max`: a preflight is never proven, so a lower ceiling would refuse one before a proven caller's own requests run out. |
 | `rate_limit.window_seconds` | The window both allowances are counted over. Default 60. A config carrying the retired `rate_limit.max` is refused at boot rather than reinterpreted. |
 | `store.host` / `store.port` | The Postgres endpoint. `127.0.0.1` is the Cloud SQL Auth Proxy sidecar; a private IP reaches the instance directly. Port defaults to 5432. |
 | `store.database` / `store.user` | **Required, no defaults**: a funding history that silently never persists is worse than a boot failure. |
