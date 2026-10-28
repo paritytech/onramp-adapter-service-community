@@ -16,7 +16,8 @@
     "start": "node dist/main.js",
     "verify": "npm run typecheck && npm run lint && npm test && npm run build",
     "test:e2e": "npm run build && vitest run --config vitest.e2e.config.ts",
-    "check:chart": "node scripts/check-chart.mjs"
+    "check:chart": "node scripts/check-chart.mjs",
+    "meld:statuses": "node scripts/meld-statuses.mjs"
   },
   "dependencies": {
     "@fastify/cors": "^11.3.0",

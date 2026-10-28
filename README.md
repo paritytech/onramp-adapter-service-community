@@ -137,6 +137,15 @@ Boot is deliberately fatal on anything it cannot verify, and the message names t
 There is no `/metrics`. Diagnostics are the structured log, keyed by `request_id`, and
 `GET /funding/:id` for one request's state and timeline.
 
+### Watching a Meld account's providers
+
+Which statuses a provider reports, in what order and how far apart, is the provider's own and
+Meld forwards it as it is. `npm run meld:statuses` opens a purchase session per provider and
+payment method the way this service does, polls the transaction the way the worker does and by
+Meld's session id, and logs every change while someone pays in the widget with the provider's
+sandbox test details. `-- --sessions 5` opens sessions without paying, to count how often Meld
+refuses one. The key comes from `MELD_API_KEY_FILE`; the flags are in the script's header.
+
 ### Verifying a tagged build
 
 Image tags are `YYYYmmdd-HHMMSS-<sha8>`, published by `.github/workflows/release.yml` on a push to
