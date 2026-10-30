@@ -126,11 +126,12 @@ describe('normalizeSellerAddress', () => {
     return 'no refusal';
   };
 
-  it('requires one on an Asset Hub lane, and normalises it to the Polkadot prefix', () => {
+  it('normalises one on an Asset Hub lane to the Polkadot prefix, and takes none', () => {
     const key = new Uint8Array(32).fill(7);
     expect(normalizeSellerAddress(encodeAddress(key, 42), 'DOT')).toBe(encodeAddress(key, 0));
-    expect(refusalCode(() => normalizeSellerAddress(undefined, 'DOT'))).toBe('INVALID_ADDRESS');
-    expect(refusalCode(() => normalizeSellerAddress(undefined, 'USDT_DOT'))).toBe('INVALID_ADDRESS');
+    expect(normalizeSellerAddress(undefined, 'DOT')).toBeUndefined();
+    expect(normalizeSellerAddress(undefined, 'USDT_DOT')).toBeUndefined();
+    expect(refusalCode(() => normalizeSellerAddress('0x1234', 'DOT'))).toBe('INVALID_ADDRESS');
   });
 
   it('takes none on another chain, and checks one in that chain\'s form', () => {

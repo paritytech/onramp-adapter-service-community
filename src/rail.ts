@@ -144,7 +144,7 @@ export interface RailBuySession extends RailSessionCommon {
  *
  * `walletAddress` is the seller's own, never where the crypto goes: the account it is sent from,
  * which the provider refunds to. The deposit address is the provider's, disclosed after the
- * session exists. Present on every Asset Hub lane; see `normalizeSellerAddress`.
+ * session exists. Absent when the client sent none; see `normalizeSellerAddress`.
  */
 export interface RailSellSession extends RailSessionCommon {
   direction: 'sell';

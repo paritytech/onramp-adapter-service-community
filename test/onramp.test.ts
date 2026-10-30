@@ -2060,15 +2060,15 @@ describe('a sell request', () => {
     expect(asBuy(meld.calls[0])).toBeUndefined();
   });
 
-  it('refuses an Asset Hub sell with no seller address, before any rail call', async () => {
-    // Banxa refuses a sell without one, and it is where a refund goes.
+  it('opens an Asset Hub sell with no seller address, sending none', async () => {
+    // A client that does not send one still gets the sells whose provider does not ask for it.
     const meld = new FakeMeld();
     const { service } = build(meld);
 
-    const refusal = await failureOf(() => service.createSession(SUBJECT, sell({ walletAddress: undefined }), REQUEST_ID));
+    await service.createSession(SUBJECT, sell({ walletAddress: undefined }), REQUEST_ID);
 
-    expect(refusal).toMatchObject({ tag: 'Other', value: { code: 'INVALID_ADDRESS' } });
-    expect(meld.calls).toHaveLength(0);
+    expect(meld.calls).toHaveLength(1);
+    expect(meld.calls[0]?.walletAddress).toBeUndefined();
   });
 
   it('pins the seller address in its canonical Asset Hub form', async () => {

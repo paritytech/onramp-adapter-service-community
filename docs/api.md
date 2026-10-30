@@ -82,7 +82,7 @@ reinterpreted:
 | --- | --- | --- |
 | amount field | `sourceAmount`, the fiat charged | `cryptoAmount`, the crypto sold |
 | format | decimal, at most **2** fraction digits | exact decimal, kept as a string end to end and never rounded or parsed; **this service accepts** up to 30 fraction digits (see the note below on what the provider has been observed to accept) |
-| `walletAddress` | **required** on `/session`: where the crypto is delivered | the seller's **own** address, the one the crypto is sent from and the provider refunds to, never a destination (the provider issues the deposit address after the session exists). **Required** on an Asset Hub lane (`DOT`, `USDT_DOT`, `USDC_DOT`); optional on another chain, and checked in that chain's form. A missing or malformed one is `400 INVALID_ADDRESS` |
+| `walletAddress` | **required** on `/session`: where the crypto is delivered | the seller's **own** address, the one the crypto is sent from and the provider refunds to, never a destination (the provider issues the deposit address after the session exists). Optional, but Banxa refuses a sell without it; normalised on an Asset Hub lane (`DOT`, `USDT_DOT`, `USDC_DOT`) and checked in that chain's form elsewhere. A malformed one is `400 INVALID_ADDRESS` |
 
 **What "30 fraction digits" is and is not a promise about.** 30 is this service's own accepted
 bound, chosen to be wider than any asset's precision so that nothing is ever silently truncated on

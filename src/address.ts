@@ -63,22 +63,13 @@ export function normalizeAddress(input: string): string {
  * refunds it. Meld files it as `sessionData.walletAddress` ("not a deposit address"), and Banxa
  * refuses a sell without one (`CRYPTO_INVALID_DESTINATION_WALLET`).
  *
- * Required on an Asset Hub lane, where this service's client always knows the account it sends
- * from, and normalised as a buy's address is. On another chain it is optional and checked in that
- * chain's own form. A malformed one is refused, never sent: the provider would refund to it.
+ * Optional: a client that sends none still opens the sells whose provider does not ask for it.
+ * On an Asset Hub lane it is normalised as a buy's address is; on another chain it is checked in
+ * that chain's own form. A malformed one is refused, never sent: the provider would refund to it.
  */
 export function normalizeSellerAddress(input: string | undefined, code: string): string | undefined {
+  if (input === undefined) return undefined;
   const chain = chainOf(code);
-  if (input === undefined) {
-    if (chain !== 'assethub') return undefined;
-    throw reject(
-      {
-        tag: 'Other',
-        value: { code: 'INVALID_ADDRESS', message: 'A sell needs the address the crypto is sent from.' },
-      },
-      `A sell of ${code} carried no walletAddress; an Asset Hub lane requires the seller's own.`,
-    );
-  }
   if (chain === 'arbitrum' || chain === 'solana') {
     const canonical = chain === 'arbitrum' ? evmAddress(input) : solanaAddress(input);
     if (canonical === undefined) throw invalidAddress(`Not a ${chain} address.`);
