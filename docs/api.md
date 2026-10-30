@@ -535,6 +535,9 @@ so a proof recorded against an earlier challenge cannot be replayed.
 }
 ```
 
+The proof is the one `host_account_create_proof` returns for the product context
+`[productId, 0]` with the 56 raw challenge bytes as the message, not their base64url text.
+
 A stale or inauthentic challenge is rejected first. Then the ring's current `Root` commitment is
 read off the People chain (`people_rpc_url`) and the proof verified against it here, never on a
 client's word. A valid proof recovers the caller's contextual **alias**, which the JWT binds as

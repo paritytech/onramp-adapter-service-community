@@ -6,6 +6,7 @@ import { hexToU8a, u8aToHex } from '@polkadot/util';
 import { Refusal } from '../../src/contract.js';
 import { PersonhoodService, type PersonhoodDeps } from '../../src/personhood.js';
 import { mintChallenge } from '../../src/personhood/challenge.js';
+import { productProofContext } from '../../src/personhood/context.js';
 import { mintToken, verifyToken } from '../../src/personhood/token.js';
 
 const ALIAS = '0x' + 'ab'.repeat(32);
@@ -273,7 +274,7 @@ describe('redeem()', () => {
 
     await service.redeem({ ...validRedeem(deps), challenge: wire(token), productId: OTHER });
 
-    expect(new TextDecoder().decode(seen.context)).toBe(OTHER);
+    expect(u8aToHex(seen.context ?? new Uint8Array())).toBe(u8aToHex(productProofContext(OTHER, 0)));
     expect(u8aToHex(seen.message ?? new Uint8Array())).toBe(u8aToHex(token));
   });
 

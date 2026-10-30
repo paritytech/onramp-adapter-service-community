@@ -16,6 +16,7 @@
 
 import { unauthorized, upstreamUnavailable } from './contract.js';
 import { mintChallenge, verifyChallenge } from './personhood/challenge.js';
+import { productProofContext } from './personhood/context.js';
 import {
   ProofRefusal,
   ProofRejected,
@@ -64,7 +65,12 @@ interface Redeemed {
 
 const toWire = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64url');
 const fromWire = (s: string) => new Uint8Array(Buffer.from(s, 'base64url'));
-const utf8 = (s: string) => new TextEncoder().encode(s);
+
+/**
+ * Fixed rather than caller-chosen: each index yields a distinct alias, so a free index would let one
+ * person hold any number of identities per product.
+ */
+const PROOF_CONTEXT_INDEX = 0;
 
 export class PersonhoodService {
   constructor(private readonly deps: PersonhoodDeps) {}
@@ -96,7 +102,7 @@ export class PersonhoodService {
 
     // The proof was minted over `context` = the product, `message` = the challenge bytes. Binding
     // both makes the proof coherent with this handshake and this deployment.
-    const context = utf8(input.productId);
+    const context = productProofContext(input.productId, PROOF_CONTEXT_INDEX);
     const message = challenge;
 
     // Each collection until one opens the proof. Order costs work, not outcome: a proof opens

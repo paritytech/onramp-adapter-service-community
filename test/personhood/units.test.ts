@@ -14,6 +14,7 @@ import {
   CHALLENGE_BYTES,
   NONCE_BYTES,
 } from '../../src/personhood/challenge.js';
+import { productProofContext } from '../../src/personhood/context.js';
 import { membersRootKey } from '../../src/personhood/key.js';
 import { ProofRejected, ProofRefusal, verifyRingMembership } from '../../src/personhood/register.js';
 import { commitmentsFrom } from '../../src/personhood/source.js';
@@ -124,6 +125,17 @@ describe('challenge', () => {
     expect(() => {
       mintChallenge(KEY, { nonce: new Uint8Array(15) });
     }).toThrow(/nonce must be/);
+  });
+});
+
+describe('productProofContext', () => {
+  it('matches the vectors the native Hosts pin', () => {
+    expect(u8aToHex(productProofContext('voting.dot', 0))).toBe(
+      '0xfc8e5a62a2abf020f4f5bc5d00c06c18404674804c8dacd5198357c5c761440d',
+    );
+    expect(u8aToHex(productProofContext('voting.dot', 5))).toBe(
+      '0x28fbecf75aae5c703268e5d6de12a6df21f42e3ca29467c7c68d8e67e2657baa',
+    );
   });
 });
 
