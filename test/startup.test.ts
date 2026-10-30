@@ -1027,10 +1027,10 @@ describe('buildPersonhood key derivation', () => {
       expect(socket.sent.length).toBe(1);
     });
     const request = JSON.parse(socket.sent[0] as string) as { id: number; params: string[] };
-    // A `Root` long enough to clear the 768-byte commitment floor, so the refusal below comes from
-    // the proof check and not from the shape guard in `source.ts`.
+    // A `Root` of exactly the `RingRoot` length, so the refusal below comes from the proof check and
+    // not from the layout guard in `source.ts`.
     socket.emit('message', {
-      data: JSON.stringify({ jsonrpc: '2.0', id: request.id, result: `0x${'00'.repeat(1024)}` }),
+      data: JSON.stringify({ jsonrpc: '2.0', id: request.id, result: `0x${'00'.repeat(1140)}` }),
     });
 
     // Rejected, and specifically as a membership failure rather than a chain error, which is what a

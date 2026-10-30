@@ -135,4 +135,4 @@ which ships as a container image.
 
 1 package.
 
-- `verifiablejs` (1.3.0-beta.0)
+- `verifiablejs` (1.6.0)

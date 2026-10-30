@@ -7,7 +7,7 @@ import { buildServer } from '../src/server.js';
 import { config, createRequest, personhoodConfig, quoteRequestBody } from './fixtures.js';
 
 const IDENTIFIER = '0x' + '22'.repeat(32);
-const COMMITMENT = '0x' + '11'.repeat(768);
+const COMMITMENT = '0x' + '11'.repeat(288);
 const PRODUCT = 'app.dot';
 
 /** A fully-functional PersonhoodService with stub chain reads. */

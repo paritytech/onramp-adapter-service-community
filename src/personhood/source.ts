@@ -7,10 +7,10 @@
  * `verifiablejs` validates a proof against directly; reading it is the whole chain cost, and it
  * is why this is cheap compared to reconstructing the member set from the paged `RingKeys`.
  *
- * The `Root` value is `RingRoot { root: Members, revision: u64 }`, where `Members` is the
- * 768-byte commitment `validate_with_commitment` consumes. The commitment is the first 768 bytes. That
- * fixed-layout dependency is documented here, in the module that reads it, rather than pointing
- * at `register.ts`, which does not mention the 768-byte prefix.
+ * The `Root` value is the SCALE `RingRoot { root, revision: u32, intermediate }`: the 288-byte
+ * commitment `validate_with_commitment` consumes, the ring's rebuild counter, and the 848-byte
+ * member set the chain extends the ring from. Every field is fixed-width, so the commitment is the
+ * first 288 bytes of a value whose length is exact.
  *
  * The ring exponent (which `validate_with_commitment` also needs, as the proof domain) is not
  * decoded from `Collections`: that SCALE struct has a variable-width `owner` enum, and decoding
@@ -25,8 +25,8 @@ import type { ChainReader } from './chain.js';
 import { membersRootKey } from './key.js';
 import type { ChainCommitments } from './register.js';
 
-/** The 768-byte commitment occupies this fixed prefix of the `Root` value. */
-const COMMITMENT_BYTES = 768;
+const COMMITMENT_BYTES = 288;
+const RING_ROOT_BYTES = COMMITMENT_BYTES + 4 + 848;
 
 /**
  * How many redeems may have reads in flight at once, across all callers.
@@ -102,17 +102,15 @@ export function commitmentsFrom(reader: ChainReader, collectionCount = 1): Chain
       const value = await read(membersRootKey(identifier, ring));
       if (value === undefined) return null;
       const bytes = hexToU8a(value);
-      // Asserted, not assumed. `subarray` shortens without complaining, so a `Root` the chain
-      // returned in some other shape would have handed `validate_with_commitment` a truncated
-      // commitment (the one input that decides who is a person) as though it were whole. This
-      // is a chain or configuration fault rather than a caller mistake, so it surfaces as one.
-      if (bytes.byteLength < COMMITMENT_BYTES) {
+      // Asserted, not assumed: a `Root` in any other layout would hand `validate_with_commitment`
+      // bytes that are not a commitment. That is a chain or `verifiable` version mismatch rather
+      // than a caller mistake, so it surfaces as one.
+      if (bytes.byteLength !== RING_ROOT_BYTES) {
         throw new Error(
           `People-chain Members.Root for ring ${String(ring)} is ${String(bytes.byteLength)} bytes; ` +
-            `the commitment needs ${String(COMMITMENT_BYTES)}.`,
+            `a RingRoot is ${String(RING_ROOT_BYTES)}.`,
         );
       }
-      // The commitment is the first 768 bytes of the `Root` value (the raw `MembersOf` bytes).
       return u8aToHex(bytes.subarray(0, COMMITMENT_BYTES));
     },
   };

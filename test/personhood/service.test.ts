@@ -10,7 +10,7 @@ import { productProofContext } from '../../src/personhood/context.js';
 import { mintToken, verifyToken } from '../../src/personhood/token.js';
 
 const ALIAS = '0x' + 'ab'.repeat(32);
-const COMMITMENT = '0x' + '11'.repeat(768);
+const COMMITMENT = '0x' + '11'.repeat(288);
 const IDENTIFIER = '0x' + '22'.repeat(32);
 const PRODUCT = 'app.dot';
 const OTHER = 'other.dot';
