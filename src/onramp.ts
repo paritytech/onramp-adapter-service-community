@@ -11,7 +11,7 @@
  * neutral rail input, calls through the seam, and persists the neutral result.
  */
 
-import { normalizeAddress } from './address.js';
+import { normalizeAddress, normalizeSellerAddress } from './address.js';
 import { railRefusal } from './meld/refusal.js';
 import type { AuditEvent, AuditLog } from './audit.js';
 import type { Subject } from './auth.js';
@@ -420,6 +420,8 @@ export class Onramp {
     subject: Subject,
     request: CreateSessionRequest,
     requestId: string,
+    /** The end user's public address, for the provider; see `publicClientIp`. */
+    clientIpAddress?: string,
   ): Promise<CreateSessionResponse> {
     const rail = this.rail(request.rail);
     const name = rail.provider;
@@ -567,12 +569,18 @@ export class Onramp {
         paymentMethodType: request.paymentMethodType,
         serviceProvider: request.serviceProvider,
         redirectUrl,
+        clientIpAddress,
         // This record's id, not the caller's key (see `RailSessionInput.clientReference`).
         clientReference: fundingId,
       };
       session = await rail.createSession(
         direction === 'sell'
-          ? { ...opening, direction, cryptoAmount: committedTerm(pinned.cryptoAmount, 'cryptoAmount', direction) }
+          ? {
+              ...opening,
+              direction,
+              cryptoAmount: committedTerm(pinned.cryptoAmount, 'cryptoAmount', direction),
+              walletAddress: pinned.walletAddress,
+            }
           : {
               ...opening,
               direction,
@@ -1224,11 +1232,11 @@ export class Onramp {
   ): Promise<Committed> {
     const destination = resolveForDirection(request.destinationCurrencyCode, direction);
     const currency = request.fiat.toUpperCase();
-    // Only a buy has an address to pin. On a sell the schema has already refused one, and the
-    // deposit address the seller will use is the provider's, issued after the session exists.
+    // A buy's address is where the crypto is delivered. A sell's is the seller's own, where it is
+    // sent from and refunded to; the deposit address is the provider's, issued after the session.
     const walletAddress =
       direction === 'sell'
-        ? undefined
+        ? normalizeSellerAddress(request.walletAddress, destination.code)
         : normalizeAddress(committedTerm(request.walletAddress, 'walletAddress', direction));
 
     // The fiat corridor gate is Meld's own question; only the fiat rail has one. A non-fiat rail
