@@ -50,14 +50,33 @@ describe('mergeAdvance: the deposit disclosure', () => {
     expect(next.status_history).toHaveLength(1);
   });
 
-  it('still refuses a self-loop that carries no deposit fact, exactly as before', () => {
-    // The bypass is scoped to "carries a deposit fact", deliberately. Any other attempt at a
+  it('still refuses a self-loop that carries no new fact, exactly as before', () => {
+    // The bypass is scoped to "carries a new fact", deliberately. Any other attempt at a
     // self-loop is a caller mistake, not a fact update, and must still be refused loudly rather
-    // than silently succeeding.
+    // than silently succeeding. A provider status equal to the one on file is no new fact.
+    const pending = { ...inFlight(), provider_status: 'PENDING' };
     expect(() => mergeAdvance(inFlight(), 'transaction_seen', NOW)).toThrow(IllegalTransition);
-    expect(() => mergeAdvance(inFlight(), 'transaction_seen', NOW, { providerStatus: 'PENDING' })).toThrow(
+    expect(() => mergeAdvance(pending, 'transaction_seen', NOW, { providerStatus: 'PENDING' })).toThrow(
       IllegalTransition,
     );
+  });
+
+  it("writes the provider's newer status onto a row that does not move", () => {
+    // PENDING -> SETTLING: the provider approved the payment and the row stays in
+    // `transaction_seen`. The app hands the buyer off the widget on SETTLING, so it has to land.
+    const previous = { ...inFlight(), provider_status: 'PENDING' };
+    const next = mergeAdvance(previous, 'transaction_seen', NOW, { providerStatus: 'SETTLING' });
+
+    expect(next.provider_status).toBe('SETTLING');
+    expect(next.status).toBe('transaction_seen');
+    expect(next.status_history).toEqual(previous.status_history);
+    expect(next.updated_at).toBe(NOW);
+  });
+
+  it.each(TERMINAL_STATES)("still refuses a provider status self-loop on an already-%s row", (status) => {
+    const terminal = sellRecord({ status, status_history: [{ status, at: 1_700_000_000_000 }], provider_status: 'X' });
+
+    expect(() => mergeAdvance(terminal, status, NOW, { providerStatus: 'Y' })).toThrow(IllegalTransition);
   });
 
   it.each(TERMINAL_STATES)('still refuses a self-loop on an already-%s row, even carrying a deposit fact', (status) => {

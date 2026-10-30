@@ -927,7 +927,10 @@ describe('rate limiting', () => {
     // limiter, both happened before any ceiling existed, so preflights were unlimited from any
     // origin on any path, each costing a request id and a log pair. The allowlist does not help:
     // it decides whether the `Allow-Origin` header is written, not whether the 204 is sent.
-    const app = await serve(undefined, config({ rate_limit: { per_address_max: 2, window_seconds: 60 } }));
+    const app = await serve(
+      undefined,
+      config({ rate_limit: { per_address_max: 2, per_person_max: 2, window_seconds: 60 } }),
+    );
     const preflight = (origin: string) =>
       app.inject({
         method: 'OPTIONS',
@@ -940,6 +943,56 @@ describe('rate limiting', () => {
 
     // And a disallowed origin draws on the same bucket rather than an unlimited one.
     expect((await preflight('https://evil.example')).statusCode).toBe(429);
+  });
+
+  it('holds preflights to the larger allowance, never below a proven caller\'s', async () => {
+    // A preflight is never proven, so it is keyed on the address; a proven caller's requests count
+    // against `per_person_max`. At `per_address_max` the preflight would be refused first in
+    // personhood mode, and shared by everyone behind one NAT.
+    const app = await serve(
+      undefined,
+      config({ rate_limit: { per_address_max: 2, per_person_max: 4, window_seconds: 60 } }),
+    );
+    const preflight = () =>
+      app.inject({
+        method: 'OPTIONS',
+        url: '/session',
+        headers: { origin: 'https://app.example', 'access-control-request-method': 'POST' },
+      });
+
+    const codes: number[] = [];
+    for (let i = 0; i < 5; i += 1) codes.push((await preflight()).statusCode);
+    expect(codes).toEqual([204, 204, 204, 204, 429]);
+  });
+
+  it('counts preflights apart from the requests they precede', async () => {
+    // A refused preflight has no `access-control-allow-origin`, so the browser shows a CORS error
+    // and the app never reads the 429. With one shared bucket, preflights spent the allowance and
+    // that unreadable refusal was the one a caller met. Apart, the real request runs out first and
+    // its 429 carries the CORS headers and `retry-after` the app backs off from.
+    const app = await serve(
+      undefined,
+      config({ rate_limit: { per_address_max: 2, per_person_max: 2, window_seconds: 60 } }),
+    );
+    const origin = { origin: 'https://app.example' };
+    const preflight = () =>
+      app.inject({
+        method: 'OPTIONS',
+        url: '/quote',
+        headers: { ...origin, 'access-control-request-method': 'POST' },
+      });
+    const quote = () =>
+      app.inject({ method: 'POST', url: '/quote', headers: { ...DEV_HEADERS, ...origin }, payload: quoteRequestBody() });
+
+    expect((await preflight()).statusCode).toBe(204);
+    expect((await quote()).statusCode).toBe(200);
+    expect((await preflight()).statusCode).toBe(204);
+    expect((await quote()).statusCode).toBe(200);
+
+    const limited = await quote();
+    expect(limited.statusCode).toBe(429);
+    expect(limited.headers['access-control-allow-origin']).toBe('https://app.example');
+    expect(limited.headers['retry-after']).toBeDefined();
   });
 
   it('throttles unmatched routes, which had no ceiling at all', async () => {

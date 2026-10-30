@@ -241,6 +241,29 @@ describe('the worker tick', () => {
     await store.close();
   });
 
+  it("records the provider's newer status while the row stays in transaction_seen", async () => {
+    // Meld's PENDING -> SETTLING: the provider approved the payment and is sending the crypto. The
+    // row does not move, but the app hands the buyer off the widget on SETTLING, so it is written.
+    const { store, updated } = tracking();
+    await store.create(record({ status: 'transaction_seen', provider_transaction_id: 'tx-1', provider_status: 'PENDING' }));
+    const { lines, log } = notes();
+
+    const advanced = await tick(store, NOW, observations(async () => txn('tx-1', 'SETTLING')), MAX_AGE, log, lease());
+
+    expect(advanced).toBe(1);
+    expect(updated).toHaveBeenCalledTimes(1);
+    const row = await store.byId('funding-1');
+    expect(row?.status).toBe('transaction_seen');
+    expect(row?.provider_status).toBe('SETTLING');
+    expect(lines).toEqual([]);
+
+    // The same status read again is no new fact: nothing is written.
+    const again = await tick(store, NOW + 1, observations(async () => txn('tx-1', 'SETTLING')), MAX_AGE, log, lease());
+    expect(again).toBe(0);
+    expect(updated).toHaveBeenCalledTimes(1);
+    await store.close();
+  });
+
   it('concludes a transaction_seen request when the mapper names a terminal state', async () => {
     const { store } = tracking();
     await store.create(record({ status: 'transaction_seen', provider_transaction_id: 'tx-1', provider_status: 'SUCCEEDED' }));
