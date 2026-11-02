@@ -5,7 +5,7 @@ first, because it lists what an attacker can still do.
 
 **Status.** Prototype, not externally audited. Caller authentication is the shipped personhood
 gate: a caller proves current membership of the People ring against the chain's commitment and
-receives a short-lived JWT that authenticates the protected routes. `insecure_dev` authenticates
+receives a JWT that authenticates the protected routes until it expires. `insecure_dev` authenticates
 nothing and is refused outside `development`. See R1 and R3 for what that does not cover.
 
 ## 1. What is being protected
@@ -183,6 +183,12 @@ person, never the application.**
 SQL Auth Proxy as its own Deployment rather than as a sidecar. If yours is one of them, the hop
 from this pod to the proxy is pod-to-pod over the cluster network rather than loopback, and
 `store.plaintext_link: "in-cluster-proxy"` is the operator asserting that hop is acceptable.
+
+**R21: a session token is a bearer credential for its alias until it expires.** `token_ttl_s`
+defaults to 24 hours so one handshake covers a purchase or a sale, including a client's background
+follow-up after the page closes. Whoever copies a token reads that person's funding rows and spends
+from their rate-limit bucket for the rest of its life, and a person dropped from the ring keeps
+access for as long. A shorter TTL narrows both at the cost of more proofs.
 
 ## 6. Out of scope
 

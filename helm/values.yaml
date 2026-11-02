@@ -92,7 +92,7 @@ auth:
     #   pop:polkadot.network/people      -> 0x706f703a706f6c6b61646f742e6e6574776f726b2f70656f706c652020202020
     collections: []
     challenge_ttl_ms: 60000
-    token_ttl_s: 300
+    token_ttl_s: 86400
 
 # What Meld calls each asset, by this service's own name for it. The only place a Meld code is
 # written: `limits`, `meld.boot_probe` and `supported.offramp_lanes` name assets, so when Meld

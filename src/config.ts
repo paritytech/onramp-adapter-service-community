@@ -339,8 +339,8 @@ const configSchema = z
               .min(1),
             /** How long a challenge stays acceptable; the freshness that stops replay. */
             challenge_ttl_ms: z.number().int().min(1_000).max(300_000),
-            /** How long a redeemed session JWT is valid; the browser keeps it this long. */
-            token_ttl_s: z.number().int().min(30).max(3_600),
+            /** How long a redeemed session JWT is valid; the client keeps it this long. */
+            token_ttl_s: z.number().int().min(30).max(86_400),
           })
           .strict()
           .optional(),

@@ -184,7 +184,7 @@ under their own Meld commercial agreement, and at their own discretion.
 Two properties of the current state are worth knowing before any deployment.
 
 `auth.mode: "personhood"` is the production gate. A caller proves ring-VRF membership of the People
-chain and receives a short-lived JWT before any spend. The proof is bound to the product context
+chain and receives a JWT, valid for `token_ttl_s`, before any spend. The proof is bound to the product context
 `[productId, 0]` exactly as a native Host derives it for `host_account_create_proof`
 (`src/personhood/context.ts`).
 
