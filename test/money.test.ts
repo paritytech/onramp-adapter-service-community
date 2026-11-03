@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { compareDecimal, toMinorUnits, widestBound } from '../src/money.js';
+import { compareDecimal, doubleDecimal, isDecimal, toMinorUnits, widestBound } from '../src/money.js';
 
 describe('toMinorUnits', () => {
   it.each([
@@ -49,5 +49,29 @@ describe('widestBound', () => {
 
   it('keeps the first text on a tie', () => {
     expect(widestBound([{ min: '1.0', max: '9.0' }, { min: '1.00', max: '9' }])).toEqual({ min: '1.0', max: '9.0' });
+  });
+});
+
+describe('isDecimal', () => {
+  it.each([
+    ['5', true],
+    ['20.50', true],
+    ['1e3', false],
+    ['-1', false],
+    ['', false],
+  ])('%s -> %s', (text, expected) => {
+    expect(isDecimal(text)).toBe(expected);
+  });
+});
+
+describe('doubleDecimal', () => {
+  it.each([
+    ['5', '10'],
+    ['20.50', '41.00'],
+    ['0.05', '0.10'],
+    ['0.5', '1.0'],
+    ['9007199254740993', '18014398509481986'],
+  ])('%s -> %s', (decimal, expected) => {
+    expect(doubleDecimal(decimal)).toBe(expected);
   });
 });

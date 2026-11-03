@@ -53,3 +53,13 @@ export function widestBound(bounds: readonly [Bound, ...Bound[]]): Bound {
   }
   return { min, max };
 }
+
+/** Whether `text` is a non-negative plain decimal. */
+export const isDecimal = (text: string): boolean => DECIMAL.test(text);
+
+/** Twice `decimal`, exactly and at its own scale. `decimal` must satisfy `isDecimal`. */
+export function doubleDecimal(decimal: string): string {
+  const [whole = '0', fraction = ''] = decimal.split('.');
+  const digits = (BigInt(whole + fraction) * 2n).toString().padStart(fraction.length + 1, '0');
+  return fraction === '' ? digits : `${digits.slice(0, -fraction.length)}.${digits.slice(-fraction.length)}`;
+}
