@@ -228,9 +228,11 @@ health:
   interval_ms: 600000
   # Countries probed first, in this order.
   preferred_countries: [US, GB]
-  # The crypto a sell probe commits, per asset, e.g. `- { asset: dot@assethub, amount: "15" }`.
-  # A sell asset without an amount is not probed.
-  sell_amounts: []
+  # The crypto a sell probe prices, per asset. A sell asset without an amount is not probed. An
+  # amount outside a provider's limits is inconclusive, never a failure.
+  sell_amounts:
+    - { asset: dot@assethub, amount: "100" }
+    - { asset: usdt@assethub, amount: "100" }
 
 # The background worker that advances in-flight funding requests.
 worker:
