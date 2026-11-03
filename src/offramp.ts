@@ -7,6 +7,7 @@
  */
 
 import type { MethodLimit } from './meld/discovery.js';
+import { widestBound } from './money.js';
 
 export interface OfframpLane {
   /** This service's own name for the asset, which a Meld rename does not change. */
@@ -52,23 +53,12 @@ export interface OfframpCorridor {
   methods: OfframpMethod[];
 }
 
-const DECIMAL = /^(\d+)(?:\.(\d+))?$/;
-
-/** Exact comparison of two non-negative decimal strings, -1 | 0 | 1. Unparseable text sorts as 0. */
-function compareDecimal(a: string, b: string): number {
-  const [pa, pb] = [DECIMAL.exec(a), DECIMAL.exec(b)];
-  const scale = Math.max(pa?.[2]?.length ?? 0, pb?.[2]?.length ?? 0);
-  const big = (m: RegExpExecArray | null): bigint => BigInt((m?.[1] ?? '0') + (m?.[2] ?? '').padEnd(scale, '0'));
-  const [x, y] = [big(pa), big(pb)];
-  return x < y ? -1 : x > y ? 1 : 0;
-}
-
 /**
  * Merge one country's per-lane views (in lane order). Every lane offering a method is kept; method
  * order is first-seen; `currency` is the country fiat when given.
  */
 export function mergeMethods(views: readonly LaneCorridor[], fiat?: string): OfframpMethod[] {
-  const merged = new Map<string, OfframpMethod>();
+  const merged = new Map<string, Omit<OfframpMethod, 'min' | 'max' | 'lanes'> & { lanes: [OfframpLaneOffer, ...OfframpLaneOffer[]] }>();
   for (const view of views) {
     for (const method of view.methods) {
       const offer: OfframpLaneOffer = {
@@ -84,19 +74,15 @@ export function mergeMethods(views: readonly LaneCorridor[], fiat?: string): Off
         merged.set(method.paymentMethodType, {
           paymentMethodType: method.paymentMethodType,
           category: method.category,
-          min: method.min,
-          max: method.max,
           currency: fiat ?? method.currency,
           lanes: [offer],
         });
-        continue;
+      } else {
+        existing.lanes.push(offer);
       }
-      existing.lanes.push(offer);
-      if (compareDecimal(method.min, existing.min) < 0) existing.min = method.min;
-      if (compareDecimal(method.max, existing.max) > 0) existing.max = method.max;
     }
   }
-  return [...merged.values()];
+  return [...merged.values()].map((method) => ({ ...method, ...widestBound(method.lanes) }));
 }
 
 /**

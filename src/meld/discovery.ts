@@ -42,6 +42,7 @@
 
 import { z } from 'zod';
 
+import { widestBound, type Bound } from '../money.js';
 import type { Direction } from '../rail.js';
 import { MeldHttpError } from './client.js';
 
@@ -113,17 +114,19 @@ const fiatLimitsEnvelope = z.object({ fiatLimits: z.array(fiatLimitRow).nullish(
 /** The category a UI groups a method under: `card` or `bank`. */
 export type MethodCategory = 'card' | 'bank' | 'wallet' | 'other';
 
+/** One provider's bound for a method, in the method's `currency`. */
+export interface ProviderLimit extends Bound {
+  provider: string;
+}
+
 /** One payment method available for a corridor, with the bound a buyer must satisfy. */
-export interface MethodLimit {
+export interface MethodLimit extends Bound {
   /** Canonical Meld method id sent back on `POST /session` as `paymentMethodType`. */
   paymentMethodType: string;
   category: MethodCategory;
-  /** Exact decimal text, in `currency` units. */
-  min: string;
-  max: string;
   currency: string;
-  /** The account's providers that offer this method for the corridor (union across providers). */
-  providers: string[];
+  /** Every provider offering this method for the corridor, in route order. `min`/`max` span them. */
+  providers: ProviderLimit[];
 }
 
 /** A (country, fiat) corridor for one crypto. `methods` empty means the corridor is not served. */
@@ -181,12 +184,6 @@ function categoryOf(paymentType: string | null | undefined): MethodCategory {
     default:
       return 'other';
   }
-}
-
-/** Numeric view of an exact-decimal string, for choosing the widest bound only. */
-function num(s: string | null | undefined): number {
-  const n = Number(s);
-  return Number.isFinite(n) ? n : NaN;
 }
 
 interface CacheEntry<T> {
@@ -336,8 +333,7 @@ export class MeldDiscovery implements Discovery {
     }
     const trustworthy = rawEntries !== undefined && dropped === 0;
 
-    // method id -> aggregated limit
-    const byMethod = new Map<string, MethodLimit>();
+    const byMethod = new Map<string, Omit<MethodLimit, keyof Bound | 'providers'> & { providers: [ProviderLimit, ...ProviderLimit[]] }>();
     for (const entry of entries) {
       for (const m of entry.paymentMethods ?? []) {
         const min = m.limits?.min ?? undefined;
@@ -357,25 +353,18 @@ export class MeldDiscovery implements Discovery {
         // seller actually commits (that is crypto); see `Onramp.limitFor` for what that means for
         // the gate built on top of this.
         if (currency.toUpperCase() !== fiat.toUpperCase()) continue;
+        const limit: ProviderLimit = { provider: entry.partner, min, max };
         const existing = byMethod.get(m.name);
         if (existing === undefined) {
-          byMethod.set(m.name, {
-            paymentMethodType: m.name,
-            category: categoryOf(m.paymentType),
-            min,
-            max,
-            currency,
-            providers: [entry.partner],
-          });
+          byMethod.set(m.name, { paymentMethodType: m.name, category: categoryOf(m.paymentType), currency, providers: [limit] });
         } else {
-          if (num(min) < num(existing.min)) existing.min = min;
-          if (num(max) > num(existing.max)) existing.max = max;
-          if (!existing.providers.includes(entry.partner)) existing.providers.push(entry.partner);
+          existing.providers.push(limit);
         }
       }
     }
 
-    const corridor: Corridor = { country, fiat, crypto, methods: [...byMethod.values()] };
+    const methods = [...byMethod.values()].map((method) => ({ ...method, ...widestBound(method.providers) }));
+    const corridor: Corridor = { country, fiat, crypto, methods };
     if (trustworthy) {
       this.evictExpired(this.corridorCache, this.ttls.routes);
       this.corridorCache.set(key, { at: this.clock(), value: corridor });

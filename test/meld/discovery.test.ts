@@ -119,7 +119,7 @@ function stubGet() {
 }
 
 describe('MeldDiscovery.corridor', () => {
-  it('aggregates a corridor across providers: min-of-mins, max-of-maxes, provider union', async () => {
+  it('aggregates a corridor across providers: min-of-mins, max-of-maxes, each provider\'s own bound', async () => {
     const d = new MeldDiscovery(stubGet(), ttls(3_600_000));
     const { methods } = await d.corridor('US', 'USD', 'DOT', 'buy');
 
@@ -130,7 +130,11 @@ describe('MeldDiscovery.corridor', () => {
       min: '2', // min(5, 10, 2): the later, lower TOPPER min lowers it
       max: '16000', // max(3000, 16000, 9)
       currency: 'USD',
-      providers: ['TRANSAK', 'GUARDARIAN', 'TOPPER'],
+      providers: [
+        { provider: 'TRANSAK', min: '5', max: '3000' },
+        { provider: 'GUARDARIAN', min: '10', max: '16000' },
+        { provider: 'TOPPER', min: '2', max: '9' },
+      ],
     });
     // BANK_TRANSFER maps to `bank`; the boundless MYSTERY method is dropped.
     expect(methods.find((m) => m.paymentMethodType === 'ACH')?.category).toBe('bank');
@@ -733,7 +737,7 @@ describe('toCorridorDto', () => {
       fiat: 'USD',
       crypto: 'DOT',
       methods: [
-        { paymentMethodType: 'CREDIT_DEBIT_CARD', category: 'card', min: '5', max: '3000', currency: 'USD', providers: ['TRANSAK', 'GUARDARIAN'] },
+        { paymentMethodType: 'CREDIT_DEBIT_CARD', category: 'card', min: '5', max: '3000', currency: 'USD', providers: [{ provider: 'TRANSAK', min: '5', max: '3000' }] },
       ],
     });
 

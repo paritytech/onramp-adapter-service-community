@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { toMinorUnits } from '../src/money.js';
+import { compareDecimal, toMinorUnits, widestBound } from '../src/money.js';
 
 describe('toMinorUnits', () => {
   it.each([
@@ -22,5 +22,32 @@ describe('toMinorUnits', () => {
     expect(toMinorUnits('20.00')).toBe(2000n);
     expect(toMinorUnits('19.99') < toMinorUnits('20.00')).toBe(true);
     expect(toMinorUnits('0.10') + toMinorUnits('0.20')).toBe(30n);
+  });
+});
+
+describe('compareDecimal', () => {
+  it.each([
+    ['1', '2', -1],
+    ['2.50', '2.5', 0],
+    ['9007199254740993', '9007199254740992.5', 1],
+    ['0.30000000000000004', '0.3', 1],
+  ] as const)('%s vs %s -> %s', (a, b, expected) => {
+    expect(compareDecimal(a, b)).toBe(expected);
+  });
+});
+
+describe('widestBound', () => {
+  it('spans the smallest min and the largest max', () => {
+    expect(
+      widestBound([
+        { min: '5', max: '3000' },
+        { min: '10', max: '16000' },
+        { min: '2', max: '9' },
+      ]),
+    ).toEqual({ min: '2', max: '16000' });
+  });
+
+  it('keeps the first text on a tie', () => {
+    expect(widestBound([{ min: '1.0', max: '9.0' }, { min: '1.00', max: '9' }])).toEqual({ min: '1.0', max: '9.0' });
   });
 });

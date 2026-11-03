@@ -55,7 +55,7 @@ function method(over: Partial<MethodLimit> = {}): MethodLimit {
     min: '5',
     max: '3000',
     currency: 'USD',
-    providers: ['TRANSAK'],
+    providers: [{ provider: 'TRANSAK', min: '5', max: '3000' }],
     ...over,
   };
 }
@@ -588,7 +588,7 @@ describe('Onramp offramp discovery', () => {
       corridorForCountry: async (country, code, direction) => {
         directions.push(direction);
         crypto.push(code);
-        return { country, fiat: code === 'USDT_SOLANA' ? 'USD' : '', crypto: code, methods: code === 'USDT_SOLANA' ? [method({ providers: ['X'] })] : [] };
+        return { country, fiat: code === 'USDT_SOLANA' ? 'USD' : '', crypto: code, methods: code === 'USDT_SOLANA' ? [method({ providers: [{ provider: 'X', min: '5', max: '3000' }] })] : [] };
       },
     };
     const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', discovery);
@@ -616,7 +616,7 @@ describe('Onramp offramp discovery', () => {
       ...fakeDiscovery(),
       corridorForCountry: async (country, code) => {
         if (code === 'DOT') throw new Error('meld 429');
-        return { country, fiat: 'USD', crypto: code, methods: [method({ providers: ['X'] })] };
+        return { country, fiat: 'USD', crypto: code, methods: [method({ providers: [{ provider: 'X', min: '5', max: '3000' }] })] };
       },
     };
     const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', discovery);

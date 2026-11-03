@@ -44,7 +44,7 @@ const method = (over: Partial<MethodLimit> = {}): MethodLimit => ({
   min: '10',
   max: '5000',
   currency: 'BRL',
-  providers: ['TRANSAK'],
+  providers: [{ provider: 'TRANSAK', min: '10', max: '5000' }],
   ...over,
 });
 
