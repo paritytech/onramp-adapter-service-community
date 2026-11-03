@@ -6,6 +6,7 @@
  * limits, so the client can pick the lane. The method's own min/max span all of them.
  */
 
+import type { Availability, WithAvailability } from './health/view.js';
 import type { MethodLimit } from './meld/discovery.js';
 import { widestBound } from './money.js';
 
@@ -24,16 +25,19 @@ export interface OfframpLaneOffer extends OfframpLane {
   min: string;
   max: string;
   currency: string;
+  availability: Availability;
 }
 
 export interface OfframpMethod {
   paymentMethodType: string;
   category: Method['category'];
-  /** The smallest lane minimum. Exact decimal text. */
+  /** The smallest minimum of the available lanes, or of every lane when none is. Exact decimal text. */
   min: string;
-  /** The largest lane maximum. Exact decimal text. */
+  /** The largest maximum, chosen like `min`. */
   max: string;
   currency: string;
+  /** Available when one lane is. */
+  availability: Availability;
   lanes: OfframpLaneOffer[];
 }
 
@@ -43,7 +47,7 @@ export interface LaneCorridor {
   country: string;
   name?: string;
   fiat: string;
-  methods: readonly Method[];
+  methods: readonly WithAvailability<Method>[];
 }
 
 export interface OfframpCorridor {
@@ -58,7 +62,10 @@ export interface OfframpCorridor {
  * order is first-seen; `currency` is the country fiat when given.
  */
 export function mergeMethods(views: readonly LaneCorridor[], fiat?: string): OfframpMethod[] {
-  const merged = new Map<string, Omit<OfframpMethod, 'min' | 'max' | 'lanes'> & { lanes: [OfframpLaneOffer, ...OfframpLaneOffer[]] }>();
+  const merged = new Map<
+    string,
+    Omit<OfframpMethod, 'min' | 'max' | 'availability' | 'lanes'> & { lanes: [OfframpLaneOffer, ...OfframpLaneOffer[]] }
+  >();
   for (const view of views) {
     for (const method of view.methods) {
       const offer: OfframpLaneOffer = {
@@ -68,6 +75,7 @@ export function mergeMethods(views: readonly LaneCorridor[], fiat?: string): Off
         min: method.min,
         max: method.max,
         currency: method.currency,
+        availability: method.availability,
       };
       const existing = merged.get(method.paymentMethodType);
       if (existing === undefined) {
@@ -82,7 +90,12 @@ export function mergeMethods(views: readonly LaneCorridor[], fiat?: string): Off
       }
     }
   }
-  return [...merged.values()].map((method) => ({ ...method, ...widestBound(method.lanes) }));
+  return [...merged.values()].map((method) => {
+    const [first, ...rest] = method.lanes.filter((lane) => lane.availability === 'available');
+    return first === undefined
+      ? { ...method, ...widestBound(method.lanes), availability: 'temporarily_unavailable' as const }
+      : { ...method, ...widestBound([first, ...rest]), availability: 'available' as const };
+  });
 }
 
 /**

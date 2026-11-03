@@ -46,20 +46,27 @@ import {
   type OfframpMethod,
 } from './offramp.js';
 import { toMinorUnits } from './money.js';
-import type { Corridor, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
+import type { Corridor, CorridorDto, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
+import { STALE_ROUNDS } from './health/types.js';
+import { healthView, liveMethods, NO_HEALTH, storedMethods, type HealthView, type WithAvailability } from './health/view.js';
 
 /** Just the store surface onramp touches, injectable in a test. */
 export type FundingPort = Pick<
   FundingStore,
-  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel' | 'readCorridors'
+  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel' | 'readCorridors' | 'readProviderHealth'
 >;
+
+/** One corridor as `GET /supported` serves it. */
+export interface SupportedDto extends Omit<CorridorDto, 'methods'> {
+  methods: WithAvailability<CorridorDto['methods'][number]>[];
+}
 
 /** One corridor as the bulk endpoint serves it: the stored row without the internal keys. */
 export interface SupportedCorridorDto {
   country: string;
   name: string;
   fiat: string;
-  methods: StoredMethod[];
+  methods: WithAvailability<StoredMethod>[];
 }
 
 /**
@@ -187,8 +194,9 @@ export class Onramp {
   /** The methods + fiat min/max a corridor offers, for the buyer's (or seller's) amount screen.
    *  Refuses an unknown crypto as `WrongAssetOrChain` before any probe. `direction` is absent
    *  means `buy`, exactly as `/quote` and `/session`; see `this.direction`. */
-  async supported(country: string, code: string, direction?: Direction): Promise<Corridor> {
-    resolveForDirection(code, this.direction(direction));
+  async supported(country: string, code: string, direction?: Direction): Promise<SupportedDto> {
+    const dir = this.direction(direction);
+    resolveForDirection(code, dir);
     if (this.discovery === undefined) {
       throw reject(
         { tag: 'Other', value: { code: 'DISCOVERY_UNAVAILABLE', message: 'Capability discovery is not configured.' } },
@@ -197,7 +205,8 @@ export class Onramp {
       );
     }
     // Fiat is resolved from the country's default corridor, so the caller picks only a country.
-    return this.discovery.corridorForCountry(country, code, this.direction(direction));
+    const corridor = await this.discovery.corridorForCountry(country, code, dir);
+    return { country: corridor.country, fiat: corridor.fiat, crypto: corridor.crypto, methods: liveMethods(await this.health(), corridor, dir) };
   }
 
   // Cached supported corridors for a (crypto, direction), read from the DB off Meld; only rows
@@ -219,7 +228,8 @@ export class Onramp {
       const newest = Math.max(...all.map((r) => r.updated_at));
       rows = all.filter((r) => r.updated_at >= newest - window);
     }
-    return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: r.methods }));
+    const view = await this.health();
+    return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: storedMethods(view, r) }));
   }
 
   /** The countries this deployment can deliver a crypto to (or take it from, on a sell), for the
@@ -242,10 +252,11 @@ export class Onramp {
    */
   async offrampCorridors(): Promise<OfframpCorridor[]> {
     const freshAfter = this.clock() - this.cfg.supported.sell_routes_interval_ms * STALE_PASSES;
+    const view = await this.health();
     const rows: LaneCorridor[] = [];
     for (const lane of this.cfg.supported.offramp_lanes) {
       for (const r of await this.funding.readCorridors(lane.code, 'sell', freshAfter)) {
-        rows.push({ lane, country: r.country, name: r.name, fiat: r.fiat, methods: r.methods });
+        rows.push({ lane, country: r.country, name: r.name, fiat: r.fiat, methods: storedMethods(view, r) });
       }
     }
     return mergeOfframpCorridors(rows);
@@ -261,6 +272,7 @@ export class Onramp {
       );
     }
     const discovery = this.discovery;
+    const view = await this.health();
     // Each lane reads its own route, so one lane's failure (a 429 or a 5xx from Meld) counts as that
     // lane having no methods rather than failing the whole answer while the others replied. When
     // every lane fails there is no answer to give, and an empty-but-OK reply would read as "this
@@ -270,7 +282,7 @@ export class Onramp {
       this.cfg.supported.offramp_lanes.map(async (lane): Promise<LaneCorridor> => {
         try {
           const c = await discovery.corridorForCountry(country, lane.code, 'sell');
-          return { lane, country: c.country, fiat: c.fiat, methods: c.methods };
+          return { lane, country: c.country, fiat: c.fiat, methods: liveMethods(view, c, 'sell') };
         } catch (error) {
           failures.push(error);
           return { lane, country, fiat: '', methods: [] };
@@ -281,6 +293,16 @@ export class Onramp {
     const fiat = views.find((v) => v.methods.length > 0)?.fiat ?? views.find((v) => v.fiat !== '')?.fiat ?? '';
     const methods = mergeMethods(views, fiat);
     return { country, fiat, methods };
+  }
+
+  /** Provider health for one request. A failed read serves every provider, as if no probe had run. */
+  private async health(): Promise<HealthView> {
+    if (!this.cfg.health.enabled) return NO_HEALTH;
+    try {
+      return healthView(await this.funding.readProviderHealth(), this.clock(), this.cfg.health.interval_ms * STALE_ROUNDS);
+    } catch {
+      return NO_HEALTH;
+    }
   }
 
   /**
@@ -1105,8 +1127,11 @@ export class Onramp {
     // discovery outage fails closed (every code -> RegionUnavailable), the safe direction for a
     // charge gate.
     if (this.discovery !== undefined) {
-      const offered = await this.corridorMethod(this.discovery, code, currency, country, method, 'buy');
-      if (offered !== undefined) {
+      const corridorMethod = await this.corridorMethod(this.discovery, code, currency, country, method, 'buy');
+      if (corridorMethod !== undefined) {
+        // Bounded by the providers that answer. With none answering, the full bound stays: health
+        // narrows what a session may charge, it never refuses one on its own.
+        const offered = (await this.health()).apply(corridorMethod, corridorMethod.providers, 'buy', country);
         // A configured (code, currency) row is a business floor that tightens the live bound.
         const floor = this.cfg.limits.find((l) => l.code === code && l.currency === currency);
         if (floor === undefined) return { min: offered.min, max: offered.max };

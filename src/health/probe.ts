@@ -6,8 +6,8 @@ import type { MeldClient } from '../meld/client.js';
 import type { RefreshJob } from '../supported/refresh.js';
 import { classifyError, classifyQuotes, type ProbeResult } from './classify.js';
 import { probeGroups, type ProbeGroup, type ProbeTarget, type TargetOptions } from './targets.js';
-import { nextHealth, type HealthKey } from './transition.js';
-import { GLOBAL_SCOPE } from './types.js';
+import { keyOf, nextHealth, type HealthKey } from './transition.js';
+import { GLOBAL_SCOPE, STALE_ROUNDS } from './types.js';
 
 export interface ProbeOptions extends TargetOptions {
   intervalMs: number;
@@ -36,9 +36,6 @@ export interface ProbeDeps {
   clock?: () => number;
 }
 
-/** Intervals without a conclusive round after which stored health counts as stale. */
-export const STALE_ROUNDS = 3;
-
 const HOUR_MS = 3_600_000;
 
 /** The share of the interval added at random, so replicas and restarts do not probe in step. */
@@ -52,8 +49,6 @@ export function pinnedQuote(meld: Pick<MeldClient, 'quote' | 'quoteSell'>): Pinn
       : meld.quote({ ...common, sourceCurrencyCode: target.fiat, destinationCurrencyCode: target.crypto, sourceAmount: target.amount });
   };
 }
-
-const keyOf = ({ provider, direction, scope }: HealthKey): string => `${provider}|${direction}|${scope}`;
 
 const requestRef = (row: ProviderHealthRow): string =>
   row.last_request_id === null ? '' : ` (Meld request ${row.last_request_id})`;

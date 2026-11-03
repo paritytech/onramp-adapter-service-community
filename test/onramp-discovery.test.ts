@@ -278,6 +278,7 @@ describe('Onramp.supported / supportedCountries', () => {
 describe('Onramp.supportedCorridors', () => {
   const pix = { paymentMethodType: 'PIX', category: 'bank' as const, min: '10', max: '5000', currency: 'BRL' };
   const payout = { paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' as const, min: '5', max: '1000', currency: 'BRL' };
+  const available = { availability: 'available' };
 
   it('reads cached corridors from the store, off Meld, without needing discovery', async () => {
     const store = fakeStore();
@@ -286,7 +287,7 @@ describe('Onramp.supportedCorridors', () => {
     const svc = new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'funding-1', undefined);
 
     expect(await svc.supportedCorridors('DOT')).toEqual([
-      { country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] },
+      { country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [{ ...pix, ...available }] },
     ]);
   });
 
@@ -296,8 +297,10 @@ describe('Onramp.supportedCorridors', () => {
     await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'sell', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [payout] });
     const svc = new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'funding-1', undefined);
 
-    expect(await svc.supportedCorridors('DOT')).toEqual([{ country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] }]);
-    expect(await svc.supportedCorridors('DOT', 'sell')).toEqual([{ country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [payout] }]);
+    expect(await svc.supportedCorridors('DOT')).toEqual([{ country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [{ ...pix, ...available }] }]);
+    expect(await svc.supportedCorridors('DOT', 'sell')).toEqual([
+      { country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [{ ...payout, ...available }] },
+    ]);
   });
 
   // A store holding rows stamped at given times, for the freshness window; `fakeStore` stamps every row alike.
@@ -544,21 +547,22 @@ describe('Onramp offramp discovery', () => {
     await put('USDT_SOLANA', 'sell', 'AR', 'Argentina', [pix]);
     const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'f', undefined);
 
-    const o = (lane: (typeof lanes)[number], x: typeof pix) => ({ ...lane, min: x.min, max: x.max, currency: x.currency });
+    const available = { availability: 'available' };
+    const o = (lane: (typeof lanes)[number], x: typeof pix) => ({ ...lane, min: x.min, max: x.max, currency: x.currency, ...available });
     expect(await svc.offrampCorridors()).toEqual([
       {
         country: 'AR',
         name: 'Argentina',
         fiat: 'BRL',
-        methods: [{ ...pix, lanes: [o(lanes[1] as never, pix)] }],
+        methods: [{ ...pix, ...available, lanes: [o(lanes[1] as never, pix)] }],
       },
       {
         country: 'BR',
         name: 'Brazil',
         fiat: 'BRL',
         methods: [
-          { ...payout, min: '1', lanes: [o(lanes[0] as never, payout), o(lanes[1] as never, { ...payout, min: '1' })] },
-          { ...pix, lanes: [o(lanes[1] as never, pix)] },
+          { ...payout, min: '1', ...available, lanes: [o(lanes[0] as never, payout), o(lanes[1] as never, { ...payout, min: '1' })] },
+          { ...pix, ...available, lanes: [o(lanes[1] as never, pix)] },
         ],
       },
     ]);
@@ -605,7 +609,8 @@ describe('Onramp offramp discovery', () => {
           min: '5',
           max: '3000',
           currency: 'USD',
-          lanes: [{ ...lanes[1], min: '5', max: '3000', currency: 'USD' }],
+          availability: 'available',
+          lanes: [{ ...lanes[1], min: '5', max: '3000', currency: 'USD', availability: 'available' }],
         },
       ],
     });
@@ -623,7 +628,7 @@ describe('Onramp offramp discovery', () => {
     const out = await svc.offramp('US');
     expect(out.fiat).toBe('USD');
     expect(out.methods).toHaveLength(1);
-    expect(out.methods[0]?.lanes).toEqual([{ ...lanes[1], min: '5', max: '3000', currency: 'USD' }]);
+    expect(out.methods[0]?.lanes).toEqual([{ ...lanes[1], min: '5', max: '3000', currency: 'USD', availability: 'available' }]);
   });
 
   it('rethrows the first failure when every lane fails, rather than answering empty', async () => {
@@ -651,5 +656,74 @@ describe('Onramp offramp discovery', () => {
   it('is a 503 without discovery', async () => {
     const svc = new Onramp(cfg(), { meld: new FakeMeld() }, new FakeAudit(), fakeStore(), new FakeMeld(), () => NOW, () => 'f', undefined);
     await expect(svc.offramp('US')).rejects.toBeInstanceOf(Refusal);
+  });
+});
+
+describe('provider health', () => {
+  const card = (min: string, max: string) => ({ paymentMethodType: 'CREDIT_DEBIT_CARD', category: 'card' as const, min, max, currency: 'USD' });
+  const banxa = { provider: 'BANXA', min: '20', max: '15000' };
+  const transak = { provider: 'TRANSAK', min: '5', max: '3000' };
+  const both = method({ min: '5', max: '15000', providers: [banxa, transak] });
+
+  /** A store holding Banxa down, as the probes recorded it in the sandbox. */
+  const banxaDown = async () => {
+    const store = fakeStore();
+    await store.writeProviderHealth({
+      provider: 'BANXA',
+      direction: 'buy',
+      scope: 'global',
+      state: 'down',
+      failures: 2,
+      last_ok_at: null,
+      last_failed_at: NOW,
+      last_code: 'INCOMPATIBLE_REQUEST',
+      last_request_id: null,
+      updated_at: NOW,
+    });
+    return store;
+  };
+  const service = (store: ReturnType<typeof fakeStore>, discovery?: Discovery) =>
+    new Onramp(config(), { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'funding-1', discovery);
+
+  it('bounds stored corridors by the providers that answer, and flags one where none does', async () => {
+    const store = await banxaDown();
+    const put = (country: string, fiat: string, providers: (typeof banxa)[]) =>
+      store.upsertCorridor({
+        destination_currency_code: 'DOT',
+        direction: 'buy',
+        country,
+        name: country,
+        fiat,
+        methods: [card('5', '15000')],
+        method_providers: [{ paymentMethodType: 'CREDIT_DEBIT_CARD', providers }],
+      });
+    await put('US', 'USD', [banxa, transak]);
+    await put('DE', 'EUR', [banxa]);
+
+    const corridors = await service(store).supportedCorridors('DOT');
+    expect(corridors.find((c) => c.country === 'US')?.methods).toEqual([{ ...card('5', '3000'), availability: 'available' }]);
+    expect(corridors.find((c) => c.country === 'DE')?.methods).toEqual([{ ...card('5', '15000'), availability: 'temporarily_unavailable' }]);
+  });
+
+  it('bounds a live corridor the same way', async () => {
+    const svc = service(await banxaDown(), fakeDiscovery({ methods: [both] }));
+    expect((await svc.supported('US', 'DOT')).methods).toMatchObject([{ min: '5', max: '3000', availability: 'available' }]);
+  });
+
+  it('refuses a session above the bound of the providers that answer', async () => {
+    const body = sessionBody({ fiat: 'USD', country: 'US', sourceAmount: '10000.00' });
+    const down = service(await banxaDown(), fakeDiscovery({ methods: [both] }));
+    expect((await refusalOf(() => down.createSession(SUBJECT, body, 'req-1'))).tag).toBe('AboveMaximum');
+    const healthy = service(fakeStore(), fakeDiscovery({ methods: [both] }));
+    expect((await healthy.createSession(SUBJECT, body, 'req-2')).fundingRequestId).toBe('funding-1');
+  });
+
+  it('serves every provider when the health read fails', async () => {
+    const store = fakeStore();
+    store.readProviderHealth = async () => {
+      throw new Error('connection refused');
+    };
+    const svc = service(store, fakeDiscovery({ methods: [both] }));
+    expect((await svc.supported('US', 'DOT')).methods).toMatchObject([{ max: '15000', availability: 'available' }]);
   });
 });

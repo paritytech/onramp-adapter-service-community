@@ -3,6 +3,8 @@ import type { ProbeResult } from './classify.js';
 
 export type HealthKey = Pick<ProviderHealthRow, 'provider' | 'direction' | 'scope'>;
 
+export const keyOf = ({ provider, direction, scope }: HealthKey): string => `${provider}|${direction}|${scope}`;
+
 type Down = Extract<ProbeResult, { outcome: 'down' }>;
 
 const isDown = (result: ProbeResult): result is Down => result.outcome === 'down';

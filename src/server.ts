@@ -44,7 +44,6 @@ import {
   fundingListQuery,
 } from './contract.js';
 import { AssetCatalog } from './meld/catalog.js';
-import { toCorridorDto } from './meld/discovery.js';
 import { toFundingRequestDto } from './funding/types.js';
 import { MeldHttpError } from './meld/client.js';
 import { railRefusal } from './meld/refusal.js';
@@ -335,9 +334,7 @@ export async function buildServer(
   );
   app.get<{ Querystring: Record<string, string> }>('/supported', asCaller, async (request, reply) => {
     const q = parse(supportedQuery, request.query);
-    // Projected, not forwarded: `providers` is aggregation bookkeeping no client reads, and
-    // serialising it would name Meld's sub-providers on a surface that deliberately never does.
-    return reply.send(toCorridorDto(await onramp.supported(q.country, q.destinationCurrencyCode, q.direction)));
+    return reply.send(await onramp.supported(q.country, q.destinationCurrencyCode, q.direction));
   });
 
   // Every supported corridor for a crypto in one payload, read from the DB the refresh fills (off Meld).
