@@ -319,6 +319,8 @@ describe('creating a fresh schema', () => {
 const atV5 = (sql: string): string =>
   sql
     .replace(" direction TEXT NOT NULL DEFAULT 'buy',", '')
+    // v8 -> v9: the per-provider limits column.
+    .replace(' method_providers JSONB,', '')
     .replace(' crypto_amount TEXT,', '')
     .replace(' deposit_address TEXT,', '')
     .replace(' deposit_amount TEXT,', '')
@@ -345,11 +347,14 @@ const atV5 = (sql: string): string =>
       ', country)',
     );
 
+/** `freshSchema()` rewound to v5: the v8 -> v9 `provider_health` table did not exist yet. */
+const v5Schema = (): string[] => freshSchema().filter((sql) => !sql.includes('provider_health')).map(atV5);
+
 describe('the v5 -> v6 migration', () => {
   /** A v5 database with one buy row in it, stamped at 5. Returns the schema name. */
   const atVersionFive = async (): Promise<string> => {
     const schema = await createSchema();
-    for (const sql of freshSchema().map(atV5)) await raw(schema, sql);
+    for (const sql of v5Schema()) await raw(schema, sql);
     await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
     await raw(schema, 'INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)');
     await raw(
@@ -378,8 +383,8 @@ describe('the v5 -> v6 migration', () => {
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Not just [5, 6]: `openIn` always walks to `SCHEMA_VERSION`, so a database stamped at 5
-      // takes the v6, v7 and v8 steps in one boot.
-      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8]);
+      // takes every later step in one boot.
+      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8, 9]);
     } finally {
       await dropSchema(schema);
     }
@@ -456,7 +461,7 @@ describe('a fresh database and a migrated one are the same database', () => {
     try {
       await (await openIn(fresh)).close();
 
-      for (const sql of freshSchema().map(atV5)) await raw(migrated, sql);
+      for (const sql of v5Schema()) await raw(migrated, sql);
       await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
       await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)');
       await (await openIn(migrated)).close();
@@ -568,7 +573,7 @@ describe('the real migration chain', () => {
       // supported_corridors is a v5 table, so a v1 database has none: filter it out before stripping
       // the later funding_requests columns, or its own ` country TEXT,` would be mangled too.
       const v1 = freshSchema()
-        .filter((sql) => !sql.includes('supported_corridors'))
+        .filter((sql) => !sql.includes('supported_corridors') && !sql.includes('provider_health'))
         .map((sql) =>
           sql
             .replace(' country TEXT,', '')
@@ -661,7 +666,7 @@ describe('the real migration chain', () => {
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     } finally {
       await dropSchema(schema);
     }

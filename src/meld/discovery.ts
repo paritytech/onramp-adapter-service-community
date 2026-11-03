@@ -165,6 +165,16 @@ export const toCorridorDto = (c: Corridor): CorridorDto => ({
   methods: c.methods.map(({ providers: _providers, ...rest }) => rest),
 });
 
+/** A method's providers, stored apart from its `CorridorDto` method because no client reads them. */
+export interface MethodProviders {
+  paymentMethodType: string;
+  providers: ProviderLimit[];
+}
+
+/** The provider roster `toCorridorDto` drops, kept for storage. */
+export const providersOf = (c: Corridor): MethodProviders[] =>
+  c.methods.map(({ paymentMethodType, providers }) => ({ paymentMethodType, providers }));
+
 /** One row of the region dropdown: every Meld on-ramp country. Whether a country can actually be
  *  delivered to (and via card or bank) is answered per selection by `corridorForCountry`, not
  *  pre-filtered here, so the list stays a cheap single call and the buyer sees every option. */

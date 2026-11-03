@@ -3,7 +3,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import type { Discovery } from '../meld/discovery.js';
-import { toCorridorDto } from '../meld/discovery.js';
+import { providersOf, toCorridorDto } from '../meld/discovery.js';
 import type { FundingStore } from '../funding/store.js';
 import type { Direction } from '../rail.js';
 
@@ -141,7 +141,15 @@ export async function refreshRoutes(
       if (methods.length === 0) continue;
       // Abort may have arrived during the probe; do not write once shutdown has begun.
       if (stopped()) break;
-      await store.upsertCorridor({ destination_currency_code: crypto, direction, country, name, fiat: corridor.fiat, methods });
+      await store.upsertCorridor({
+        destination_currency_code: crypto,
+        direction,
+        country,
+        name,
+        fiat: corridor.fiat,
+        methods,
+        method_providers: providersOf(corridor),
+      });
       written += 1;
     } catch (error) {
       log(`supported refresh skipped ${direction} ${country}/${crypto}: ${message(error)}`);
