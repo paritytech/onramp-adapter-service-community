@@ -19,9 +19,13 @@ import {
   encodeClaimerTermsCall,
   encodeDelivery,
   encodeHomeClaimerCall,
+  encodePauseReturns,
   encodeRelease,
   encodeRetired,
+  encodeReturnsPaused,
+  encodeUnpaused,
   eventTopic,
+  NO_RELEASE_TIME,
   saleRef,
   selector,
   topicAddress,
@@ -52,6 +56,12 @@ describe('selectors', () => {
     ['home()', '9fa92f9d'],
     ['retired()', '2eb38ae0'],
     ['GUARDIAN()', '724c184c'],
+    ['PAUSER()', 'd9dc8694'],
+    ['returnsPaused()', 'f38c27b5'],
+    ['unpaused()', 'b0b62f5a'],
+    ['pauseReturns()', 'a976c7e9'],
+    // Guardian only, never sent by the keeper
+    ['unpauseReturns()', 'a2e63796'],
     ['skim()', '1dd19cb4'],
     ['totalPending()', '3f90916a'],
     ['IMPLEMENTATION()', '3a4741bd'],
@@ -166,6 +176,8 @@ describe('logs', () => {
     ['DeferredExpired(bytes32,address,bytes32,address,uint256,uint256,uint256)', '0x2ff0a87413e8741befdd6c42c9b6b8ef0b9bf66e48412812267ecb4835288298'],
     ['PendingFlushed(bytes32,address,address,uint256)', '0x1dc85fc3f58e3ec3a5a227beb1c5ca1500834ad3b5955ba342ec59cf7b4d12ec'],
     ['Retired()', '0xc15f68f0a72806ff3f8bf2435385a67c4c22413f1c7931ef7bcea718e6ffcf03'],
+    ['ReturnsPaused(address)', '0xeaf7ce87f7dcfcf87cc66464043d9ec4bfc42de60a66e1b937be192f223ee70f'],
+    ['ReturnsUnpaused()', '0x4878710db943494f9c563e836b2f8088695465bec3e2b76471e016c2984239ce'],
     ['Released(uint256)', '0xfb81f9b30d73d830c3544b34d827c08142579ee75710b490bab0b3995468c565'],
     ['Unattributed(address,uint256,bytes32)', '0x0787f9200c6edc0c789aa92966501bc1cc341358e5ff68465e15a5cc668bd752'],
   ])('the keeper watches %s as the contract emits it', (signature, topic) => {
@@ -228,9 +240,16 @@ describe('the claimer-bound contract', () => {
     expect(() => encodeClaimerTermsCall('deliver(bytes32,address,bytes32,address,uint256,uint256)', { ...TERMS, claimer: 'nope' }, 1n)).toThrow(/claimer/);
   });
 
-  it('encodes release and retired', () => {
+  it('encodes release, retired and the pause calls', () => {
     expect(encodeRelease()).toBe('0x86d1a69f');
     expect(encodeRetired()).toBe('0x2eb38ae0');
+    expect(encodeReturnsPaused()).toBe('0xf38c27b5');
+    expect(encodePauseReturns()).toBe('0xa976c7e9');
+    expect(encodeUnpaused()).toBe('0xb0b62f5a');
+  });
+
+  it('names the release time of a balance with no clock as uint256 max', () => {
+    expect(NO_RELEASE_TIME.toString(16)).toBe('f'.repeat(64));
   });
 
   it('decodes a bool and refuses any other word', () => {

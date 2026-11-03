@@ -788,7 +788,7 @@ into the proxy address (EIP-55), the only place `release()` and a refused flush 
 `releaseAt`, the proxy's own `state()` release time in epoch ms (last activity plus `RELEASE_DELAY`
 below `minReturn`, plus `STALE_DELAY` otherwise; `0` once the factory is retired or `RELEASE_ATTEMPTS`
 returns were sent and the balance is at least `minReturn` above what the last return left behind while that return's refund window (`lastReturnAt` plus `RELEASE_DELAY`) is open, meaning open now; `null` before the deploy and while a balance of at least
-`minReturn` has no delivery or return yet, when the contract has no release time for it); `releasable`, what `release()` would
+`minReturn` has no delivery or return yet and returns are not paused, when the contract has no release time for it; while paused it is the factory's `pausedAt()` plus `STALE_DELAY`); `releasable`, what `release()` would
 send the claimer right now (the whole balance once `releaseAt` passed, else `"0"`); `claimerBalance`,
 the claimer's live USDC balance in base units, read on every request, which is what a relay can move
 off it; `released`, every
@@ -799,14 +799,15 @@ oldest first, `amount` in base units and `at` the epoch ms the keeper read the l
 while the factory is not retired, deferred not counted, the same condition the keeper returns under: at
 the attempt cap the contract opens release only on a balance at least `minReturn` above what the last return left behind and only within `RELEASE_DELAY` of that return, so a later refund goes home. The keeper sends a balance home while it can (at least `minReturn`, not retired, fewer than
 `RELEASE_ATTEMPTS` returns or release still shut) and releases it to the claimer once `releasable` is above zero and the
-return is not possible or held back.
-`blockedReason` is `not-due`, `below-minimum` (waiting for `releaseAt`), `not-swappable` (Chainflip would ignore or confiscate the chunk, or the quote misses the floor), `route-refused` (Chainflip would refund it: retry window over its cap or broker unregistered), `vault-changed` (Chainflip's live Arbitrum Vault is no longer the proxy's immutable one, so a return would be lost), `chain-unavailable` or `null`.
+return is not possible or held back, keeping the reason the return is held for while it releases.
+`blockedReason` is `not-due`, `below-minimum` (waiting for `releaseAt`), `not-swappable` (Chainflip would ignore or confiscate the chunk, or the quote misses the floor), `route-refused` (Chainflip would refund it: retry window over its cap or broker unregistered), `vault-changed` (Chainflip's live Arbitrum Vault is no longer the proxy's immutable one, so a return would be stranded in the old Vault, out of the seller's and our reach), `returns-paused` (the factory's `returnsPaused()` is true, so no return runs until its guardian unpauses, while a flush or a due release still does and the balance goes to the claimer at `releaseAt`, which for a balance with no delivery leftover or return yet is the factory's `pausedAt()` plus `STALE_DELAY`), `chain-unavailable` or `null`.
+`returnable` is not changed by a pause, which only holds a return back. `returns-paused` is read on every request, like `not-due`.
 On the GET, `not-swappable`, `route-refused`, `vault-changed` and `chain-unavailable` are the keeper's
 own last judgement of the proxy, from its latest pass or `POST /offramp/returns/:id`, and stay until a
-later judgement returns, releases, finds the proxy empty or finds another reason. They are held in the
+later judgement returns, finds the proxy empty or finds another reason, a release sent while the return is held keeping it. They are held in the
 keeper's memory, not stored, since every pass judges a held proxy again: after a restart, or on a
 replica that is not running the keeper, the GET falls back to what one read tells, `not-due`,
-`below-minimum` or `null`, until the next judgement there. The `POST` always answers with the reason it
+`below-minimum`, `returns-paused` or `null`, until the next judgement there. The `POST` always answers with the reason it
 just judged.
 `call` is the latest keeper call on the proxy, `action` one of `deliver`, `expire`, `flush`, `deploy`,
 `return` or `release`, `status` one of `sending`, `sent`, `mined`, `reverted` or `dropped`.

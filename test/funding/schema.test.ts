@@ -384,8 +384,8 @@ describe('the v5 -> v6 migration', () => {
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Not just [5, 6]: `openIn` always walks to `SCHEMA_VERSION`, so a database stamped at 5
-      // takes the v6 to v10 steps in one boot.
-      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8, 9, 10]);
+      // takes the v6 to v11 steps in one boot.
+      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8, 9, 10, 11]);
     } finally {
       await dropSchema(schema);
     }
@@ -538,7 +538,43 @@ describe('a fresh database and a migrated one are the same database', () => {
       }
       expect(await query(migrated, 'SELECT funding_request_id FROM vault_sales')).toEqual([{ funding_request_id: 'kept' }]);
       const applied = await query(migrated, 'SELECT version FROM schema_migrations ORDER BY version');
-      expect(applied.map((r) => Number(r.version))).toEqual([9, 10]);
+      expect(applied.map((r) => Number(r.version))).toEqual([9, 10, 11]);
+    } finally {
+      await dropSchema(fresh);
+      await dropSchema(migrated);
+    }
+  });
+});
+
+describe('the v10 -> v11 migration', () => {
+  it('lets a database stamped at v10 with the old action check claim a pause call', async () => {
+    const fresh = await createSchema();
+    const migrated = await createSchema();
+    try {
+      await (await openIn(fresh)).close();
+
+      // The v10 call table as first shipped, without the pause action
+      const atV10 = (sql: string): string => sql.replace("'skim', 'pause', 'relay'", "'skim', 'relay'");
+      for (const sql of freshSchema().map(atV10)) await raw(migrated, sql);
+      await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
+      await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (10, 0)');
+      await expect(
+        raw(
+          migrated,
+          "INSERT INTO sale_vault_proxy_calls (id, chain_id, sender, target, proxy, action, created_at, updated_at) VALUES ('before', 421614, '0x1', '0x2', '0x2', 'pause', 1, 1)",
+        ),
+      ).rejects.toThrow(/sale_vault_proxy_calls_action_known/);
+
+      const store = await openIn(migrated);
+      const claimed = await store.keeperRows().claimProxyCall({ id: 'paused', chain_id: 421614, sender: '0x1', target: '0x2', proxy: '0x2', action: 'pause', amount: null });
+      expect(claimed).toBe(true);
+      await store.close();
+
+      const constraintsOf = async (schema: string) =>
+        query(schema, "SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'sale_vault_proxy_calls'::regclass ORDER BY conname");
+      expect(await constraintsOf(migrated)).toEqual(await constraintsOf(fresh));
+      const applied = await query(migrated, 'SELECT version FROM schema_migrations ORDER BY version');
+      expect(applied.map((r) => Number(r.version))).toEqual([10, 11]);
     } finally {
       await dropSchema(fresh);
       await dropSchema(migrated);
@@ -744,7 +780,7 @@ describe('the real migration chain', () => {
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     } finally {
       await dropSchema(schema);
     }

@@ -226,7 +226,7 @@ sale_vault_proxy:
   # 42161 in production, 421614 for Arbitrum Sepolia
   chain_id: 421614
   # The deployed SaleVaultProxyFactory, required when enabled, the Arbitrum Sepolia one here
-  factory: "0xe5ab3776f482040f81f53a1080ca48e6313ee5ab"
+  factory: "0x370ba1f8c569cb98a2d75dafec18b33f6dd7a686"
   # Earlier factories on the same chain whose proxies are still watched and served, each { factory, chainflip_vault, usdc }
   retired: []
   # Chainflip's Arbitrum Vault and USDC, Perseverance values here, checked against the factory and live Chainflip

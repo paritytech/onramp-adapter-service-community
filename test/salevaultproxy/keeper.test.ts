@@ -9,7 +9,10 @@ import {
   encodeDelivery,
   encodeHomeClaimerCall,
   encodeRelease,
+  encodePauseReturns,
   encodeRetired,
+  encodeReturnsPaused,
+  encodeUnpaused,
   eventTopic,
   saleRef,
   type RawLog,
@@ -20,6 +23,7 @@ import {
   PROXY_TOPIC_CHUNK,
   saleTerms,
   SaleVaultProxyKeeper,
+  VAULT_MOVED_PASSES,
   type KeeperLog,
   type KeeperSettings,
   type KeeperStore,
@@ -144,6 +148,10 @@ function world(overrides: Partial<ProxyWorld> = {}, totalPending = 0n, staleDela
     transferLogs: [] as RawLog[],
     releasedLogs: [] as RawLog[],
     retired: false,
+    paused: false,
+    unpaused: false,
+    // Runtime code by address, which the test can add to
+    code: { [FACTORY]: '0x60', [IMPL]: '0x60', ...Object.fromEntries(Object.keys(deployed).map((key) => [key.split(':')[0], '0x60'])) } as Record<string, string>,
     logReads: [] as { address: unknown; topics: unknown; fromBlock: string; toBlock: string }[],
     // Each factory's first log block, and the longest range a one-address read may span
     firstLogs: new Map<string, bigint>(),
@@ -161,13 +169,15 @@ function world(overrides: Partial<ProxyWorld> = {}, totalPending = 0n, staleDela
   };
   // The sale's pendingDelivery call bar its trailing deadline word
   const deferredCall = encodeClaimerTermsCall('pendingDelivery(bytes32,address,bytes32,address,uint256,uint256)', TERMS, 0n).slice(0, -64);
-  // Retired is read live, so the test can flip it
+  // Retired, paused and unpaused are read live, so the test can flip them
   const getters = Object.fromEntries(
-    Object.entries(deployedGetters({ [`${FACTORY}:totalPending()`]: w(totalPending), [`${IMPL}:STALE_DELAY()`]: w(staleDelay) })).filter(([key]) => key !== `${FACTORY}:retired()`),
+    Object.entries(deployedGetters({ [`${FACTORY}:totalPending()`]: w(totalPending), [`${IMPL}:STALE_DELAY()`]: w(staleDelay) })).filter(
+      ([key]) => key !== `${FACTORY}:retired()` && key !== `${FACTORY}:returnsPaused()` && key !== `${FACTORY}:unpaused()`,
+    ),
   );
   const node = fakeNode({
     getters: { ...getters, ...deployed },
-    code: { [FACTORY]: '0x60', [IMPL]: '0x60', ...Object.fromEntries(Object.keys(deployed).map((key) => [key.split(':')[0], '0x60'])) },
+    code: state.code,
     methods: {
       eth_call: ([{ to, data }]: [{ to: string; data: string }]) => {
         if (to === PROXY && data === encodeCall('state()')) {
@@ -176,6 +186,8 @@ function world(overrides: Partial<ProxyWorld> = {}, totalPending = 0n, staleDela
           return `0x${words.join('')}`;
         }
         if (to === FACTORY && data === encodeRetired()) return `0x${w(state.retired ? 1n : 0n)}`;
+        if (to === FACTORY && data === encodeReturnsPaused()) return `0x${w(state.paused ? 1n : 0n)}`;
+        if (to === FACTORY && data === encodeUnpaused()) return `0x${w(state.unpaused ? 1n : 0n)}`;
         if (data === encodeBalanceOf(PROXY)) return `0x${w(proxy.balance)}`;
         if (data === encodeBalanceOf(FACTORY)) return `0x${w(state.factoryBalance)}`;
         if (data === encodeHomeClaimerCall('pending(bytes32,address)', HOME, CLAIMER)) return `0x${w(proxy.pending)}`;
@@ -557,12 +569,32 @@ describe('verification', () => {
     expect(log.mock.calls.filter(([level]) => level === 'warn')).toHaveLength(1);
   });
 
-  it('refuses a deployment whose guardian is the keeper key', async () => {
-    const w0 = world();
-    const node = fakeNode({ getters: deployedGetters({ [`${FACTORY}:GUARDIAN()`]: w(KEEPER.toLowerCase()) }) });
-    const { keeper, log } = keeperFor(w0, memoryStore([]), { chain: new SaleVaultProxyChain(node.rpc) });
+  it('refuses a retired deployment whose guardian is the keeper key, its pauser free to be a rotated key', async () => {
+    const getters = { ...oldDeployment(), [`${OLD_FACTORY}:GUARDIAN()`]: w(KEEPER.toLowerCase()), [`${OLD_FACTORY}:PAUSER()`]: w('88'.repeat(20)) };
+    const { keeper, log } = keeperFor(world({}, 0n, BigInt(WATCH_SECONDS), getters), memoryStore([]), {
+      retired: [{ factory: OLD_FACTORY, vault: SEPOLIA.vault, usdc: SEPOLIA.usdc }],
+    });
+    expect(await keeper.verify()).toBe(true);
+    expect(keeper.verifiedFor(421614, OLD_FACTORY)).toBeUndefined();
+    expect(log).toHaveBeenCalledWith('error', expect.stringMatching(new RegExp(`${OLD_FACTORY} is unavailable: .*guardian .* is the keeper key`)));
+  });
+
+  it('refuses a configured deployment whose pauser is not the keeper key', async () => {
+    const node = fakeNode({ getters: deployedGetters({ [`${FACTORY}:PAUSER()`]: w('88'.repeat(20)) }) });
+    const { keeper, log } = keeperFor(world(), memoryStore([]), { chain: new SaleVaultProxyChain(node.rpc) });
     expect(await keeper.verify()).toBe(false);
-    expect(log).toHaveBeenCalledWith('error', expect.stringMatching(/is unavailable: .*guardian .* is the keeper key/));
+    expect(log).toHaveBeenCalledWith('error', expect.stringMatching(/is unavailable: .*factory pauser is 0x8888.*, the keeper key is 0x9d8a/));
+  });
+
+  it('closes new sells while returns are paused and reopens them on an unpause, existing sales still served', async () => {
+    const w0 = world();
+    const { keeper, log } = keeperFor(w0, memoryStore([]));
+    w0.state.paused = true;
+    expect(await keeper.verify()).toBe(false);
+    expect(keeper.current()?.factory).toBe(FACTORY);
+    expect(log).toHaveBeenCalledWith('error', expect.stringMatching(/is closed to new sells: .*has returns paused/));
+    w0.state.paused = false;
+    expect(await keeper.verify()).toBe(true);
   });
 
   it('rethrows an unexpected failure', async () => {
@@ -752,6 +784,28 @@ describe('action priority', () => {
     const limits = limitsOf({ check: async () => Promise.reject(new ReturnNotSwappableError('above maximum')) });
     await keeperFor(world(open), held, { limits }).keeper.pass();
     expect(actionsOf(held)).toEqual(['release:sent']);
+  });
+
+  it('keeps why a return is held while it releases a due balance, a Chainflip outage included', async () => {
+    const open = { balance: 20_000_000n, releaseAt: 5_184_000n, releasable: 20_000_000n };
+    for (const [limits, reason] of [
+      [limitsOf({ check: async () => Promise.reject(new ReturnNotSwappableError('above maximum')) }), 'not-swappable'],
+      [limitsOf({ quote: async () => Promise.reject(new ChainUnavailableError('quote down')) }), 'chain-unavailable'],
+    ] as const) {
+      const mem = memoryStore();
+      const { keeper } = keeperFor(world(open), mem, { limits });
+      await keeper.verify();
+      expect((await keeper.trigger(sale())).blockedReason).toBe(reason);
+      expect(keeper.hold(PROXY)).toBe(reason);
+      expect(actionsOf(mem)).toEqual(['release:sent']);
+    }
+    // With no release due a Chainflip outage still only holds the return
+    const mem = memoryStore();
+    const shut = { balance: 20_000_000n, releaseAt: BigInt(NOW / 1000) + 86_400n, releasable: 0n };
+    const { keeper } = keeperFor(world(shut), mem, { limits: limitsOf({ quote: async () => Promise.reject(new ChainUnavailableError('quote down')) }) });
+    await keeper.verify();
+    expect((await keeper.trigger(sale())).blockedReason).toBe('chain-unavailable');
+    expect(actionsOf(mem)).toEqual([]);
   });
 
   it('skims the factory once its free balance is worth it, reading only totalPending', async () => {
@@ -1159,6 +1213,8 @@ describe('the log scan', () => {
           'PendingFlushed(bytes32,address,address,uint256)',
           'Unattributed(address,uint256,bytes32)',
           'Retired()',
+          'ReturnsPaused(address)',
+          'ReturnsUnpaused()',
         ].map(eventTopic),
       ],
     });
@@ -1978,5 +2034,322 @@ describe('relay', () => {
     mem.otherReplica(true);
     expect(await keeperFor(world(), mem).keeper.relay(421614, SEPOLIA.usdc, CLAIMER, '0xe3ee160e', 5n)).toBe('locked');
     expect(mem.calls).toEqual([]);
+  });
+});
+
+describe('the moved-Vault pause', () => {
+  const MOVED = `0x${'99'.repeat(20)}`;
+
+  /** A Chainflip whose State Chain and encoder each name a Vault the test sets, or fail. */
+  function liveVaults(start: { state?: string; encoder?: string } = {}) {
+    const live = { state: start.state ?? MOVED, encoder: start.encoder ?? MOVED, down: false };
+    const limits = limitsOf();
+    const route = limits.returnRoute.bind(limits);
+    Object.assign(limits, {
+      arbitrumVault: async () => (live.down ? Promise.reject(new ChainUnavailableError('cf down')) : live.state),
+      returnRoute: async (args: Parameters<ReturnLimits['returnRoute']>[0]) => ({ ...(await route(args)), vault: live.encoder }),
+    });
+    return { live, limits };
+  }
+
+  // A world where the moved Vault has code
+  const movedWorld = (overrides: Partial<ProxyWorld> = {}) => {
+    const w0 = world(overrides);
+    w0.state.head = 50n;
+    w0.state.code[MOVED] = '0x60';
+    return w0;
+  };
+  const pauses = (mem: ReturnType<typeof memoryStore>) => mem.calls.filter((c) => c.action === 'pause');
+
+  it(`pauses the factory once both sources name the same moved Vault with code on ${String(VAULT_MOVED_PASSES)} passes in a row`, async () => {
+    expect(VAULT_MOVED_PASSES).toBe(2);
+    const w0 = movedWorld();
+    const mem = memoryStore([]);
+    const { limits } = liveVaults();
+    const { keeper, log } = keeperFor(w0, mem, { limits });
+    await keeper.pass();
+    expect(pauses(mem)).toEqual([]);
+    await keeper.pass();
+    expect(pauses(mem)).toMatchObject([{ action: 'pause', target: FACTORY, proxy: FACTORY, status: 'sent', amount: null }]);
+    expect(log).toHaveBeenCalledWith(
+      'error',
+      `sale vault proxy factory ${FACTORY} returns paused by the keeper: Chainflip's Arbitrum vault moved from ${SEPOLIA.vault} to ${MOVED}, only its guardian unpauses`,
+    );
+    expect(w0.state.sent).toHaveLength(1);
+    // While it is unmined the in-flight call holds the slot, once mined the factory reads paused
+    await keeper.pass();
+    expect(pauses(mem)).toHaveLength(1);
+    for (const c of mem.calls) if (c.tx_hash !== null) w0.state.receipts.set(c.tx_hash, { status: '0x1' });
+    w0.state.paused = true;
+    await keeper.pass();
+    await keeper.pass();
+    expect(actionsOf(mem)).toEqual(['pause:mined']);
+    expect(w0.state.sent).toHaveLength(1);
+  });
+
+  it('signs pauseReturns() to the factory with the keeper key', async () => {
+    const w0 = movedWorld();
+    const estimated: string[] = [];
+    w0.state.estimate = (data) => {
+      estimated.push(data);
+      return '0x186a0';
+    };
+    const { keeper } = keeperFor(w0, memoryStore([]), { limits: liveVaults().limits });
+    await keeper.pass();
+    await keeper.pass();
+    expect(estimated).toEqual([encodePauseReturns()]);
+  });
+
+  it('starts the count again on a disagreement, an outage or another Vault, so one glitch never pauses', async () => {
+    const w0 = movedWorld();
+    const mem = memoryStore([]);
+    const { live, limits } = liveVaults();
+    const { keeper } = keeperFor(w0, mem, { limits });
+    const glitches: (() => void)[] = [
+      () => {
+        live.encoder = SEPOLIA.vault;
+      },
+      () => {
+        live.down = true;
+      },
+      () => {
+        live.state = `0x${'aa'.repeat(20)}`;
+        live.encoder = live.state;
+        w0.state.code[live.state] = '0x60';
+      },
+    ];
+    await keeper.pass();
+    for (const glitch of glitches) {
+      glitch();
+      await keeper.pass();
+      Object.assign(live, { state: MOVED, encoder: MOVED, down: false });
+      await keeper.pass();
+      expect(pauses(mem)).toEqual([]);
+    }
+    await keeper.pass();
+    expect(pauses(mem)).toHaveLength(1);
+  });
+
+  it('starts the count again when an Arbitrum read fails', async () => {
+    const w0 = movedWorld();
+    const mem = memoryStore([]);
+    let codeDown = false;
+    const chain = new SaleVaultProxyChain(async (method, params) => {
+      if (codeDown && method === 'eth_getCode' && String(params[0]) === MOVED) throw new RpcCallError('rpc eth_getCode error: rate limited', -32005);
+      return w0.rpc(method, params);
+    });
+    const { keeper, log } = keeperFor(w0, mem, { limits: liveVaults().limits, chain });
+    await keeper.pass();
+    codeDown = true;
+    await keeper.pass();
+    expect(log).toHaveBeenCalledWith('warn', expect.stringMatching(/moved Vault check failed: .*rate limited/));
+    codeDown = false;
+    await keeper.pass();
+    expect(pauses(mem)).toEqual([]);
+    await keeper.pass();
+    expect(pauses(mem)).toHaveLength(1);
+  });
+
+  it.each([
+    ['only the State Chain moved', { encoder: SEPOLIA.vault }, true],
+    ['only the encoder moved', { state: SEPOLIA.vault }, true],
+    ['the moved Vault has no code', {}, false],
+    ['the moved Vault is the zero address', { state: `0x${'0'.repeat(40)}`, encoder: `0x${'0'.repeat(40)}` }, true],
+  ])('never pauses when %s', async (_name, start, withCode) => {
+    const w0 = world();
+    w0.state.head = 50n;
+    if (withCode) {
+      w0.state.code[MOVED] = '0x60';
+      w0.state.code[`0x${'0'.repeat(40)}`] = '0x60';
+    }
+    const mem = memoryStore([]);
+    const { keeper } = keeperFor(w0, mem, { limits: liveVaults(start).limits });
+    for (let i = 0; i < 4; i++) await keeper.pass();
+    expect(pauses(mem)).toEqual([]);
+  });
+
+  it('leaves a retired or already paused factory alone', async () => {
+    for (const flag of ['retired', 'paused'] as const) {
+      const w0 = movedWorld();
+      w0.state[flag] = true;
+      const mem = memoryStore([]);
+      const { keeper } = keeperFor(w0, mem, { limits: liveVaults().limits });
+      await keeper.pass();
+      await keeper.pass();
+      expect(pauses(mem)).toEqual([]);
+    }
+  });
+
+  it("lets a guardian's unpause of its own pause stand, alerting once", async () => {
+    const w0 = movedWorld();
+    const mem = memoryStore([]);
+    const log = vi.fn<KeeperLog>();
+    const { keeper } = keeperFor(w0, mem, { limits: liveVaults().limits, log });
+    await keeper.pass();
+    await keeper.pass();
+    for (const c of mem.calls) if (c.tx_hash !== null) w0.state.receipts.set(c.tx_hash, { status: '0x1' });
+    w0.state.paused = true;
+    await keeper.pass();
+    // Paused, then unpaused by the guardian while the Vault still differs
+    Object.assign(w0.state, { paused: false, unpaused: true });
+    await keeper.pass();
+    await keeper.pass();
+    expect(actionsOf(mem)).toEqual(['pause:mined']);
+    expect(log.mock.calls.filter(([, m]) => /returns run again after the guardian's unpause/.test(m))).toHaveLength(1);
+  });
+
+  it("lets a guardian's unpause stand when the guardian paused first, never pausing", async () => {
+    const w0 = movedWorld();
+    // The guardian paused by hand, so no keeper call row exists
+    w0.state.paused = true;
+    const mem = memoryStore([]);
+    const log = vi.fn<KeeperLog>();
+    const { keeper } = keeperFor(w0, mem, { limits: liveVaults().limits, log });
+    await keeper.pass();
+    await keeper.pass();
+    expect(pauses(mem)).toEqual([]);
+    Object.assign(w0.state, { paused: false, unpaused: true });
+    for (let i = 0; i < 3; i++) await keeper.pass();
+    expect(pauses(mem)).toEqual([]);
+    expect(w0.state.sent).toEqual([]);
+    expect(log.mock.calls.filter(([, m]) => /returns run again after the guardian's unpause: .*the keeper does not pause it again/.test(m))).toHaveLength(1);
+  });
+
+  it('still pauses a factory its guardian never unpaused', async () => {
+    const w0 = movedWorld();
+    const mem = memoryStore([]);
+    const { keeper } = keeperFor(w0, mem, { limits: liveVaults().limits });
+    await keeper.pass();
+    await keeper.pass();
+    expect(pauses(mem)).toHaveLength(1);
+  });
+
+  it('alerts instead of pausing a retired deployment whose pauser is a rotated key, and pauses the configured one', async () => {
+    const getters = { ...oldDeployment(), [`${OLD_FACTORY}:PAUSER()`]: w('88'.repeat(20)), [`${OLD_FACTORY}:returnsPaused()`]: w(0n) };
+    const w0 = world({}, 0n, BigInt(WATCH_SECONDS), getters);
+    w0.state.head = 50n;
+    w0.state.code[MOVED] = '0x60';
+    const mem = memoryStore([]);
+    const log = vi.fn<KeeperLog>();
+    const { keeper } = keeperFor(w0, mem, { limits: liveVaults().limits, log, retired: [{ factory: OLD_FACTORY, vault: SEPOLIA.vault, usdc: SEPOLIA.usdc }] });
+    for (let i = 0; i < 3; i++) await keeper.pass();
+    expect(pauses(mem).map((c) => c.target)).toEqual([FACTORY]);
+    expect(log.mock.calls.filter(([, m]) => m.includes(`factory ${OLD_FACTORY} returns stay open`) && m.includes('is not the keeper key, so its guardian must pause it'))).toHaveLength(1);
+  });
+
+  it("pauses every other stranded factory when one factory's reads fail, and keeps the count for it", async () => {
+    const w0 = world({}, 0n, BigInt(WATCH_SECONDS), oldDeployment());
+    w0.state.head = 50n;
+    w0.state.code[MOVED] = '0x60';
+    const mem = memoryStore([]);
+    const log = vi.fn<KeeperLog>();
+    let failing: string | undefined;
+    const chain = new SaleVaultProxyChain(async (method, params) => {
+      const [call] = params as [{ to?: string; data?: string }];
+      if (method === 'eth_call' && failing !== undefined && call.to === failing && call.data === encodeUnpaused()) throw new RpcCallError('rpc eth_call error: rate limited', -32005);
+      return w0.rpc(method, params);
+    });
+    const { keeper } = keeperFor(w0, mem, { limits: liveVaults().limits, log, chain, retired: [{ factory: OLD_FACTORY, vault: SEPOLIA.vault, usdc: SEPOLIA.usdc }] });
+    await keeper.pass();
+    failing = FACTORY;
+    await keeper.pass();
+    expect(pauses(mem).map((c) => c.target)).toEqual([OLD_FACTORY]);
+    expect(log).toHaveBeenCalledWith('warn', expect.stringMatching(new RegExp(`factory ${FACTORY} pause check failed: .*rate limited`)));
+    // The confirmed count stands, so the failed factory is paused as soon as its reads answer
+    failing = undefined;
+    await keeper.pass();
+    expect(pauses(mem).map((c) => c.target)).toEqual([OLD_FACTORY, FACTORY]);
+  });
+
+  it('warns and sends again next pass when another call holds the factory slot', async () => {
+    const w0 = movedWorld();
+    const mem = memoryStore([]);
+    const log = vi.fn<KeeperLog>();
+    const { keeper } = keeperFor(w0, mem, { limits: liveVaults().limits, log });
+    await keeper.pass();
+    // A skim on the factory key is still in flight
+    await mem.rows.claimProxyCall({ id: 'skim', chain_id: 421614, sender: KEEPER, target: FACTORY, proxy: FACTORY, action: 'skim', amount: '1' });
+    await mem.rows.markProxyCallSent('skim', '0xskim', 3);
+    await keeper.pass();
+    expect(pauses(mem)).toEqual([]);
+    expect(log).toHaveBeenCalledWith('warn', expect.stringMatching(new RegExp(`factory ${FACTORY} pause skipped, sent again next pass`)));
+    w0.state.receipts.set('0xskim', { status: '0x1' });
+    await keeper.pass();
+    expect(pauses(mem)).toHaveLength(1);
+  });
+
+  it('keeps the vault-changed hold on a return while the pause is on its way', async () => {
+    const w0 = movedWorld({ balance: 20_000_000n });
+    const mem = memoryStore();
+    const { keeper } = keeperFor(w0, mem, { limits: liveVaults().limits });
+    await keeper.pass();
+    expect(keeper.hold(PROXY)).toBe('vault-changed');
+    expect(actionsOf(mem)).toEqual([]);
+  });
+});
+
+describe('returns paused', () => {
+  it('holds a return while paused and looks again at the release time', async () => {
+    const releaseAt = BigInt(NOW / 1000) + 86_400n;
+    const w0 = world({ balance: 20_000_000n, releaseAt });
+    w0.state.paused = true;
+    const mem = memoryStore();
+    const { keeper } = keeperFor(w0, mem);
+    await keeper.verify();
+    const evaluation = await keeper.trigger(sale());
+    expect(evaluation).toMatchObject({ blockedReason: 'returns-paused', observation: { returnsPaused: true } });
+    expect(keeper.hold(PROXY)).toBeUndefined();
+    expect(mem.schedules.at(-1)).toEqual({ proxy: PROXY, dueAt: Number(releaseAt) * 1000 });
+    expect(mem.calls).toEqual([]);
+  });
+
+  it('reads again next pass when paused and state() shows no release time, which only split reads give', async () => {
+    const w0 = world({ balance: 20_000_000n, releaseAt: 2n ** 256n - 1n });
+    w0.state.paused = true;
+    const mem = memoryStore();
+    const { keeper } = keeperFor(w0, mem);
+    await keeper.verify();
+    expect((await keeper.trigger(sale())).blockedReason).toBe('chain-unavailable');
+    expect(mem.schedules.at(-1)).toEqual({ proxy: PROXY, dueAt: NOW });
+    expect(mem.calls).toEqual([]);
+  });
+
+  it('releases a due balance while paused, and still flushes', async () => {
+    const w0 = world({ balance: 20_000_000n, releaseAt: BigInt(NOW / 1000) - 1n, releasable: 20_000_000n });
+    w0.state.paused = true;
+    const mem = memoryStore();
+    const { keeper } = keeperFor(w0, mem);
+    await keeper.verify();
+    // The return stays held, so the reason stays while the release runs
+    expect((await keeper.trigger(sale())).blockedReason).toBe('returns-paused');
+    expect(actionsOf(mem)).toEqual(['release:sent']);
+    const flushing = world({ pending: 5n });
+    flushing.state.paused = true;
+    const other = memoryStore();
+    const second = keeperFor(flushing, other).keeper;
+    await second.verify();
+    await second.trigger(sale());
+    expect(actionsOf(other)).toEqual(['flush:sent']);
+  });
+
+  it('alerts on a pause and makes every watched sale due on an unpause', async () => {
+    const w0 = world();
+    w0.state.head = 50n;
+    const by = '0x9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f';
+    w0.state.factoryLogs = [
+      { address: FACTORY, topics: [eventTopic('ReturnsPaused(address)')], data: `0x${w(by)}`, ...at(0) },
+      { address: FACTORY, topics: [eventTopic('ReturnsPaused(address)')], data: '0x', ...at(1) },
+      { address: FACTORY, topics: [eventTopic('ReturnsUnpaused()')], data: '0x', ...at(2) },
+    ];
+    const mem = memoryStore([sale({ due_at: null })]);
+    const log = vi.fn<KeeperLog>();
+    await keeperFor(w0, mem, { log }).keeper.pass();
+    expect(log.mock.calls.filter(([level]) => level === 'error').map(([, m]) => m)).toEqual([
+      `sale vault proxy factory ${FACTORY} returns home were paused by ${by}: every proxy holds its balance until the guardian unpauses, release is unaffected`,
+      `sale vault proxy factory ${FACTORY} logged an unreadable pause: every proxy holds its balance until the guardian unpauses, release is unaffected`,
+      `sale vault proxy factory ${FACTORY} returns home were unpaused by its guardian`,
+    ]);
+    // Due again, then judged and scheduled by the same pass
+    expect(mem.schedules).toEqual([{ proxy: PROXY, dueAt: null }]);
   });
 });

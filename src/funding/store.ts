@@ -168,7 +168,7 @@ export interface KeeperCandidate extends NewSaleVaultProxyRow {
 }
 
 /** The keeper's on-chain actions, pinned by a CHECK in `schema.ts`. */
-export type ProxyCallAction = 'deliver' | 'expire' | 'flush' | 'deploy' | 'return' | 'release' | 'skim' | 'relay';
+export type ProxyCallAction = 'deliver' | 'expire' | 'flush' | 'deploy' | 'return' | 'release' | 'skim' | 'pause' | 'relay';
 
 /** USDC that reached a claimer: a proxy's release or a factory flush the proxy refused. */
 export type PayoutKind = 'released' | 'flushed';
@@ -197,7 +197,7 @@ export interface WatchedProxy {
 /** A keeper call's lifecycle, pinned by a CHECK in `schema.ts`. */
 export type ProxyCallStatus = 'sending' | 'sent' | 'mined' | 'reverted' | 'dropped';
 
-/** A keeper call before it is signed. For a skim `proxy` holds the factory, for a relay the claimer. */
+/** A keeper call before it is signed. For a skim or a pause `proxy` holds the factory, for a relay the claimer. */
 export interface NewProxyCall {
   id: string;
   chain_id: number;

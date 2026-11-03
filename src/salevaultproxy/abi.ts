@@ -238,12 +238,30 @@ export function encodeRetired(): string {
   return encodeCall('retired()');
 }
 
+/** calldata for the factory's `returnsPaused()` getter. */
+export function encodeReturnsPaused(): string {
+  return encodeCall('returnsPaused()');
+}
+
+/** calldata for the factory's `unpaused()` getter, true once its guardian unpaused returns. */
+export function encodeUnpaused(): string {
+  return encodeCall('unpaused()');
+}
+
+/** calldata for the factory's `pauseReturns()`, which the PAUSER or the GUARDIAN may call and only the GUARDIAN undoes. */
+export function encodePauseReturns(): string {
+  return encodeCall('pauseReturns()');
+}
+
 /** Decode a single bool return value, refusing any word but 0 or 1. */
 export function decodeBool(hex: string): boolean {
   const value = uintAt(hex, 0);
   if (value > 1n) throw new Error(`not a bool: ${value.toString()}`);
   return value === 1n;
 }
+
+/** The proxy's `releaseAt` for a returnable balance with no release time yet, uint256 max. */
+export const NO_RELEASE_TIME = 2n ** 256n - 1n;
 
 /** The decoded `state()` of a claimer-bound proxy. */
 export interface ClaimerProxyState {

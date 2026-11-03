@@ -13,9 +13,11 @@ import {
   encodeCall,
   encodeClaimerTermsCall,
   encodeHomeClaimerCall,
+  encodePauseReturns,
   encodeRelease,
   eventTopic,
   EVM_ADDRESS,
+  NO_RELEASE_TIME,
   topicAddress,
   type ClaimerProxyState,
   type RawLog,
@@ -27,6 +29,7 @@ import type { FailedCallSource } from './failed-calls.js';
 import { proxyMinOut, returnChunk, ReturnNotSwappableError, type ReturnLimits, type ReturnRefusal } from './limits.js';
 import type { KeeperSigner } from './signer.js';
 import {
+  encoderRoute,
   SaleVaultProxyMisconfigured,
   verifyDeployment,
   verifyWindow,
@@ -63,6 +66,8 @@ export interface ProxyObservation {
   readonly pending: bigint;
   /** Whether the factory is retired, which stops every return home. */
   readonly retired: boolean;
+  /** Whether the factory's returns home are paused, which leaves release alone. */
+  readonly returnsPaused: boolean;
 }
 
 /** What the keeper read off one sale on its proxy. */
@@ -74,7 +79,7 @@ export interface SaleObservation {
 }
 
 /** Why a proxy holding USDC is not being returned or released right now. */
-export type BlockedReason = 'not-due' | 'below-minimum' | ReturnRefusal | 'vault-changed' | 'chain-unavailable';
+export type BlockedReason = 'not-due' | 'below-minimum' | ReturnRefusal | 'vault-changed' | 'returns-paused' | 'chain-unavailable';
 
 /** The outcome of evaluating one proxy. */
 export interface Evaluation {
@@ -122,11 +127,17 @@ const FACTORY_TOPICS = [
 const UNATTRIBUTED = eventTopic('Unattributed(address,uint256,bytes32)');
 // The guardian stopped every return home for good
 const RETIRED = eventTopic('Retired()');
+// The pauser or the guardian paused every return home, and the guardian let them run again
+const RETURNS_PAUSED = eventTopic('ReturnsPaused(address)');
+const RETURNS_UNPAUSED = eventTopic('ReturnsUnpaused()');
 // A proxy paid its whole balance to its claimer
 const RELEASED = eventTopic('Released(uint256)');
 const TRANSFER_TOPIC = eventTopic('Transfer(address,address,uint256)');
 // Proxies per Transfer log read, well under the 1000 selectors the public Arbitrum RPCs allow
 export const PROXY_TOPIC_CHUNK = 100;
+// Passes in a row both Chainflip sources must name the same moved Vault before a pause, so one glitched read never pauses
+export const VAULT_MOVED_PASSES = 2;
+const ZERO_ADDRESS = `0x${'0'.repeat(40)}`;
 
 /** A sale's on-chain terms off its funding row: the provider's deposit address and the committed USDC. */
 export function saleTerms(sale: KeeperCandidate): SaleTerms | undefined {
@@ -189,6 +200,8 @@ export class SaleVaultProxyKeeper {
   private readonly alerted = new Map<string, string>();
   // The latest hold per proxy a status read cannot tell itself, in memory since every pass judges a held proxy again
   private readonly holds = new Map<string, BlockedReason>();
+  // The moved Vault both Chainflip sources named on the last passes in a row and how many, cleared by any other answer or failure
+  private moved: { vault: string; passes: number } | undefined;
   private readonly clock: () => number;
   private readonly newId: () => string;
 
@@ -220,7 +233,9 @@ export class SaleVaultProxyKeeper {
     for (const cfg of configs) {
       if (this.deployments.has(cfg.factory.toLowerCase())) continue;
       const outcome = await this.verifying(cfg.factory, 'unavailable', async () => {
-        const v = await verifyDeployment(cfg, this.deps.chain, this.deps.limits);
+        // The configured factory's pauser must be the keeper key, a retired one may name a key since rotated
+        const pauser = cfg === this.deps.deployment ? this.deps.signer.address : undefined;
+        const v = await verifyDeployment(cfg, this.deps.chain, this.deps.limits, pauser);
         // The guardian can stop every return, so it is never the hot key that pays for them
         if (v.guardian === this.deps.signer.address.toLowerCase()) throw new SaleVaultProxyMisconfigured(`sale_vault_proxy: factory guardian ${v.guardian} is the keeper key`);
         this.deployments.set(v.factory, v);
@@ -233,6 +248,8 @@ export class SaleVaultProxyKeeper {
       // Read again on every call, so a retire or Chainflip's drift closes new sells without a restart
       const outcome = await this.verifying(current.factory, 'closed to new sells', async () => {
         if (await this.deps.chain.retired(current.factory)) throw new SaleVaultProxyMisconfigured(`sale_vault_proxy: factory ${current.factory} is retired`);
+        // A new sale could not go home until the guardian unpauses
+        if (await this.deps.chain.returnsPaused(current.factory)) throw new SaleVaultProxyMisconfigured(`sale_vault_proxy: factory ${current.factory} has returns paused`);
         await verifyWindow(current, this.deps.limits);
       });
       // An outage keeps the last answer rather than closing sells on a blip
@@ -321,14 +338,15 @@ export class SaleVaultProxyKeeper {
   /** Read a proxy's on-chain position without acting. */
   async observe(v: VerifiedSaleVaultProxy, sale: Pick<KeeperCandidate, 'factory' | 'proxy' | 'home' | 'claimer'>): Promise<ProxyObservation> {
     const { chain } = this.deps;
-    const [state, pending, retired] = await Promise.all([
+    const [state, pending, retired, returnsPaused] = await Promise.all([
       chain.proxyState(sale.proxy),
       chain.pending(sale.factory, sale.home, sale.claimer),
       chain.retired(sale.factory),
+      chain.returnsPaused(sale.factory),
     ]);
     // Before the deploy USDC can still sit at the address
     const balance = state?.balance ?? (await chain.usdcBalance(v.usdc, sale.proxy));
-    return { deployed: state !== undefined, state, balance, pending, retired };
+    return { deployed: state !== undefined, state, balance, pending, retired, returnsPaused };
   }
 
   /** A claimer's live USDC balance in the deployment's own USDC. */
@@ -426,6 +444,12 @@ export class SaleVaultProxyKeeper {
     const watchSeconds = [...this.deployments.values()].reduce((longest, v) => (v.staleDelay > longest ? v.staleDelay : longest), 0n);
     const sinceMs = this.clock() - Number(watchSeconds) * 1000;
     await this.settleInflight(rows, chainId);
+    // After settling, so a pause mined since the last pass counts
+    try {
+      await this.guardVault();
+    } catch (error) {
+      this.deps.log('warn', `sale vault proxy moved Vault check failed: ${toMessage(error)}`);
+    }
     // One cursor serves every factory, so it never moves past blocks an unverified one has not read
     if (!this.unanswered) {
       try {
@@ -513,7 +537,7 @@ export class SaleVaultProxyKeeper {
     while (from <= head) {
       const to = minOf(from + range - 1n, head);
       const [logs, released, transfers] = await Promise.all([
-        chain.logs({ address: factories, topics: [[...FACTORY_TOPICS, UNATTRIBUTED, RETIRED]], fromBlock: from, toBlock: to }),
+        chain.logs({ address: factories, topics: [[...FACTORY_TOPICS, UNATTRIBUTED, RETIRED, RETURNS_PAUSED, RETURNS_UNPAUSED]], fromBlock: from, toBlock: to }),
         // By topic alone, so a release on a proxy past the watch window is recorded too
         chain.logs({ topics: [RELEASED], fromBlock: from, toBlock: to }),
         Promise.all(
@@ -546,6 +570,9 @@ export class SaleVaultProxyKeeper {
       const retired = named(RETIRED);
       // A retire opens every proxy's release at once, idle ones too
       await rows.markFactoriesActive({ chainId, factories: [...new Set(retired.map((log) => log.address))], at: this.clock() });
+      // An unpause lets every watched proxy of that factory go home again
+      const unpaused = [...new Set(named(RETURNS_UNPAUSED).map((log) => log.address))];
+      if (unpaused.length > 0) await rows.markAllDue({ chainId, factories: unpaused, sinceMs, at: this.clock() });
       await rows.writeCursor(chainId, to);
       // After the cursor moves, so a range read again never alerts twice
       for (const message of [...deferrals.unreadable, ...payouts.unreadable]) this.deps.log('error', message);
@@ -554,6 +581,8 @@ export class SaleVaultProxyKeeper {
       for (const log of retired) {
         this.deps.log('error', `sale vault proxy factory ${log.address} was retired by its guardian: returns home stop and every proxy releases to its claimer`);
       }
+      for (const log of named(RETURNS_PAUSED)) this.deps.log('error', `sale vault proxy factory ${log.address} ${pausedBy(log)}`);
+      for (const log of named(RETURNS_UNPAUSED)) this.deps.log('error', `sale vault proxy factory ${log.address} returns home were unpaused by its guardian`);
       from = to + 1n;
       if (this.clock() >= stopAt) break;
     }
@@ -782,7 +811,7 @@ export class SaleVaultProxyKeeper {
     }
     const reason = judgement.blockedReason;
     if (reason === null) this.alerted.delete(`blocked:${first.proxy}`);
-    if (reason === null || reason === 'not-due' || reason === 'below-minimum') this.holds.delete(first.proxy.toLowerCase());
+    if (reason === null || reason === 'not-due' || reason === 'below-minimum' || reason === 'returns-paused') this.holds.delete(first.proxy.toLowerCase());
     else this.holds.set(first.proxy.toLowerCase(), reason);
     if (act) {
       let { dueAt } = judgement;
@@ -839,8 +868,23 @@ export class SaleVaultProxyKeeper {
     if (split && o.balance > 0n) return { decision: undefined, blockedReason: 'chain-unavailable', dueAt: now };
     // Returns end once the factory is retired, or out of attempts once the contract opens release
     if (o.balance >= v.minReturn && !o.retired && (BigInt(o.state.attempts) < v.releaseAttempts || o.state.releasable === 0n)) {
-      const held = await this.judgeReturn(v, proxy.proxy, o.state, now);
-      return held.decision === undefined && release !== undefined ? acting(release) : held;
+      // A pause leaves release on its own clock, and an unpause log makes the proxy due again
+      if (o.returnsPaused) {
+        // A paused factory gives every returnable balance a release time, so none means the reads split
+        if (o.state.releaseAt === NO_RELEASE_TIME) return { decision: undefined, blockedReason: 'chain-unavailable', dueAt: now };
+        if (release !== undefined) return { ...acting(release), blockedReason: 'returns-paused' };
+        return { decision: undefined, blockedReason: 'returns-paused', dueAt: Math.max(Number(o.state.releaseAt) * 1000, now) };
+      }
+      let held: Judgement;
+      try {
+        held = await this.judgeReturn(v, proxy.proxy, o.state, now);
+      } catch (error) {
+        // A release needs only Arbitrum, so a Chainflip outage never holds a due one
+        if (!(error instanceof ChainUnavailableError) || release === undefined) throw error;
+        held = { decision: undefined, blockedReason: 'chain-unavailable', dueAt: now };
+      }
+      // A due release runs while the return is held back, keeping why
+      return held.decision === undefined && release !== undefined ? { ...acting(release), blockedReason: held.blockedReason } : held;
     }
     if (release !== undefined) return acting(release);
     if (o.balance === 0n) return { decision: undefined, blockedReason: null, dueAt: null };
@@ -866,10 +910,56 @@ export class SaleVaultProxyKeeper {
     const quoted = await this.deps.limits.quotedOutput(amount);
     const needed = (proxyMinOut(amount, v) * BigInt(10_000 + this.deps.settings.quoteMarginBps)) / 10_000n;
     if (quoted < needed) return held('not-swappable', 'info', `quote ${quoted.toString()} under ${needed.toString()}`);
-    // The proxy's Vault is immutable, so a return into a Vault Chainflip moved away from is lost
+    // The proxy's Vault is immutable, so a return into a Vault Chainflip moved away from is stranded there
     const vault = await this.deps.limits.arbitrumVault();
     if (vault !== v.vault) return held('vault-changed', 'error', `Chainflip's Arbitrum vault is ${vault}, the proxy sends to ${v.vault}`);
     return { decision: { action: 'return', target: proxy, data: encodeCall('returnHome()'), amount }, blockedReason: null, dueAt: now };
+  }
+
+  // Pause every unretired factory whose Vault Chainflip moved away from, once both live sources name the same Vault with code on passes in a row
+  private async guardVault(): Promise<void> {
+    const seen = this.moved;
+    // A failure or any other answer below starts the count again
+    this.moved = undefined;
+    const { chain, limits, signer } = this.deps;
+    const vault = await limits.arbitrumVault();
+    const stranded = [...this.deployments.values()].filter((v) => v.vault !== vault);
+    const [first] = stranded;
+    if (first === undefined || vault === ZERO_ADDRESS) return;
+    // The encoder's Vault does not depend on which deployment asks
+    if ((await encoderRoute(this.current() ?? first, limits)).vault !== vault || (await chain.code(vault)) === '0x') return;
+    const passes = seen?.vault === vault ? seen.passes + 1 : 1;
+    // Both sources agreed, so a factory's own failure below keeps the count
+    this.moved = { vault, passes };
+    if (passes < VAULT_MOVED_PASSES) return;
+    for (const v of stranded) {
+      try {
+        await this.pauseStranded(v, vault, signer.address.toLowerCase());
+      } catch (error) {
+        this.deps.log('warn', `sale vault proxy factory ${v.factory} pause check failed: ${toMessage(error)}`);
+      }
+    }
+  }
+
+  // Pause one factory stranded by a confirmed Vault move, or alert why it stays open
+  private async pauseStranded(v: VerifiedSaleVaultProxy, vault: string, keeper: string): Promise<void> {
+    const { chain } = this.deps;
+    const [retired, paused, unpaused] = await Promise.all([chain.retired(v.factory), chain.returnsPaused(v.factory), chain.unpaused(v.factory)]);
+    if (retired || paused) return;
+    const moved = `Chainflip's Arbitrum vault moved from ${v.vault} to ${vault}`;
+    // A guardian's unpause stands whoever paused, the keeper only alerts
+    if (unpaused) {
+      this.alertOnce(`pause:${v.factory}`, `unpaused:${vault}`, 'error', `sale vault proxy factory ${v.factory} returns run again after the guardian's unpause: ${moved}, the keeper does not pause it again`);
+      return;
+    }
+    if (v.pauser !== keeper) {
+      this.alertOnce(`pause:${v.factory}`, `pauser:${vault}`, 'error', `sale vault proxy factory ${v.factory} returns stay open: ${moved}, and its pauser ${v.pauser} is not the keeper key, so its guardian must pause it`);
+      return;
+    }
+    const outcome = await this.send(v.chainId, v.factory, { action: 'pause', target: v.factory, data: encodePauseReturns(), amount: null });
+    if (outcome === 'sent') this.deps.log('error', `sale vault proxy factory ${v.factory} returns paused by the keeper: ${moved}, only its guardian unpauses`);
+    // Another call on the factory key, such as a skim, holds the slot until it settles
+    else this.deps.log('warn', `sale vault proxy factory ${v.factory} pause ${outcome}, sent again next pass: ${moved}`);
   }
 
   /** Send a claimer's signed USDC transfer, keyed by the claimer so one relay per claimer is in flight. */
@@ -951,6 +1041,15 @@ export class SaleVaultProxyKeeper {
       this.deps.log('warn', `sale vault proxy ${d.action} broadcast ${hash} failed: ${toMessage(error)}`);
     }
     return 'sent';
+  }
+}
+
+// A pause log's alert text after the factory's address
+function pausedBy(log: RawLog): string {
+  try {
+    return `returns home were paused by ${decodeAddress(log.data)}: every proxy holds its balance until the guardian unpauses, release is unaffected`;
+  } catch {
+    return 'logged an unreadable pause: every proxy holds its balance until the guardian unpauses, release is unaffected';
   }
 }
 

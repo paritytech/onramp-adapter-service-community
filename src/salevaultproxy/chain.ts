@@ -14,6 +14,8 @@ import {
   encodeDelivery,
   encodeHomeClaimerCall,
   encodeRetired,
+  encodeReturnsPaused,
+  encodeUnpaused,
   type ClaimerProxyState,
   type RawLog,
   type SaleDelivery,
@@ -125,8 +127,12 @@ export interface FactoryInfo {
   readonly implementation: string;
   readonly vault: string;
   readonly usdc: string;
-  /** The only caller of retire, lowercase. */
+  /** The only caller of retire and unpauseReturns, lowercase. */
   readonly guardian: string;
+  /** The other caller of pauseReturns, lowercase. */
+  readonly pauser: string;
+  /** Where the factory skims, lowercase. */
+  readonly treasury: string;
 }
 
 /** What the implementation reports, the immutables every proxy shares. */
@@ -208,6 +214,16 @@ export class SaleVaultProxyChain {
     return this.decoded(await this.call(factory, encodeRetired()), decodeBool, 'retired');
   }
 
+  /** Whether the factory's pauser or guardian paused every return home, which leaves release alone. */
+  async returnsPaused(factory: string): Promise<boolean> {
+    return this.decoded(await this.call(factory, encodeReturnsPaused()), decodeBool, 'returnsPaused');
+  }
+
+  /** Whether the factory's guardian ever unpaused returns, which the keeper never overrides. */
+  async unpaused(factory: string): Promise<boolean> {
+    return this.decoded(await this.call(factory, encodeUnpaused()), decodeBool, 'unpaused');
+  }
+
   /** One sale's record on its proxy, keyed by its exact terms. */
   async delivery(proxy: string, terms: Pick<SaleTerms, 'ref' | 'recipient' | 'committed'>): Promise<SaleDelivery> {
     return this.decoded(await this.call(proxy, encodeDelivery(terms)), decodeDelivery, 'delivery');
@@ -228,13 +244,15 @@ export class SaleVaultProxyChain {
   }
 
   async factoryInfo(factory: string): Promise<FactoryInfo> {
-    const [implementation, vault, usdc, guardian] = await Promise.all([
+    const [implementation, vault, usdc, guardian, pauser, treasury] = await Promise.all([
       this.address(factory, 'IMPLEMENTATION()'),
       this.address(factory, 'VAULT()'),
       this.address(factory, 'USDC()'),
       this.address(factory, 'GUARDIAN()'),
+      this.address(factory, 'PAUSER()'),
+      this.address(factory, 'TREASURY()'),
     ]);
-    return { implementation, vault, usdc, guardian };
+    return { implementation, vault, usdc, guardian, pauser, treasury };
   }
 
   /** The USDC token's decimals, so a committed amount converts by the token's own word. */

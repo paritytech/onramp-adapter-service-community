@@ -19,7 +19,7 @@ import {
   SaleVaultProxyChain,
   toMessage,
 } from '../../src/salevaultproxy/chain.js';
-import { CLAIMER, FACTORY, fakeNode, GUARDIAN, HOME, IMPL, PROXY, SEPOLIA, TREASURY, w } from './fakes.js';
+import { CLAIMER, FACTORY, fakeNode, GUARDIAN, HOME, IMPL, PAUSER, PROXY, SEPOLIA, TREASURY, w } from './fakes.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -122,8 +122,12 @@ describe('SaleVaultProxyChain reads', () => {
       vault: SEPOLIA.vault,
       usdc: SEPOLIA.usdc,
       guardian: GUARDIAN,
+      pauser: PAUSER,
+      treasury: TREASURY,
     });
     expect(await chain.retired(FACTORY)).toBe(false);
+    expect(await chain.returnsPaused(FACTORY)).toBe(false);
+    expect(await chain.unpaused(FACTORY)).toBe(false);
     expect(await chain.totalPending(FACTORY)).toBe(0n);
     expect(await chain.decimals(SEPOLIA.usdc)).toBe(6);
     expect(await chain.implementationInfo(IMPL)).toEqual({

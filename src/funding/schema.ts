@@ -23,7 +23,7 @@ import { DIRECTIONS } from '../rail.js';
 import { FUNDING_STATES } from './state.js';
 
 /** The current schema version. Bump with each migration added here. */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /** A migration: bring the previous version's rows to this version's shape. */
 export interface Migration {
@@ -270,6 +270,10 @@ const SALE_VAULT_PROXIES_INDEXES = [
   'CREATE INDEX IF NOT EXISTS sale_vault_proxies_activity ON sale_vault_proxies (chain_id, factory, last_activity_at)',
 ];
 
+// The keeper actions a call row may carry, shared by the table and the v10 -> v11 step
+const SALE_VAULT_PROXY_CALLS_ACTION_CONSTRAINT =
+  "CONSTRAINT sale_vault_proxy_calls_action_known CHECK (action IN ('deliver', 'expire', 'flush', 'deploy', 'return', 'release', 'skim', 'pause', 'relay'))";
+
 // Every keeper transaction, claimed before it is signed and settled from its receipt
 const SALE_VAULT_PROXY_CALLS_TABLE =
   'CREATE TABLE IF NOT EXISTS sale_vault_proxy_calls (' +
@@ -286,7 +290,7 @@ const SALE_VAULT_PROXY_CALLS_TABLE =
   ' error TEXT,' +
   ' created_at BIGINT NOT NULL,' +
   ' updated_at BIGINT NOT NULL,' +
-  " CONSTRAINT sale_vault_proxy_calls_action_known CHECK (action IN ('deliver', 'expire', 'flush', 'deploy', 'return', 'release', 'skim', 'relay'))," +
+  ` ${SALE_VAULT_PROXY_CALLS_ACTION_CONSTRAINT},` +
   " CONSTRAINT sale_vault_proxy_calls_status_known CHECK (status IN ('sending', 'sent', 'mined', 'reverted', 'dropped'))" +
   ')';
 
@@ -359,7 +363,7 @@ const SALE_VAULT_PROXY_SCHEMA = [
  *
  * A fresh database is created at `SCHEMA_VERSION` directly by `freshSchema()`, so this list is
  * what an existing database walks through, one step at a time. The next migration appends
- * `{ from: 10, to: 11, sql: [...] }` and bumps `SCHEMA_VERSION`. `store.ts` needs no change.
+ * `{ from: 11, to: 12, sql: [...] }` and bumps `SCHEMA_VERSION`. `store.ts` needs no change.
  *
  * This chain is one-way. A build expecting v1 refuses a v2 database: the version check is
  * `!==`, deliberately, because reading a shape you do not understand is worse than not starting.
@@ -637,6 +641,15 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE funding_requests ADD ${SELLER_CLAIMER_CONSTRAINT}`,
       SELLER_CLAIMER_INDEX,
       ...SALE_VAULT_PROXY_SCHEMA,
+    ],
+  },
+  {
+    from: 10,
+    to: 11,
+    // v10 -> v11: let a call row carry the keeper's pause action
+    sql: [
+      'ALTER TABLE sale_vault_proxy_calls DROP CONSTRAINT sale_vault_proxy_calls_action_known',
+      `ALTER TABLE sale_vault_proxy_calls ADD ${SALE_VAULT_PROXY_CALLS_ACTION_CONSTRAINT}`,
     ],
   },
 ];

@@ -13,6 +13,8 @@ export const HOME = '0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a
 export const PROXY = '0xfb63126b916e3bd2497702a0139ad2b344ac7536';
 export const CLAIMER = '0x3333333333333333333333333333333333333333';
 export const GUARDIAN = '0x5555555555555555555555555555555555555555';
+// The keeper key's address, which the configured factory names its pauser
+export const PAUSER = '0x9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f';
 // Perseverance's Arbitrum Vault, USDC and default broker
 export const SEPOLIA = {
   vault: '0x2bb150e6d4366a1bdbc4275d1f35892cd63f27e3',
@@ -58,7 +60,11 @@ export function deployedGetters(overrides: Record<string, string> = {}): Record<
     [`${FACTORY}:VAULT()`]: w(SEPOLIA.vault),
     [`${FACTORY}:USDC()`]: w(SEPOLIA.usdc),
     [`${FACTORY}:GUARDIAN()`]: w(GUARDIAN),
+    [`${FACTORY}:PAUSER()`]: w(PAUSER),
+    [`${FACTORY}:TREASURY()`]: w(TREASURY),
     [`${FACTORY}:retired()`]: w(0n),
+    [`${FACTORY}:returnsPaused()`]: w(0n),
+    [`${FACTORY}:unpaused()`]: w(0n),
     [`${FACTORY}:totalPending()`]: w(0n),
     [`${SEPOLIA.usdc}:decimals()`]: w(6n),
     [`${IMPL}:FACTORY()`]: w(FACTORY),

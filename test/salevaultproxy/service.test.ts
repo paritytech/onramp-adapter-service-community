@@ -49,7 +49,7 @@ const state = (overrides: Partial<ClaimerProxyState> = {}): ClaimerProxyState =>
   ...overrides,
 });
 
-const observed = (o: Partial<ProxyObservation> = {}): ProxyObservation => ({ deployed: true, state: state(), balance: 0n, pending: 0n, retired: false, ...o });
+const observed = (o: Partial<ProxyObservation> = {}): ProxyObservation => ({ deployed: true, state: state(), balance: 0n, pending: 0n, retired: false, returnsPaused: false, ...o });
 
 function serviceWith(opts: {
   observation?: ProxyObservation;
@@ -227,6 +227,17 @@ describe('SaleVaultProxyService.status', () => {
     });
   });
 
+  it('answers a returnable balance as held by the pause, a due release too, a flush as not blocked', async () => {
+    const paused = (o: Partial<ProxyObservation>) => serviceWith({ observation: observed({ returnsPaused: true, ...o }) }).service.status(ALICE, ID);
+    expect(await paused({ state: state({ attempts: 1, nextReturnAt: BigInt(NOW / 1000 + 60), balance: 5_000_000n }), balance: 5_000_000n })).toMatchObject({
+      returnable: true,
+      blockedReason: 'returns-paused',
+    });
+    expect(await paused({ deployed: false, state: undefined, pending: 7n })).toMatchObject({ returnable: true, blockedReason: null });
+    expect(await paused({ state: state({ balance: 5_000_000n, releaseAt: 1n, releasable: 5_000_000n }), balance: 5_000_000n })).toMatchObject({ blockedReason: 'returns-paused' });
+    expect(await paused({ state: state({ balance: 500_000n }), balance: 500_000n })).toMatchObject({ blockedReason: 'below-minimum' });
+  });
+
   it('treats pending as returnable with nothing blocking', async () => {
     const { service } = serviceWith({ observation: observed({ deployed: false, state: undefined, pending: 7n }) });
     expect(await service.status(ALICE, ID)).toMatchObject({ pending: '7', returnable: true, blockedReason: null });
@@ -249,7 +260,9 @@ describe('SaleVaultProxyService.status', () => {
       updated_at: NOW + 5,
     };
     expect((await serviceWith({ latest: call }).service.status(ALICE, ID))?.call).toEqual({ action: 'deliver', status: 'mined', txHash: '0xabc', at: NOW + 5 });
-    expect((await serviceWith({ latest: { ...call, action: 'skim' } }).service.status(ALICE, ID))?.call).toBeNull();
+    for (const action of ['skim', 'pause', 'relay'] as const) {
+      expect((await serviceWith({ latest: { ...call, action } }).service.status(ALICE, ID))?.call).toBeNull();
+    }
   });
 
   it('answers undefined for an unknown id or another caller', async () => {

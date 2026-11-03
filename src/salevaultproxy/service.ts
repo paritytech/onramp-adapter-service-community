@@ -3,7 +3,7 @@
 import type { Subject } from '../auth.js';
 import { reject, saleVaultProxyUnavailable } from '../contract.js';
 import type { FundingStore, PayoutRow, ProxyCallAction, SaleVaultProxyRow } from '../funding/store.js';
-import type { SaleTerms } from './abi.js';
+import { NO_RELEASE_TIME, type SaleTerms } from './abi.js';
 import { ChainUnavailableError } from './chain.js';
 import { checksum } from './derive.js';
 import { saleTerms, type BlockedReason, type Evaluation, type SaleObservation, type SaleVaultProxyKeeper } from './keeper.js';
@@ -64,7 +64,7 @@ export interface OfframpSaleDto {
   flushedToClaimer: PayoutDto[];
   blockedReason: BlockedReason | null;
   call: {
-    action: Exclude<ProxyCallAction, 'skim' | 'relay'>;
+    action: Exclude<ProxyCallAction, 'skim' | 'pause' | 'relay'>;
     status: 'sending' | 'sent' | 'mined' | 'reverted' | 'dropped';
     txHash: string | null;
     at: number;
@@ -78,9 +78,6 @@ export type SaleVaultProxyServiceStore = Pick<FundingStore, 'byAlias' | 'readSal
 export type SaleVaultProxyServiceKeeper = Pick<SaleVaultProxyKeeper, 'trigger' | 'hold' | 'observe' | 'observeSale' | 'claimerBalance' | 'verified' | 'verifiedFor'>;
 
 const STATUS_NAMES = ['none', 'paid', 'held'] as const;
-
-// The contract's releaseAt for a balance with no release time yet
-const NO_RELEASE_TIME = 2n ** 256n - 1n;
 
 /** The refusal for a chain read that failed, shared with the relay. */
 export const chainUnavailable = (detail: string) =>
@@ -147,7 +144,7 @@ export class SaleVaultProxyService {
     }
     const [latest, payouts] = await Promise.all([this.store.readLatestProxyCall(row.chain_id, row.proxy), this.store.readPayouts(row)]);
     const call =
-      latest === undefined || latest.action === 'skim' || latest.action === 'relay'
+      latest === undefined || latest.action === 'skim' || latest.action === 'pause' || latest.action === 'relay'
         ? null
         : { action: latest.action, status: latest.status, txHash: latest.tx_hash, at: latest.updated_at };
     return toDto(row, v, evaluation, sale, terms, this.clock(), call, payouts, claimerBalance);
@@ -212,6 +209,8 @@ function toDto(
 function staticBlock(o: Evaluation['observation'], returnable: boolean, waiting: bigint, now: number): BlockedReason | null {
   // A balance the contract releases now is not blocked, the keeper sends it to the claimer
   if (!returnable) return waiting > 0n && (o.state?.releasable ?? 0n) === 0n ? 'below-minimum' : null;
+  // A flush still runs while returns are paused, a due release runs as the return stays held
+  if (o.pending === 0n && o.returnsPaused) return 'returns-paused';
   if (o.pending === 0n && o.state !== undefined && BigInt(Math.floor(now / 1000)) < o.state.nextReturnAt) return 'not-due';
   return null;
 }

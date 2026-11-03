@@ -50,6 +50,7 @@ export const SALE_VAULT_PROXY: VerifiedSaleVaultProxy = {
   releaseAttempts: 7n,
   staleDelay: 5_184_000n,
   guardian: '0x5555555555555555555555555555555555555555',
+  pauser: '0x9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f',
 };
 
 /** ALICE's home and claimer under `SALE_VAULT_PROXY`, and the EIP-55 proxy they predict. */

@@ -2,13 +2,14 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { ChainUnavailableError, RpcCallError, SaleVaultProxyChain } from '../../src/salevaultproxy/chain.js';
 import {
+  encoderRoute,
   SaleVaultProxyMisconfigured,
   verifyDeployment,
   verifyWindow,
   type ChainflipSource,
   type SaleVaultProxyDeploymentConfig,
 } from '../../src/salevaultproxy/verify.js';
-import { chainflipOf, deployedGetters, FACTORY, fakeNode, GUARDIAN, IMPL, SEPOLIA, w } from './fakes.js';
+import { chainflipOf, deployedGetters, FACTORY, fakeNode, GUARDIAN, IMPL, PAUSER, SEPOLIA, w } from './fakes.js';
 
 const CFG: SaleVaultProxyDeploymentConfig = {
   chainId: 421614,
@@ -17,8 +18,8 @@ const CFG: SaleVaultProxyDeploymentConfig = {
   usdc: SEPOLIA.usdc,
 };
 
-const verify = (node: Parameters<typeof fakeNode>[0], cfg = CFG, chainflip: ChainflipSource = chainflipOf()) =>
-  verifyDeployment(cfg, new SaleVaultProxyChain(fakeNode(node).rpc), chainflip);
+const verify = (node: Parameters<typeof fakeNode>[0], cfg = CFG, chainflip: ChainflipSource = chainflipOf(), pauser?: string) =>
+  verifyDeployment(cfg, new SaleVaultProxyChain(fakeNode(node).rpc), chainflip, pauser);
 
 describe('verifyDeployment', () => {
   it('returns the verified deployment with its immutables', async () => {
@@ -42,18 +43,42 @@ describe('verifyDeployment', () => {
       releaseAttempts: 7n,
       staleDelay: 5_184_000n,
       guardian: GUARDIAN,
+      pauser: PAUSER,
     });
+  });
+
+  it('checks the PAUSER against the keeper key when given, and never lets it be the guardian', async () => {
+    const keeper = PAUSER.toUpperCase().replace('0X', '0x');
+    await expect(verify({}, CFG, chainflipOf(), keeper)).resolves.toMatchObject({ pauser: PAUSER });
+    const other = verify({}, CFG, chainflipOf(), `0x${'66'.repeat(20)}`);
+    await expect(other).rejects.toBeInstanceOf(SaleVaultProxyMisconfigured);
+    await expect(other).rejects.toThrow(`factory pauser is ${PAUSER}, the keeper key is 0x${'66'.repeat(20)}`);
+    // A retired factory is verified without a keeper key, its pauser may be a key since rotated
+    await expect(verify({ getters: deployedGetters({ [`${FACTORY}:PAUSER()`]: w('66'.repeat(20)) }) })).resolves.toMatchObject({ pauser: `0x${'66'.repeat(20)}` });
+    const guardian = verify({ getters: deployedGetters({ [`${FACTORY}:PAUSER()`]: w(GUARDIAN) }) });
+    await expect(guardian).rejects.toBeInstanceOf(SaleVaultProxyMisconfigured);
+    await expect(guardian).rejects.toThrow(`factory pauser ${GUARDIAN} is its guardian`);
+    // The configured factory never skims to the hot keeper key
+    const treasury = verify({ getters: deployedGetters({ [`${FACTORY}:TREASURY()`]: w(PAUSER) }) }, CFG, chainflipOf(), PAUSER);
+    await expect(treasury).rejects.toBeInstanceOf(SaleVaultProxyMisconfigured);
+    await expect(treasury).rejects.toThrow(`factory treasury ${PAUSER} is the keeper key`);
+    // A retired factory is verified without a keeper key, so its treasury is not checked against it
+    await expect(verify({ getters: deployedGetters({ [`${FACTORY}:TREASURY()`]: w(PAUSER) }) })).resolves.toMatchObject({ pauser: PAUSER });
   });
 
   it('refuses a home-only factory or implementation, whose claimer-bound getters revert, as misconfigured', async () => {
     const homeOnly = (drop: string) => ({ getters: Object.fromEntries(Object.entries(deployedGetters()).filter(([key]) => key !== drop)) });
-    for (const [drop, what] of [
-      [`${FACTORY}:GUARDIAN()`, `factory ${FACTORY}`],
-      [`${IMPL}:RELEASE_DELAY()`, `implementation ${IMPL}`],
+    const prePause = 'a home-only factory or one built before the returns pause (PAUSER, unpaused) is not served';
+    for (const [drop, what, why] of [
+      [`${FACTORY}:GUARDIAN()`, `factory ${FACTORY}`, prePause],
+      [`${FACTORY}:PAUSER()`, `factory ${FACTORY}`, prePause],
+      // A factory built before unpaused() existed is not served either
+      [`${FACTORY}:unpaused()`, `factory ${FACTORY}`, prePause],
+      [`${IMPL}:RELEASE_DELAY()`, `implementation ${IMPL}`, 'a home-only deployment is not served'],
     ] as const) {
       const result = verify(homeOnly(drop));
       await expect(result).rejects.toBeInstanceOf(SaleVaultProxyMisconfigured);
-      await expect(result).rejects.toThrow(`${what} does not answer the claimer-bound ABI`);
+      await expect(result).rejects.toThrow(`${what} does not answer the claimer-bound ABI, ${why}`);
     }
     // A node error that is not a revert stays retryable
     const flaky = verify({ getters: {}, methods: { eth_call: () => Promise.reject(new RpcCallError('rpc eth_call error: rate limited', -32005)) } });
@@ -118,7 +143,11 @@ describe('verifyWindow', () => {
     const chainflip = chainflipOf();
     const returnRoute = vi.spyOn(chainflip, 'returnRoute');
     await window(chainflip);
-    expect(returnRoute).toHaveBeenCalledWith({ amount: 1_000_000n, refund: FACTORY, home: `0x${'0'.repeat(24)}${FACTORY.slice(2)}`, retryBlocks: 100 });
+    const request = { amount: 1_000_000n, refund: FACTORY, home: `0x${'0'.repeat(24)}${FACTORY.slice(2)}`, retryBlocks: 100 };
+    expect(returnRoute).toHaveBeenCalledWith(request);
+    // The moved-Vault guard reads the encoder with the same request
+    await expect(encoderRoute(await verify({}), chainflip)).resolves.toMatchObject({ vault: SEPOLIA.vault });
+    expect(returnRoute).toHaveBeenLastCalledWith(request);
   });
 
   it('surfaces a Chainflip outage as retryable', async () => {

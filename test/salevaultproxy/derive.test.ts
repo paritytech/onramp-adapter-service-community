@@ -16,11 +16,11 @@ describe('predictSaleVaultProxy', () => {
   });
 
   it('matches the address a deployed factory.predict returned in the contract vectors', () => {
-    const factory = '0xC140bBe06848EeA22BACc5f02D4D1A69767d33c5';
-    const implementation = '0xc3813cd0fC2e34A56dd030c6e9362AA7D1428344';
+    const factory = '0x70cb8b72CCaa962E848fDcc6d0bAe223fAEAc25b';
+    const implementation = '0xb404f988c6b2d4aAc2361F9209f92d1099a495E5';
     const home = '0x0a528ed24585e375c843bdbaa82a92ea3320936295ba3eacac9bc93acce2a575';
     const claimer = '0x90D121876b4f93DA56F039139fdF37a96cde00c3';
-    expect(checksum(predictSaleVaultProxy(factory, implementation, home, claimer))).toBe('0xad46C51Afe8817c4127D08f6Ff78dEF7E6fb83a9');
+    expect(checksum(predictSaleVaultProxy(factory, implementation, home, claimer))).toBe('0x08b93a45040C01f66b4c488031AE932ADb25C21b');
   });
 
   it('gives each claimer its own address for one home', () => {
