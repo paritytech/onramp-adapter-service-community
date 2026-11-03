@@ -139,6 +139,19 @@ const secretSource = z.discriminatedUnion('mode', [
 /** An asset by this service's own name for it; see `meld/catalog.ts`. */
 const assetId = z.enum(ASSET_IDS);
 
+/** Refuses a list that names one asset twice. */
+const uniqueAssets =
+  (label: string) =>
+  (entries: readonly { asset: string }[], ctx: z.RefinementCtx): void => {
+    const seen = new Set<string>();
+    entries.forEach((entry, index) => {
+      if (seen.has(entry.asset)) {
+        ctx.addIssue({ code: 'custom', path: [index, 'asset'], message: `Duplicate ${label} "${entry.asset}".` });
+      }
+      seen.add(entry.asset);
+    });
+  };
+
 /**
  * Meld's current code for an asset. Uppercase letters, digits and `_`, which is every code Meld has
  * shipped; anything else is a typo that would otherwise reach a locked checkout field.
@@ -582,18 +595,38 @@ const configSchema = z
           .array(z.object({ asset: assetId }).strict())
           .min(1)
           .default([{ asset: 'dot@assethub' }])
-          .superRefine((lanes, ctx) => {
-            const seen = new Set<string>();
-            lanes.forEach((lane, index) => {
-              if (seen.has(lane.asset)) {
-                ctx.addIssue({ code: 'custom', path: [index, 'asset'], message: `Duplicate offramp lane "${lane.asset}".` });
-              }
-              seen.add(lane.asset);
-            });
-          }),
+          .superRefine(uniqueAssets('offramp lane')),
       })
       .strict()
       // `.prefault({})` like `cors`/`rate_limit`: an absent block is the documented defaults.
+      .prefault({}),
+
+    /** Provider probes behind `provider_health`. Runs only with `supported`, whose corridors it probes. */
+    health: z
+      .object({
+        enabled: z.boolean().default(true),
+        interval_ms: z.number().int().min(60_000).max(86_400_000).default(600_000),
+        confirm_delay_ms: z.number().int().min(0).max(300_000).default(5_000),
+        failures_to_down: z.number().int().min(1).max(10).default(2),
+        throttle_pause_ms: z.number().int().min(60_000).max(86_400_000).default(900_000),
+        max_probes_per_hour: z.number().int().min(1).max(10_000).default(120),
+        preferred_countries: z.array(z.string().regex(/^[A-Z]{2}$/, 'An ISO 3166-1 alpha-2 code.')).default(['US', 'GB']),
+        sell_amounts: z
+          .array(
+            z
+              .object({
+                asset: assetId,
+                amount: z
+                  .string()
+                  .regex(/^\d{1,12}(\.\d{1,18})?$/, 'A plain decimal amount.')
+                  .refine((amount) => /[1-9]/.test(amount), 'Must be above zero.'),
+              })
+              .strict(),
+          )
+          .default([])
+          .superRefine(uniqueAssets('sell amount')),
+      })
+      .strict()
       .prefault({}),
   })
   .strict()
@@ -947,6 +980,9 @@ const configSchema = z
     cfg.supported.offramp_lanes.forEach((lane, i) => {
       named(lane.asset, ['supported', 'offramp_lanes', i, 'asset']);
     });
+    cfg.health.sell_amounts.forEach((entry, i) => {
+      named(entry.asset, ['health', 'sell_amounts', i, 'asset']);
+    });
   })
   // Resolve every asset reference to the code it is sent under, once, so nothing downstream reads
   // `assets` itself. Runs only on a config the refinements above passed, so every lookup hits.
@@ -967,6 +1003,10 @@ const configSchema = z
           code: codeOf(lane.asset),
           chain: ASSETS[lane.asset].chain,
         })),
+      },
+      health: {
+        ...cfg.health,
+        sell_amounts: cfg.health.sell_amounts.map((entry) => ({ ...entry, code: codeOf(entry.asset) })),
       },
     };
   });

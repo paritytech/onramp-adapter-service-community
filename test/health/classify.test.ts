@@ -37,6 +37,14 @@ describe('classifyError', () => {
     expect(classifyError('BANXA', new MeldHttpError(503))).toEqual({ outcome: 'throttled', code: 'HTTP_503' });
   });
 
+  it('keeps Meld\'s request ID on a down answer', () => {
+    expect(classifyError('BANXA', new MeldHttpError(400, 'INCOMPATIBLE_REQUEST', '[BANXA] x', undefined, 'req-1'))).toEqual({
+      outcome: 'down',
+      code: 'INCOMPATIBLE_REQUEST',
+      requestId: 'req-1',
+    });
+  });
+
   it('says nothing about the provider when Meld could not be reached', () => {
     expect(classifyError('BANXA', upstreamUnavailable('socket hang up'))).toEqual({ outcome: 'unknown', code: 'UNREACHABLE' });
     expect(classifyError('BANXA', new Error('boom'))).toEqual({ outcome: 'unknown', code: 'UNREACHABLE' });

@@ -471,6 +471,14 @@ describe('createWidgetSession', () => {
     expect(error.detail).toBe('No Valid Quote Combinations Found.');
   });
 
+  it('carries Meld\'s request ID from the error body', async () => {
+    stub(400, { code: 'INCOMPATIBLE_REQUEST', message: '[BANXA] Incompatible request', requestId: 'req-1' });
+    const error = (await client()
+      .quote(probe())
+      .catch((e: unknown) => e)) as MeldHttpError;
+    expect(error.requestId).toBe('req-1');
+  });
+
   it('leaves code, detail and providerDetail undefined when the error body carries none', async () => {
     stub(400, { something: 'unrelated' });
     const error = (await client()
@@ -565,6 +573,16 @@ describe('createWidgetSession', () => {
 });
 
 describe('quote', () => {
+  it('restricts the offers to the named providers, in both directions', async () => {
+    const buy = stub(200, { quotes: [] });
+    await client().quote({ ...probe(), serviceProviders: ['BANXA'] });
+    expect(sentBody(buy)).toMatchObject({ serviceProviders: ['BANXA'] });
+
+    const sell = stub(200, { quotes: [] });
+    await client().quoteSell({ ...sellProbe(), serviceProviders: ['TRANSAK'] });
+    expect(sentBody(sell)).toMatchObject({ serviceProviders: ['TRANSAK'] });
+  });
+
   it('sends every field Meld needs to price the offer', async () => {
     const fetchMock = stub(200, { quotes: [] });
     await client().quote(probe());

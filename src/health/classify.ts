@@ -6,7 +6,7 @@ import { MeldHttpError } from '../meld/client.js';
  */
 export type ProbeResult =
   | { outcome: 'up' }
-  | { outcome: 'down'; code: string }
+  | { outcome: 'down'; code: string; requestId?: string }
   | { outcome: 'unknown'; code: string }
   | { outcome: 'throttled'; code: string };
 
@@ -39,6 +39,8 @@ export function classifyError(provider: string, error: unknown): ProbeResult {
   if (error.status === 429 || (error.status === 503 && error.code === undefined)) return { outcome: 'throttled', code };
   if (error.code === undefined || AMOUNT_CODES.has(error.code)) return { outcome: 'unknown', code };
   // Meld prefixes a sub-provider's failure with its name, e.g. "[BANXA] Incompatible request".
-  if (PROVIDER_CODES.has(error.code) || error.detail?.startsWith(`[${provider}]`) === true) return { outcome: 'down', code };
+  if (PROVIDER_CODES.has(error.code) || error.detail?.startsWith(`[${provider}]`) === true) {
+    return { outcome: 'down', code, ...(error.requestId === undefined ? {} : { requestId: error.requestId }) };
+  }
   return { outcome: 'unknown', code };
 }

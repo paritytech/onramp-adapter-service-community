@@ -220,6 +220,18 @@ supported:
     # - { asset: usdc@arbitrum }
     # - { asset: usdc@solana }
 
+# Provider probes behind `provider_health`: one Meld quote per provider and direction, pinned to that
+# provider, in two fiat currencies. A provider Meld lists but cannot price is marked down. Runs only
+# while `supported.enabled` is true, because the probes are chosen from its corridors.
+health:
+  enabled: true
+  interval_ms: 600000
+  # Countries probed first, in this order.
+  preferred_countries: [US, GB]
+  # The crypto a sell probe commits, per asset, e.g. `- { asset: dot@assethub, amount: "15" }`.
+  # A sell asset without an amount is not probed.
+  sell_amounts: []
+
 # The background worker that advances in-flight funding requests.
 worker:
   interval_ms: 15000

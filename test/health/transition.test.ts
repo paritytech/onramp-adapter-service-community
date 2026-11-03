@@ -33,6 +33,10 @@ describe('nextHealth', () => {
     expect(step(once, [DOWN, DOWN], 2)).toMatchObject({ state: 'down', failures: 2, last_failed_at: 2 });
   });
 
+  it('records the request ID of the failure it counted', () => {
+    expect(step(undefined, [{ ...DOWN, requestId: 'req-1' }, DOWN], 1)).toMatchObject({ last_request_id: 'req-1' });
+  });
+
   it('keeps a down provider down while it keeps failing', () => {
     const down = step(step(undefined, [DOWN, DOWN], 1), [DOWN, DOWN], 2);
     expect(step(down, [DOWN, DOWN], 3)).toMatchObject({ state: 'down', failures: 3 });

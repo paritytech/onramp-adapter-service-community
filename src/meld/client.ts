@@ -147,6 +147,8 @@ export class MeldHttpError extends Error {
     readonly code?: string,
     readonly detail?: string,
     readonly providerDetail?: string,
+    /** Meld's `requestId`, the reference its support asks for. */
+    readonly requestId?: string,
   ) {
     super(`Meld answered HTTP ${String(status)}.`);
     this.name = 'MeldHttpError';
@@ -203,6 +205,9 @@ const quoteEnvelope = z.object({ quotes: z.array(z.unknown()).nullish() }).loose
 
 type MeldQuote = z.infer<typeof quoteSchema>;
 
+const providerFilter = ({ serviceProviders }: { serviceProviders?: readonly string[] }) =>
+  serviceProviders === undefined ? {} : { serviceProviders };
+
 /** What Meld's quote endpoint is asked for, on a buy. */
 export interface QuoteParams {
   countryCode: string;
@@ -212,6 +217,8 @@ export interface QuoteParams {
    *  the crypto out. Verified against api-sb.meld.io, which rejects a null `sourceAmount`. */
   sourceAmount: string;
   paymentMethodType: string;
+  /** Restricts the offers to these providers. */
+  serviceProviders?: readonly string[];
 }
 
 /**
@@ -243,6 +250,8 @@ export interface SellQuoteParams {
    */
   cryptoAmount: string;
   paymentMethodType: string;
+  /** Restricts the offers to these providers. */
+  serviceProviders?: readonly string[];
 }
 
 // --- session ----------------------------------------------------------------
@@ -471,6 +480,7 @@ export class MeldClient {
       destinationCurrencyCode: params.destinationCurrencyCode,
       sourceAmount: params.sourceAmount,
       paymentMethodType: params.paymentMethodType,
+      ...providerFilter(params),
     });
   }
 
@@ -500,6 +510,7 @@ export class MeldClient {
       destinationCurrencyCode: params.fiatCurrencyCode,
       sourceAmount: params.cryptoAmount,
       paymentMethodType: params.paymentMethodType,
+      ...providerFilter(params),
     });
   }
 
@@ -511,7 +522,7 @@ export class MeldClient {
    * this line. Duplicating the partial-offer handling per direction would give the sell path its
    * own copy of the rule that one bad provider must not discard the others.
    */
-  private async postQuote(request: Record<string, string>): Promise<MeldQuote[]> {
+  private async postQuote(request: Record<string, string | readonly string[]>): Promise<MeldQuote[]> {
     const body = await this.send('POST', QUOTE, request);
 
     const offers = this.read(quoteEnvelope, body, 'quote').quotes ?? [];
@@ -834,16 +845,19 @@ export class MeldClient {
       let code: string | undefined;
       let detail: string | undefined;
       let providerDetail: string | undefined;
+      let requestId: string | undefined;
       try {
         const body = (await response.json()) as {
           error?: unknown;
           code?: unknown;
           message?: unknown;
           serviceProviderDetails?: unknown;
+          requestId?: unknown;
         };
         if (typeof body.error === 'string') code = body.error;
         else if (typeof body.code === 'string') code = body.code;
         if (typeof body.message === 'string') detail = body.message;
+        if (typeof body.requestId === 'string') requestId = body.requestId;
         const provider: unknown = body.serviceProviderDetails;
         if (typeof provider === 'object' && provider !== null) {
           const nested = (provider as { message?: unknown }).message;
@@ -852,7 +866,7 @@ export class MeldClient {
       } catch {
         // no JSON body; the status carries the signal on its own
       }
-      throw new MeldHttpError(response.status, code, detail, providerDetail);
+      throw new MeldHttpError(response.status, code, detail, providerDetail, requestId);
     }
 
     try {

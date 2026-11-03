@@ -41,7 +41,7 @@ export function nextHealth(
     failures,
     last_failed_at: now,
     last_code: first.code,
-    last_request_id: null,
+    last_request_id: first.requestId ?? null,
     updated_at: now,
   };
 }

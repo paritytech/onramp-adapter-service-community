@@ -12,11 +12,13 @@ import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 
 import { hkdfSync } from 'node:crypto';
 
+import { serial } from './background.js';
 import { loadConfig, type Config } from './config.js';
 import { ChainflipRail } from './chainflip/rail.js';
 import { FundingStore } from './funding/store.js';
 import { startWorker, type RailObservation } from './funding/worker.js';
 import { startSupportedRefresh, type RefreshJob } from './supported/refresh.js';
+import { pinnedQuote, startProviderProbes } from './health/probe.js';
 import { MeldClient, MeldHttpError } from './meld/client.js';
 import { ASSET_IDS, ASSETS, AssetCatalog, installCatalog, type AssetId } from './meld/catalog.js';
 import { MeldDiscovery } from './meld/discovery.js';
@@ -154,6 +156,7 @@ export async function start(
   let app: Awaited<ReturnType<typeof buildServer>> | undefined;
   let worker: ReturnType<typeof startWorker> | undefined;
   let supported: ReturnType<typeof startSupportedRefresh> | undefined;
+  let probes: ReturnType<typeof startProviderProbes> | undefined;
   // The worker starts only after this and after the port opens. Constructed earlier, a boot that
   // then failed on a bad credential would leave a loop advancing durable funding rows with no
   // handle to stop it, because `start` rejects and the caller never gets a `close`.
@@ -261,11 +264,14 @@ export async function start(
       : undefined;
 
     // The supported-corridors refresh, started last like the worker so a failed boot leaves no unstoppable loop.
+    // The provider probes read its corridors and share its lock, so the two never call Meld at once.
+    const jobs = refreshJobs(cfg.supported.offramp_lanes, cfg.assets);
+    const exclusive = serial();
     supported = cfg.supported.enabled
       ? startSupportedRefresh(
           discovery,
           funding,
-          refreshJobs(cfg.supported.offramp_lanes, cfg.assets),
+          jobs,
           {
             catalogMs: cfg.supported.catalog_interval_ms,
             routesMs: cfg.supported.routes_interval_ms,
@@ -275,8 +281,37 @@ export async function start(
           (message) => {
             server.log.warn(message);
           },
+          exclusive,
         )
       : undefined;
+    probes =
+      cfg.supported.enabled && cfg.health.enabled
+        ? startProviderProbes(
+            {
+              store: funding,
+              quote: pinnedQuote(meld),
+              jobs,
+              log: {
+                info: (message) => {
+                  server.log.info(message);
+                },
+                warn: (message) => {
+                  server.log.warn(message);
+                },
+              },
+            },
+            {
+              intervalMs: cfg.health.interval_ms,
+              confirmDelayMs: cfg.health.confirm_delay_ms,
+              failuresToDown: cfg.health.failures_to_down,
+              throttlePauseMs: cfg.health.throttle_pause_ms,
+              maxProbesPerHour: cfg.health.max_probes_per_hour,
+              preferredCountries: cfg.health.preferred_countries,
+              sellAmounts: new Map(cfg.health.sell_amounts.map(({ code, amount }) => [code, amount])),
+            },
+            exclusive,
+          )
+        : undefined;
   } catch (error) {
     // One guard, spanning everything between the store opening and the handle being returned.
     //
@@ -290,6 +325,7 @@ export async function start(
     // Stop the loops too: they are the last things started so this is defensive today, but it keeps
     // the cleanup complete if a throwing step is ever added after them.
     await worker?.stop();
+    await probes?.stop();
     await supported?.stop();
     await app?.close();
     await funding.close();
@@ -305,6 +341,7 @@ export async function start(
       // one stopped. Draining the pool also returns its CloudSQL connections promptly instead of
       // leaving the server to time them out.
       await worker?.stop();
+      await probes?.stop();
       await supported?.stop();
       await app.close();
       await funding.close();

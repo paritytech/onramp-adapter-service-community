@@ -96,5 +96,11 @@ data:
         "routes_interval_ms": {{ int .Values.supported.routes_interval_ms }},
         "sell_routes_interval_ms": {{ int .Values.supported.sell_routes_interval_ms }},
         "offramp_lanes": {{ .Values.supported.offramp_lanes | toJson }}
+      },
+      "health": {
+        "enabled": {{ .Values.health.enabled }},
+        "interval_ms": {{ int .Values.health.interval_ms }},
+        "preferred_countries": {{ .Values.health.preferred_countries | toJson }},
+        "sell_amounts": {{ .Values.health.sell_amounts | toJson }}
       }
     }

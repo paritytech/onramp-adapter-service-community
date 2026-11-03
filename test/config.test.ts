@@ -954,6 +954,50 @@ describe('parseConfig', () => {
     });
   });
 
+  describe('health', () => {
+    const health = (value: unknown) => () => parseConfig(rawConfig({ health: value }));
+
+    it('probes every ten minutes by default, with no sell amounts', () => {
+      expect(parseConfig(rawConfig()).health).toEqual({
+        enabled: true,
+        interval_ms: 600_000,
+        confirm_delay_ms: 5_000,
+        failures_to_down: 2,
+        throttle_pause_ms: 900_000,
+        max_probes_per_hour: 120,
+        preferred_countries: ['US', 'GB'],
+        sell_amounts: [],
+      });
+    });
+
+    it('resolves each sell amount\'s asset to its Meld code', () => {
+      expect(health({ sell_amounts: [{ asset: 'dot@assethub', amount: '15' }] })().health.sell_amounts).toEqual([
+        { asset: 'dot@assethub', amount: '15', code: 'DOT' },
+      ]);
+    });
+
+    it('refuses a malformed, zero or duplicated sell amount and a country that is not a code', () => {
+      expect(health({ sell_amounts: [{ asset: 'dot@assethub', amount: '1e3' }] })).toThrow(/plain decimal/);
+      expect(health({ sell_amounts: [{ asset: 'dot@assethub', amount: '0.00' }] })).toThrow(/above zero/);
+      expect(
+        health({
+          sell_amounts: [
+            { asset: 'dot@assethub', amount: '15' },
+            { asset: 'dot@assethub', amount: '20' },
+          ],
+        }),
+      ).toThrow(/Duplicate sell amount "dot@assethub"/);
+      expect(health({ preferred_countries: ['usa'] })).toThrow(/alpha-2/);
+    });
+
+    it('refuses a sell amount for an asset `assets` does not name', () => {
+      const cfg = rawConfig({ health: { sell_amounts: [{ asset: 'usdc@solana', amount: '50' }] } });
+      const assets = { ...(cfg['assets'] as Record<string, string>) };
+      delete assets['usdc@solana'];
+      expect(() => parseConfig({ ...cfg, assets })).toThrow(/"usdc@solana" has no Meld code/);
+    });
+  });
+
   it('gives each Meld endpoint its own cache lifetime, on the scale its data moves', () => {
     const cfg = parseConfig(rawConfig());
     expect(cfg.meld.countries_cache_ttl_ms).toBe(6 * 3_600_000);
