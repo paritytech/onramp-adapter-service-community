@@ -56,7 +56,7 @@ function harness(quote: PinnedQuote, options: Partial<ProbeOptions> = {}) {
       rows.filter((r) => r.destination_currency_code === code && r.direction === direction),
     readProviderHealth: async () => [...health.values()],
     writeProviderHealth: async (row: ProviderHealthRow) => {
-      health.set(`${row.provider}|${row.direction}`, row);
+      health.set(`${row.provider}|${row.direction}|${row.scope}`, row);
     },
   };
   const prober = createProber(
@@ -64,12 +64,16 @@ function harness(quote: PinnedQuote, options: Partial<ProbeOptions> = {}) {
     { ...OPTIONS, ...options },
   );
   return {
+    prober,
     round: () => prober.round(new AbortController().signal),
+    check: (provider: string, country: string) =>
+      prober.check([{ provider, direction: 'buy', scope: country }], new AbortController().signal),
     advance: (ms: number) => {
       now += ms;
     },
-    state: (provider: string) => health.get(`${provider}|buy`),
-    calls: (provider: string) => spy.mock.calls.filter(([t]) => t.provider === provider).length,
+    state: (provider: string, scope = 'global') => health.get(`${provider}|buy|${scope}`),
+    calls: (provider: string, country?: string) =>
+      spy.mock.calls.filter(([t]) => t.provider === provider && (country === undefined || t.country === country)).length,
     spy,
     log,
   };
@@ -107,6 +111,14 @@ describe('a probe round', () => {
 
     expect(h.state('BANXA')).toMatchObject({ state: 'up', failures: 0, last_code: 'INCOMPATIBLE_REQUEST' });
     expect(lines(h.log.info)).toContain('provider BANXA buy is up again in US/USD, GB/GBP');
+  });
+
+  it('sends nothing once its signal is aborted', async () => {
+    const h = harness(banxaDown);
+    const controller = new AbortController();
+    controller.abort();
+    await h.prober.round(controller.signal);
+    expect(h.spy).not.toHaveBeenCalled();
   });
 
   it('changes nothing when Meld cannot be reached', async () => {
@@ -164,7 +176,148 @@ describe('a probe round', () => {
   });
 });
 
+describe('a country check', () => {
+  /** Banxa fails in Germany only. */
+  const downInGermany: PinnedQuote = async (target) => {
+    if (target.provider === 'BANXA' && target.country === 'DE') throw BANXA_DOWN;
+    return [{ serviceProvider: target.provider }];
+  };
+
+  it('marks a provider down in that country only', async () => {
+    const h = harness(downInGermany);
+    await h.check('BANXA', 'DE');
+
+    expect(h.state('BANXA', 'DE')).toMatchObject({ state: 'down', failures: 2 });
+    expect(h.state('BANXA')).toMatchObject({ state: 'up', failures: 0 });
+    expect(h.calls('BANXA', 'DE')).toBe(2);
+    expect(lines(h.log.warn)).toEqual([
+      'provider BANXA buy in DE is down after 2 failed probe rounds in DE/EUR: expected an offer, observed INCOMPATIBLE_REQUEST (Meld request req-1)',
+    ]);
+  });
+
+  it('checks a country at most once per interval', async () => {
+    const h = harness(downInGermany);
+    await h.check('BANXA', 'DE');
+    await h.check('BANXA', 'DE');
+    expect(h.calls('BANXA', 'DE')).toBe(2);
+
+    h.advance(INTERVAL);
+    await h.check('BANXA', 'DE');
+    expect(h.calls('BANXA', 'DE')).toBe(3);
+  });
+
+  it('checks the provider everywhere first, and skips the country when it is down everywhere', async () => {
+    const h = harness(banxaDown);
+    await h.check('BANXA', 'DE');
+
+    expect(h.state('BANXA')).toMatchObject({ state: 'down' });
+    expect(h.state('BANXA', 'DE')).toBeUndefined();
+    expect(h.calls('BANXA', 'DE')).toBe(0);
+    expect(h.calls('TRANSAK')).toBe(0);
+  });
+
+  it('spends at most half the hourly cap, leaving the rest to the rounds', async () => {
+    const h = harness(downInGermany, { maxProbesPerHour: 2 });
+    await h.check('BANXA', 'DE');
+    expect(h.spy).toHaveBeenCalledTimes(1);
+    expect(h.calls('BANXA', 'DE')).toBe(0);
+
+    await h.round();
+    expect(h.spy).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops before the country when its share runs out after the check everywhere', async () => {
+    const h = harness(downInGermany, { maxProbesPerHour: 4 });
+    await h.check('BANXA', 'DE');
+    expect(h.calls('BANXA')).toBe(2);
+    expect(h.calls('BANXA', 'DE')).toBe(0);
+  });
+
+  it('skips a country without a stored corridor for the provider', async () => {
+    const h = harness(downInGermany);
+    await h.check('BANXA', 'FR');
+    expect(h.calls('BANXA', 'FR')).toBe(0);
+    expect(h.state('BANXA', 'FR')).toBeUndefined();
+  });
+
+  it('waits out a throttle pause', async () => {
+    const h = harness(async () => {
+      throw new MeldHttpError(429);
+    });
+    await h.round();
+    await h.check('BANXA', 'DE');
+    expect(h.spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips a provider that is already down everywhere', async () => {
+    const h = harness(banxaDown);
+    await h.round();
+    const before = h.calls('BANXA');
+    await h.check('BANXA', 'DE');
+    expect(h.calls('BANXA')).toBe(before);
+  });
+
+  it('is rechecked on every round, and clears once the provider answers there', async () => {
+    let down = true;
+    const h = harness(async (target) => (down ? downInGermany(target) : [{ serviceProvider: target.provider }]));
+    await h.check('BANXA', 'DE');
+    down = false;
+    await h.round();
+    expect(h.state('BANXA', 'DE')).toMatchObject({ state: 'up', failures: 0 });
+  });
+});
+
 describe('startProviderProbes', () => {
+  it('checks a suspected country without waiting for the next round', async () => {
+    const quote = vi.fn(async (target: ProbeTarget) => [{ serviceProvider: target.provider }]);
+    const store = {
+      readCorridors: async () => [corridor('DE', 'EUR')],
+      readProviderHealth: async () => [],
+      writeProviderHealth: async () => undefined,
+    };
+    const probes = startProviderProbes(
+      { store, quote, jobs: [{ crypto: 'DOT', direction: 'buy' }], log: { info: vi.fn(), warn: vi.fn() } },
+      OPTIONS,
+    );
+    probes.suspect([{ provider: 'BANXA', direction: 'buy', scope: 'DE' }]);
+    await vi.waitFor(() => {
+      expect(quote).toHaveBeenCalledWith(expect.objectContaining({ provider: 'BANXA', country: 'DE' }));
+    });
+    await probes.stop();
+
+    const calls = quote.mock.calls.length;
+    probes.suspect([{ provider: 'TRANSAK', direction: 'buy', scope: 'DE' }]);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(quote).toHaveBeenCalledTimes(calls);
+  });
+
+  it('warns and continues when a round or a country check fails', async () => {
+    const store = {
+      readCorridors: async () => {
+        throw new Error('store unreachable');
+      },
+      readProviderHealth: async () => [],
+      writeProviderHealth: async () => undefined,
+    };
+    const log = { info: vi.fn<(message: string) => void>(), warn: vi.fn<(message: string) => void>() };
+    const probes = startProviderProbes(
+      { store, quote: banxaDown, jobs: [{ crypto: 'DOT', direction: 'buy' }], log },
+      { ...OPTIONS, intervalMs: 5 },
+      undefined,
+      () => 0,
+    );
+    probes.suspect([{ provider: 'BANXA', direction: 'buy', scope: 'DE' }]);
+    await vi.waitFor(() => {
+      expect(lines(log.warn)).toEqual(
+        expect.arrayContaining([
+          'provider country check failed: store unreachable',
+          'provider probe round failed, continuing: store unreachable',
+        ]),
+      );
+    });
+    await probes.stop();
+  });
+
   it('runs rounds on its interval and stops cleanly', async () => {
     const quote = vi.fn(async (target: ProbeTarget) => [{ serviceProvider: target.provider }]);
     const store = {

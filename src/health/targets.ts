@@ -97,3 +97,15 @@ function buyAmount({ min, max }: ProviderLimit): string | undefined {
   const doubled = doubleDecimal(min);
   return compareDecimal(doubled, max) <= 0 ? doubled : min;
 }
+
+/** The target that tests `provider` in one country, chosen as `probeGroups` would choose it. */
+export function countryTarget(
+  rows: readonly SupportedCorridorRow[],
+  provider: string,
+  direction: Direction,
+  country: string,
+  options: TargetOptions,
+): ProbeTarget | undefined {
+  const local = rows.filter((row) => row.country === country && row.direction === direction);
+  return probeGroups(local, options).find((group) => group.provider === provider)?.targets[0];
+}

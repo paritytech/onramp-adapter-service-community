@@ -565,6 +565,96 @@ afterEach(async () => {
     handle = undefined;
   });
 
+  it('probes a provider a live quote misses, and logs what the probe concludes', async () => {
+    const pinned: unknown[] = [];
+    const json = (res: http.ServerResponse, body: unknown) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    const card = (min: string, max: string) => ({ name: 'CREDIT_DEBIT_CARD', paymentType: 'CARD', limits: { currencyCode: 'USD', min, max } });
+    const server = http.createServer((req, res) => {
+      const url = req.url ?? '';
+      if (url.startsWith('/network-partner/supported/countries')) {
+        json(res, { countries: [{ countryCode: 'US', name: 'United States' }] });
+        return;
+      }
+      if (url.startsWith('/network-partner/defaults/')) {
+        json(res, { countryCode: 'US', currencyCode: 'USD' });
+        return;
+      }
+      if (url.startsWith('/network-partner/supported/fiat-limits')) {
+        json(res, { fiatLimits: [{ countryCode: 'US', currencyCode: 'USD' }] });
+        return;
+      }
+      if (url.startsWith('/network-partner/supported/routes/CRYPTO_ONRAMP/')) {
+        json(res, [
+          { partner: 'BANXA', paymentMethods: [card('20', '15000')] },
+          { partner: 'TRANSAK', paymentMethods: [card('5', '3000')] },
+        ]);
+        return;
+      }
+      if (url.startsWith('/network-partner/')) {
+        json(res, []);
+        return;
+      }
+      let raw = '';
+      req.on('data', (chunk: Buffer) => {
+        raw += chunk.toString();
+      });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as { serviceProviders?: string[]; destinationCurrencyCode?: string };
+        if (body.serviceProviders?.includes('BANXA') === true) {
+          pinned.push(body);
+          json(res, { quotes: [] });
+          return;
+        }
+        json(res, {
+          quotes: [
+            {
+              serviceProvider: 'TRANSAK',
+              sourceAmount: '100.00',
+              sourceCurrencyCode: 'USD',
+              destinationAmount: '24',
+              destinationCurrencyCode: body.destinationCurrencyCode,
+              totalFee: '1.00',
+            },
+          ],
+        });
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    meld = server;
+    const address = server.address();
+    const path = await writeConfig('health-on', `http://127.0.0.1:${String(typeof address === 'object' && address ? address.port : 0)}`);
+    const raw = JSON.parse(await readFile(path, 'utf8')) as Record<string, Record<string, unknown> | undefined>;
+    raw.supported = { enabled: true, catalog_interval_ms: 120_000, routes_interval_ms: 120_000 };
+    raw.meld = { ...raw.meld, countries_cache_ttl_ms: 60_000, defaults_cache_ttl_ms: 60_000, routes_cache_ttl_ms: 60_000 };
+    raw.health = { confirm_delay_ms: 0, sell_amounts: [{ asset: 'dot@assethub', amount: '15' }] };
+    await writeFile(path, JSON.stringify(raw));
+    const lines: string[] = [];
+    handle = await start(path, { write: (line) => lines.push(line) });
+    const app = handle.app;
+    const headers = { 'x-dev-product-id': 'app.dot' };
+
+    await vi.waitFor(async () => {
+      const stored = await app.inject({ method: 'GET', url: '/supported/corridors?destinationCurrencyCode=DOT&direction=buy', headers });
+      expect(stored.json().corridors).toHaveLength(1);
+    });
+    const quote = await app.inject({
+      method: 'POST',
+      url: '/quote',
+      headers,
+      payload: { destinationCurrencyCode: 'DOT', sourceAmount: '100', fiat: 'USD', country: 'US', paymentMethodType: 'CREDIT_DEBIT_CARD' },
+    });
+    expect(quote.statusCode).toBe(200);
+
+    await vi.waitFor(() => {
+      expect(lines.join('')).toContain('provider BANXA buy is down after 2 failed probe rounds in US/USD');
+    });
+    expect(lines.join('')).toContain('provider BANXA buy failed a probe round in US/USD');
+    expect(pinned).toHaveLength(2);
+  });
+
   it('gives the worker the configured observation window, not a constant', async () => {
     // `session_max_age_ms` sits one argument away from `interval_ms` in the same call. Mutating
     // `interval_ms` is caught; mutating this one to `1` was not. At `1` every in-flight

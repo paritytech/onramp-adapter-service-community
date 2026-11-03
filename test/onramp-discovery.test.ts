@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { AuditEvent, AuditLog } from '../src/audit.js';
 import { Refusal, reject } from '../src/contract.js';
 import type { Config } from '../src/config.js';
 import { activeCatalog } from '../src/meld/catalog.js';
+import { MeldHttpError } from '../src/meld/client.js';
 import { Onramp } from '../src/onramp.js';
 import type { Corridor, CountryRow, Discovery, MethodLimit } from '../src/meld/discovery.js';
 import type {
@@ -718,6 +719,11 @@ describe('provider health', () => {
     expect((await healthy.createSession(SUBJECT, body, 'req-2')).fundingRequestId).toBe('funding-1');
   });
 
+  it('serves every provider when health is disabled', async () => {
+    const svc = new Onramp(config({ health: { enabled: false } }), { meld: new FakeMeld() }, new FakeAudit(), await banxaDown(), new FakeMeld(), () => NOW, () => 'funding-1', fakeDiscovery({ methods: [both] }));
+    expect((await svc.supported('US', 'DOT')).methods).toMatchObject([{ max: '15000', availability: 'available' }]);
+  });
+
   it('serves every provider when the health read fails', async () => {
     const store = fakeStore();
     store.readProviderHealth = async () => {
@@ -725,5 +731,66 @@ describe('provider health', () => {
     };
     const svc = service(store, fakeDiscovery({ methods: [both] }));
     expect((await svc.supported('US', 'DOT')).methods).toMatchObject([{ max: '15000', availability: 'available' }]);
+  });
+});
+
+describe('reporting providers a live quote misses', () => {
+  const both = method({ min: '5', max: '15000', providers: [{ provider: 'BANXA', min: '20', max: '15000' }, { provider: 'TRANSAK', min: '5', max: '3000' }] });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  /** A rail whose quote answers or fails as given, and the suspicions the service reports. */
+  const harness = (quote: () => Promise<unknown[]>, discovery = fakeDiscovery({ methods: [both] })) => {
+    const rail = new FakeMeld();
+    rail.quote = quote;
+    const suspect = vi.fn<(keys: readonly { provider: string; direction: string; scope: string }[]) => void>();
+    const svc = new Onramp(config(), { meld: rail }, new FakeAudit(), fakeStore(), rail, () => NOW, () => 'f', discovery, suspect);
+    return { svc, suspect };
+  };
+
+  it('reports a listed provider the quote did not offer, in the quoted country', async () => {
+    const { svc, suspect } = harness(async () => [{ serviceProvider: 'TRANSAK' }]);
+    await svc.quote(quoteBody({ sourceAmount: '100' }));
+    await vi.waitFor(() => {
+      expect(suspect).toHaveBeenCalledWith([{ provider: 'BANXA', direction: 'buy', scope: 'US' }]);
+    });
+  });
+
+  it('reports nothing when the amount is outside the missing provider\'s own limits', async () => {
+    const { svc, suspect } = harness(async () => [{ serviceProvider: 'TRANSAK' }]);
+    await svc.quote(quoteBody({ sourceAmount: '10' }));
+    await settle();
+    expect(suspect).not.toHaveBeenCalled();
+  });
+
+  it('reports the listed providers when the quote fails on a provider, and still refuses the quote', async () => {
+    const { svc, suspect } = harness(async () => {
+      throw new MeldHttpError(400, 'INCOMPATIBLE_REQUEST', '[BANXA] Incompatible request');
+    });
+    await expect(svc.quote(quoteBody({ sourceAmount: '100' }))).rejects.toBeInstanceOf(MeldHttpError);
+    await vi.waitFor(() => {
+      expect(suspect).toHaveBeenCalledWith(expect.arrayContaining([{ provider: 'BANXA', direction: 'buy', scope: 'US' }]));
+    });
+  });
+
+  it('reports nothing when discovery fails after the quote', async () => {
+    const discovery = fakeDiscovery();
+    const { svc, suspect } = harness(async () => {
+      discovery.corridor = async () => {
+        throw new Error('meld catalog unreachable');
+      };
+      return [{ serviceProvider: 'TRANSAK' }];
+    }, discovery);
+    await svc.quote(quoteBody({ sourceAmount: '100' }));
+    await settle();
+    expect(suspect).not.toHaveBeenCalled();
+  });
+
+  it('reports nothing when the quote fails on Meld itself', async () => {
+    const { svc, suspect } = harness(async () => {
+      throw new MeldHttpError(503);
+    });
+    await expect(svc.quote(quoteBody({ sourceAmount: '100' }))).rejects.toBeInstanceOf(MeldHttpError);
+    await settle();
+    expect(suspect).not.toHaveBeenCalled();
   });
 });

@@ -5,7 +5,7 @@ import type { FundingStore, ProviderHealthRow } from '../funding/store.js';
 import type { MeldClient } from '../meld/client.js';
 import type { RefreshJob } from '../supported/refresh.js';
 import { classifyError, classifyQuotes, type ProbeResult } from './classify.js';
-import { probeGroups, type ProbeGroup, type ProbeTarget, type TargetOptions } from './targets.js';
+import { countryTarget, probeGroups, type ProbeGroup, type ProbeTarget, type TargetOptions } from './targets.js';
 import { keyOf, nextHealth, type HealthKey } from './transition.js';
 import { GLOBAL_SCOPE, STALE_ROUNDS } from './types.js';
 
@@ -41,6 +41,15 @@ const HOUR_MS = 3_600_000;
 /** The share of the interval added at random, so replicas and restarts do not probe in step. */
 const JITTER = 0.1;
 
+/** The share of the hourly cap that country checks may spend, so they cannot starve the rounds. */
+const CHECK_SHARE = 0.5;
+
+interface Pass {
+  signal: AbortSignal;
+  /** The quotes in the last hour past which this pass stops. */
+  limit: number;
+}
+
 export function pinnedQuote(meld: Pick<MeldClient, 'quote' | 'quoteSell'>): PinnedQuote {
   return (target) => {
     const common = { countryCode: target.country, paymentMethodType: target.paymentMethodType, serviceProviders: [target.provider] };
@@ -53,20 +62,30 @@ export function pinnedQuote(meld: Pick<MeldClient, 'quote' | 'quoteSell'>): Pinn
 const requestRef = (row: ProviderHealthRow): string =>
   row.last_request_id === null ? '' : ` (Meld request ${row.last_request_id})`;
 
-/** One probe round over every provider the stored corridors name. */
-export function createProber(deps: ProbeDeps, options: ProbeOptions): { round: (signal: AbortSignal) => Promise<void> } {
+export interface Prober {
+  /** One round over every provider the stored corridors name, then over every country outage. */
+  round: (signal: AbortSignal) => Promise<void>;
+  /**
+   * Checks each suspect's provider everywhere, then in the country its key scopes, each at most
+   * once per interval and within a share of the hourly cap.
+   */
+  check: (suspects: readonly HealthKey[], signal: AbortSignal) => Promise<void>;
+}
+
+export function createProber(deps: ProbeDeps, options: ProbeOptions): Prober {
   const clock = deps.clock ?? Date.now;
   const spent: number[] = [];
+  const checkedAt = new Map<string, number>();
   let pausedUntil = 0;
   let capped = false;
   let concludedAt = clock();
   let staleReported = false;
 
-  const withinBudget = (): boolean => {
+  const withinBudget = (limit: number): boolean => {
     const now = clock();
     while ((spent[0] ?? Infinity) <= now - HOUR_MS) spent.shift();
-    if (spent.length >= options.maxProbesPerHour) {
-      if (!capped) deps.log.warn(`provider probes reached ${String(options.maxProbesPerHour)} quotes in the last hour; pausing`);
+    if (spent.length >= limit) {
+      if (!capped) deps.log.warn(`provider probes reached ${String(limit)} quotes in the last hour; pausing`);
       capped = true;
       return false;
     }
@@ -76,10 +95,10 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions): { round: (
   };
 
   /** One answer per target, or `undefined` when the round must stop: throttled or out of budget. */
-  const probe = async (group: ProbeGroup): Promise<ProbeResult[] | undefined> => {
+  const probe = async (group: ProbeGroup, limit: number): Promise<ProbeResult[] | undefined> => {
     const results: ProbeResult[] = [];
     for (const target of group.targets) {
-      if (!withinBudget()) return undefined;
+      if (!withinBudget(limit)) return undefined;
       const result = await deps.quote(target).then(
         (quotes) => classifyQuotes(target.provider, quotes),
         (error: unknown) => classifyError(target.provider, error),
@@ -95,7 +114,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions): { round: (
   };
 
   const report = (group: ProbeGroup, previous: ProviderHealthRow | undefined, next: ProviderHealthRow): void => {
-    const name = `provider ${next.provider} ${next.direction}`;
+    const name = `provider ${next.provider} ${next.direction}${next.scope === GLOBAL_SCOPE ? '' : ` in ${next.scope}`}`;
     const where = group.targets.map((t) => `${t.country}/${t.fiat}`).join(', ');
     const wasDown = previous?.state === 'down';
     if (next.state === 'down' && !wasDown) {
@@ -117,50 +136,116 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions): { round: (
     deps.log.warn(`no provider probe has reached a conclusion for ${String(silentMs)}ms; stored provider health is stale`);
   };
 
+  const snapshot = async () => ({
+    rows: (await Promise.all(deps.jobs.map((job) => deps.store.readCorridors(job.crypto, job.direction)))).flat(),
+    known: new Map((await deps.store.readProviderHealth()).map((row) => [keyOf(row), row])),
+  });
+  type Snapshot = Awaited<ReturnType<typeof snapshot>>;
+
+  /** Probes `group` until `key`'s state settles. `false` when the pass must stop: throttled or out of budget. */
+  const settle = async (group: ProbeGroup, key: HealthKey, known: Snapshot['known'], { signal, limit }: Pass): Promise<boolean> => {
+    checkedAt.set(keyOf(key), clock());
+    let previous = known.get(keyOf(key));
+    for (;;) {
+      if (signal.aborted) return false;
+      const results = await probe(group, limit);
+      if (results === undefined) return false;
+      const next = nextHealth(key, previous, results, clock(), options.failuresToDown);
+      if (next === undefined) return true;
+      concludedAt = clock();
+      staleReported = false;
+      await deps.store.writeProviderHealth(next);
+      report(group, previous, next);
+      known.set(keyOf(key), next);
+      previous = next;
+      if (next.failures === 0 || next.state === 'down') return true;
+      await sleep(options.confirmDelayMs, undefined, { signal, ref: false });
+    }
+  };
+
+  const globalKey = (group: ProbeGroup): HealthKey => ({ provider: group.provider, direction: group.direction, scope: GLOBAL_SCOPE });
+
+  const isDue = (key: HealthKey): boolean => clock() - (checkedAt.get(keyOf(key)) ?? -Infinity) >= options.intervalMs;
+
+  /** A provider already down everywhere is hidden everywhere, so its countries are not checked. */
+  const checkCountries = async (suspects: readonly HealthKey[], { rows, known }: Snapshot, pass: Pass): Promise<void> => {
+    for (const key of suspects) {
+      if (known.get(keyOf({ ...key, scope: GLOBAL_SCOPE }))?.state === 'down') continue;
+      const target = countryTarget(rows, key.provider, key.direction, key.scope, options);
+      if (target === undefined) continue;
+      if (!(await settle({ provider: key.provider, direction: key.direction, targets: [target] }, key, known, pass))) return;
+    }
+  };
+
   const round = async (signal: AbortSignal): Promise<void> => {
     if (clock() < pausedUntil) {
       reportStale();
       return;
     }
     try {
-      const rows = (await Promise.all(deps.jobs.map((job) => deps.store.readCorridors(job.crypto, job.direction)))).flat();
-      const known = new Map((await deps.store.readProviderHealth()).map((row) => [keyOf(row), row]));
-      for (const group of probeGroups(rows, options)) {
-        const key: HealthKey = { provider: group.provider, direction: group.direction, scope: GLOBAL_SCOPE };
-        let previous = known.get(keyOf(key));
-        for (;;) {
-          if (signal.aborted) return;
-          const results = await probe(group);
-          if (results === undefined) return;
-          const next = nextHealth(key, previous, results, clock(), options.failuresToDown);
-          if (next === undefined) break;
-          concludedAt = clock();
-          staleReported = false;
-          await deps.store.writeProviderHealth(next);
-          report(group, previous, next);
-          previous = next;
-          if (next.failures === 0 || next.state === 'down') break;
-          await sleep(options.confirmDelayMs, undefined, { signal, ref: false });
-        }
+      const pass = { signal, limit: options.maxProbesPerHour };
+      const current = await snapshot();
+      for (const group of probeGroups(current.rows, options)) {
+        if (!(await settle(group, globalKey(group), current.known, pass))) return;
       }
+      const outages = [...current.known.values()].filter((row) => row.scope !== GLOBAL_SCOPE && row.state === 'down');
+      await checkCountries(outages, current, pass);
     } finally {
       reportStale();
     }
   };
 
-  return { round };
+  /** One outage everywhere can make every country suspect, so the provider is checked everywhere first. */
+  const check = async (suspects: readonly HealthKey[], signal: AbortSignal): Promise<void> => {
+    if (clock() < pausedUntil) return;
+    const due = suspects.filter(isDue);
+    if (due.length === 0) return;
+    const pass = { signal, limit: Math.floor(options.maxProbesPerHour * CHECK_SHARE) };
+    const current = await snapshot();
+    for (const group of probeGroups(current.rows, options)) {
+      const suspected = due.some((key) => key.provider === group.provider && key.direction === group.direction);
+      if (!suspected || !isDue(globalKey(group))) continue;
+      if (!(await settle(group, globalKey(group), current.known, pass))) return;
+    }
+    await checkCountries(due, current, pass);
+  };
+
+  return { round, check };
 }
 
-/** Probe every `intervalMs` plus jitter, one round at a time under `exclusive`; returns `stop()`. */
+/**
+ * Probe every `intervalMs` plus jitter, and check suspected countries as they are reported, one
+ * pass at a time under `exclusive`.
+ */
 export function startProviderProbes(
   deps: ProbeDeps,
   options: ProbeOptions,
   exclusive: Serial = serial(),
   random: () => number = Math.random,
-): { stop: (graceMs?: number) => Promise<void> } {
+): { stop: (graceMs?: number) => Promise<void>; suspect: (keys: readonly HealthKey[]) => void } {
   const controller = new AbortController();
   const { signal } = controller;
-  const { round } = createProber(deps, options);
+  const { round, check } = createProber(deps, options);
+  const pending = new Map<string, HealthKey>();
+  const checks = new Set<Promise<void>>();
+  let scheduled = false;
+
+  const suspect = (keys: readonly HealthKey[]): void => {
+    for (const key of keys) pending.set(keyOf(key), key);
+    if (scheduled || pending.size === 0 || signal.aborted) return;
+    scheduled = true;
+    const pass = exclusive(async () => {
+      scheduled = false;
+      const batch = [...pending.values()];
+      pending.clear();
+      await check(batch, signal);
+    }).catch((error: unknown) => {
+      if (!isAbort(error)) deps.log.warn(`provider country check failed: ${message(error)}`);
+    });
+    checks.add(pass);
+    void pass.finally(() => checks.delete(pass));
+  };
+
   const loop = (async () => {
     for (;;) {
       try {
@@ -172,5 +257,5 @@ export function startProviderProbes(
       }
     }
   })();
-  return { stop: (graceMs = 5_000) => stopWithin(controller, () => loop, graceMs) };
+  return { stop: (graceMs = 5_000) => stopWithin(controller, () => Promise.all([loop, ...checks]), graceMs), suspect };
 }

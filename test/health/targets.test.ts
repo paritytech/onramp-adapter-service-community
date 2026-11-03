@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { StoredMethod, SupportedCorridorRow } from '../../src/funding/store.js';
-import { probeGroups, type TargetOptions } from '../../src/health/targets.js';
+import { countryTarget, probeGroups, type TargetOptions } from '../../src/health/targets.js';
 import type { ProviderLimit } from '../../src/meld/discovery.js';
 import type { Direction } from '../../src/rail.js';
 
@@ -92,6 +92,12 @@ describe('probeGroups', () => {
         ],
       },
     ]);
+  });
+
+  it('picks a provider\'s target within one country', () => {
+    const rows = [row('US', 'USD', { CREDIT_DEBIT_CARD: [banxa()] }), row('DE', 'EUR', { CREDIT_DEBIT_CARD: [banxa(), transak()] })];
+    expect(countryTarget(rows, 'BANXA', 'buy', 'DE', OPTIONS)).toMatchObject({ provider: 'BANXA', country: 'DE', fiat: 'EUR' });
+    expect(countryTarget(rows, 'TRANSAK', 'buy', 'US', OPTIONS)).toBeUndefined();
   });
 
   it('skips rows without stored providers and limits that are not plain decimals', () => {

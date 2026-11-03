@@ -34,6 +34,7 @@ import type {
   FundingRail,
   MeldTransactionReader,
   RailName,
+  RailQuote,
   RailRegistry,
 } from './rail.js';
 import { DEFAULT_DIRECTION, DEFAULT_RAIL } from './rail.js';
@@ -45,8 +46,10 @@ import {
   type OfframpCorridor,
   type OfframpMethod,
 } from './offramp.js';
-import { toMinorUnits } from './money.js';
+import { compareDecimal, toMinorUnits } from './money.js';
 import type { Corridor, CorridorDto, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
+import { classifyError } from './health/classify.js';
+import type { HealthKey } from './health/transition.js';
 import { STALE_ROUNDS } from './health/types.js';
 import { healthView, liveMethods, NO_HEALTH, storedMethods, type HealthView, type WithAvailability } from './health/view.js';
 
@@ -83,6 +86,12 @@ const STALE_PASSES = 3;
  * offered forever.
  */
 const FALLBACK_GRACE_MS = 24 * 3_600_000;
+
+/** The provider that made a rail's quote, when the quote names one. */
+const offeredBy = (quote: unknown): string | undefined =>
+  typeof quote === 'object' && quote !== null && 'serviceProvider' in quote && typeof quote.serviceProvider === 'string'
+    ? quote.serviceProvider
+    : undefined;
 
 /** An injectable clock so tests can pin "now" without mocking time. */
 export type Clock = () => number;
@@ -189,6 +198,8 @@ export class Onramp {
     // meaning unchanged. Absent, the limit gate falls back to `config.limits`, which is also the
     // degraded path when discovery is present but Meld's public catalog is briefly unreachable.
     private readonly discovery?: Discovery,
+    /** Receives the providers a live quote found missing in a country, for the probes to check. */
+    private readonly suspect?: (keys: readonly HealthKey[]) => void,
   ) {}
 
   /** The methods + fiat min/max a corridor offers, for the buyer's (or seller's) amount screen.
@@ -295,6 +306,33 @@ export class Onramp {
     return { country, fiat, methods };
   }
 
+  /**
+   * Reports each provider the corridor lists for this method that the live quote did not offer. A
+   * buy outside that provider's own limits explains its absence, and so does a failed quote that
+   * does not blame a provider. Best effort: a discovery outage reports nothing.
+   */
+  private async reportMissing(priced: RailQuote, answer: { quotes: readonly unknown[] } | { error: unknown }): Promise<void> {
+    if (this.suspect === undefined || this.discovery === undefined) return;
+    let corridor: Corridor;
+    try {
+      corridor = await this.discovery.corridor(priced.countryCode, priced.sourceCurrencyCode, priced.destinationCurrencyCode, priced.direction);
+    } catch {
+      return;
+    }
+    const offered = new Set('quotes' in answer ? answer.quotes.map(offeredBy) : []);
+    const method = corridor.methods.find((m) => m.paymentMethodType === priced.paymentMethodType);
+    const missing = (method?.providers ?? []).filter(
+      (p) =>
+        !offered.has(p.provider) &&
+        ('quotes' in answer || classifyError(p.provider, answer.error).outcome === 'down') &&
+        (priced.direction === 'sell' ||
+          (compareDecimal(priced.sourceAmount, p.min) >= 0 && compareDecimal(priced.sourceAmount, p.max) <= 0)),
+    );
+    if (missing.length > 0) {
+      this.suspect(missing.map((p) => ({ provider: p.provider, direction: priced.direction, scope: priced.countryCode })));
+    }
+  }
+
   /** Provider health for one request. A failed read serves every provider, as if no probe had run. */
   private async health(): Promise<HealthView> {
     if (!this.cfg.health.enabled) return NO_HEALTH;
@@ -382,7 +420,14 @@ export class Onramp {
       direction === 'sell'
         ? ({ ...legs, direction, cryptoAmount: committedTerm(request.cryptoAmount, 'cryptoAmount', direction) } as const)
         : ({ ...legs, direction, sourceAmount: committedTerm(request.sourceAmount, 'sourceAmount', direction) } as const);
-    const quotes = await rail.quote(priced);
+    let quotes: unknown[];
+    try {
+      quotes = await rail.quote(priced);
+    } catch (error) {
+      if (rail.provider === 'meld') void this.reportMissing(priced, { error });
+      throw error;
+    }
+    if (rail.provider === 'meld') void this.reportMissing(priced, { quotes });
 
     // The echo is built here rather than round-tripped through the rail: every value in it is
     // already in hand, so asking the rail to hand back its own arguments bought nothing.

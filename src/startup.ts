@@ -170,7 +170,9 @@ export async function start(
     app = await buildServer(
       cfg,
       (audit) =>
-        new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery),
+        new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery, (keys) => {
+          probes?.suspect(keys);
+        }),
       personhood,
       logDestination,
     );
