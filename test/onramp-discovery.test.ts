@@ -482,7 +482,12 @@ describe('sell-only codes across the sell paths', () => {
   it('quotes and opens a sell session, and refuses both on a buy', async () => {
     const svc = build(fakeDiscovery({ methods: [method({ paymentMethodType: 'PAYOUT_TO_BANK', category: 'bank' })] }), withLanes('DOT', SOL_CODE));
     expect((await svc.quote(asQuote(sellQuoteBody({ destinationCurrencyCode: SOL_CODE })))).quotes).toHaveLength(1);
-    const opened = await svc.createSession(SUBJECT, asSession(sellRequest({ destinationCurrencyCode: SOL_CODE })), 'req-sol');
+    // No seller address: optional off Asset Hub.
+    const opened = await svc.createSession(
+      SUBJECT,
+      asSession(sellRequest({ destinationCurrencyCode: SOL_CODE, walletAddress: undefined })),
+      'req-sol',
+    );
     expect(opened.pinned.cryptoAmount).toBe('12.3456789012');
 
     expect((await refusalOf(() => svc.quote(asQuote(quoteBody({ destinationCurrencyCode: SOL_CODE }))))).tag).toBe('WrongAssetOrChain');
@@ -496,13 +501,20 @@ describe('sell-only codes across the sell paths', () => {
     const svc = build(discovery, withLanes('DOT'));
     expect(await refusalOf(() => svc.quote(asQuote(sellQuoteBody({ destinationCurrencyCode: SOL_CODE }))))).toEqual({ tag: 'RegionUnavailable' });
     expect(
-      await refusalOf(() => svc.createSession(SUBJECT, asSession(sellRequest({ destinationCurrencyCode: SOL_CODE })), 'req-sol-off')),
+      await refusalOf(() =>
+        svc.createSession(
+          SUBJECT,
+          asSession(sellRequest({ destinationCurrencyCode: SOL_CODE, walletAddress: undefined })),
+          'req-sol-off',
+        ),
+      ),
     ).toEqual({ tag: 'RegionUnavailable' });
     // The lane still listed sells as before.
     expect((await svc.quote(asQuote(sellQuoteBody()))).quotes).toHaveLength(1);
   });
 
-  it('still refuses a walletAddress on a sell session', async () => {
+  it('refuses a seller address that is not one on the lane\'s own chain', async () => {
+    // The provider refunds to it, so a malformed one is refused rather than sent.
     const svc = build(fakeDiscovery());
     await expect(
       svc.createSession(SUBJECT, asSession(sellRequest({ destinationCurrencyCode: SOL_CODE, walletAddress: 'x' })), 'req-sol-w'),
