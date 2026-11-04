@@ -9,6 +9,7 @@ const STALE = 1_800_000;
 const down = (over: Partial<ProviderHealthRow> = {}): ProviderHealthRow => ({
   provider: 'BANXA',
   direction: 'buy',
+  category: 'card',
   scope: 'global',
   state: 'down',
   failures: 2,
@@ -53,6 +54,13 @@ describe('healthView', () => {
 
   it('applies an outage to its own direction only', () => {
     expect(healthView([down({ direction: 'sell' })], NOW, STALE).apply(card, providers, 'buy', 'US')).toMatchObject({ max: '15000' });
+  });
+
+  it('applies an outage to its own method category only', () => {
+    const bank = { ...card, paymentMethodType: 'SEPA', category: 'bank' as const };
+    const view = healthView([down()], NOW, STALE);
+    expect(view.apply(card, providers, 'buy', 'US')).toMatchObject({ max: '3000' });
+    expect(view.apply(bank, providers, 'buy', 'US')).toMatchObject({ max: '15000' });
   });
 
   it('ignores a down state older than the stale window', () => {

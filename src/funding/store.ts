@@ -23,7 +23,7 @@ import { Pool, types as pgTypes, type PoolClient, type PoolConfig } from 'pg';
 
 import type { FundingFailure } from '../contract.js';
 import type { ProviderState } from '../health/types.js';
-import type { CorridorDto, MethodProviders } from '../meld/discovery.js';
+import type { CorridorDto, MethodCategory, MethodProviders } from '../meld/discovery.js';
 import type { Direction, RailName } from '../rail.js';
 import type { Secret } from '../secret.js';
 import type { FundingState } from './state.js';
@@ -121,10 +121,11 @@ export interface SupportedCorridorRow {
   updated_at: number;
 }
 
-/** One provider's health in one direction and scope. */
+/** One provider's health for one direction, method category and scope. */
 export interface ProviderHealthRow {
   provider: string;
   direction: Direction;
+  category: MethodCategory;
   /** `GLOBAL_SCOPE`, or an ISO 3166-1 alpha-2 country. */
   scope: string;
   state: ProviderState;
@@ -137,7 +138,7 @@ export interface ProviderHealthRow {
   updated_at: number;
 }
 
-const HEALTH_KEY = ['provider', 'direction', 'scope'] as const;
+const HEALTH_KEY = ['provider', 'direction', 'category', 'scope'] as const;
 const HEALTH_FIELDS = ['state', 'failures', 'last_ok_at', 'last_failed_at', 'last_code', 'last_request_id', 'updated_at'] as const;
 const HEALTH_COLUMNS = [...HEALTH_KEY, ...HEALTH_FIELDS] satisfies readonly (keyof ProviderHealthRow)[];
 

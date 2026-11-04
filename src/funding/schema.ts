@@ -19,6 +19,7 @@
  */
 
 import { GLOBAL_SCOPE, PROVIDER_STATES } from '../health/types.js';
+import { METHOD_CATEGORIES } from '../meld/discovery.js';
 import { DIRECTIONS } from '../rail.js';
 import { FUNDING_STATES } from './state.js';
 
@@ -82,11 +83,12 @@ const SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT = `CONSTRAINT supported_corridors
  */
 const SUPPORTED_CORRIDORS_PROVIDERS_COLUMN = ' method_providers JSONB';
 
-/** Provider health from probe quotes, one row per provider, direction and scope. */
+/** Provider health from probe quotes, one row per provider, direction, method category and scope. */
 const PROVIDER_HEALTH_TABLE =
   'CREATE TABLE IF NOT EXISTS provider_health (' +
   ' provider TEXT NOT NULL,' +
   ' direction TEXT NOT NULL,' +
+  ' category TEXT NOT NULL,' +
   ' scope TEXT NOT NULL,' +
   ' state TEXT NOT NULL,' +
   ' failures INTEGER NOT NULL,' +
@@ -95,8 +97,9 @@ const PROVIDER_HEALTH_TABLE =
   ' last_code TEXT,' +
   ' last_request_id TEXT,' +
   ' updated_at BIGINT NOT NULL,' +
-  ' PRIMARY KEY (provider, direction, scope),' +
+  ' PRIMARY KEY (provider, direction, category, scope),' +
   ` CONSTRAINT provider_health_direction_known CHECK (direction IN (${DIRECTIONS.map((d) => `'${d}'`).join(', ')})),` +
+  ` CONSTRAINT provider_health_category_known CHECK (category IN (${METHOD_CATEGORIES.map((c) => `'${c}'`).join(', ')})),` +
   ` CONSTRAINT provider_health_state_known CHECK (state IN (${PROVIDER_STATES.map((st) => `'${st}'`).join(', ')})),` +
   ` CONSTRAINT provider_health_scope_known CHECK (scope = '${GLOBAL_SCOPE}' OR scope ~ '^[A-Z]{2}$'),` +
   ' CONSTRAINT provider_health_failures_counted CHECK (failures >= 0)' +

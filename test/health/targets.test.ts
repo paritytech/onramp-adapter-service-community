@@ -33,6 +33,8 @@ const row = (
   updated_at: 0,
 });
 
+const bank = (paymentMethodType: string): StoredMethod => ({ ...card(paymentMethodType), category: 'bank' });
+
 const banxa = (min = '20', max = '15000'): ProviderLimit => ({ provider: 'BANXA', min, max });
 const transak = (min = '5', max = '3000'): ProviderLimit => ({ provider: 'TRANSAK', min, max });
 
@@ -72,24 +74,26 @@ describe('probeGroups', () => {
     expect(amount('TRANSAK')).toBe('60');
   });
 
-  it('prefers a card method over another method in the same country', () => {
+  it('probes each method category apart, in the countries that list the provider for it', () => {
     const groups = probeGroups(
       [
-        row('US', 'USD', { ACH: [banxa()], CREDIT_DEBIT_CARD: [banxa()] }, {
-          methods: [{ ...card('ACH'), category: 'bank' }, card()],
-        }),
+        row('US', 'USD', { ACH: [banxa()], CREDIT_DEBIT_CARD: [banxa()] }, { methods: [bank('ACH'), card()] }),
+        row('GB', 'GBP', { CREDIT_DEBIT_CARD: [banxa()] }),
       ],
       OPTIONS,
       first,
     );
-    expect(groups[0]?.targets[0].paymentMethodType).toBe('CREDIT_DEBIT_CARD');
+    expect(groups.map((g) => [g.category, g.targets.map((t) => `${t.country}/${t.paymentMethodType}`)])).toEqual([
+      ['card', ['GB/CREDIT_DEBIT_CARD', 'US/CREDIT_DEBIT_CARD']],
+      ['bank', ['US/ACH']],
+    ]);
   });
 
   it('sells the configured crypto amount, and skips a sell crypto with none configured', () => {
     const groups = probeGroups(
       [
-        row('GB', 'GBP', { PAYOUT_TO_BANK: [transak()] }, { direction: 'sell' }),
-        row('US', 'USD', { PAYOUT_TO_BANK: [transak()] }, { direction: 'sell', crypto: 'USDC_SOLANA' }),
+        row('GB', 'GBP', { PAYOUT_TO_BANK: [transak()] }, { direction: 'sell', methods: [bank('PAYOUT_TO_BANK')] }),
+        row('US', 'USD', { PAYOUT_TO_BANK: [transak()] }, { direction: 'sell', crypto: 'USDC_SOLANA', methods: [bank('PAYOUT_TO_BANK')] }),
       ],
       OPTIONS,
       first,
@@ -98,17 +102,29 @@ describe('probeGroups', () => {
       {
         provider: 'TRANSAK',
         direction: 'sell',
+        category: 'bank',
         targets: [
-          { provider: 'TRANSAK', direction: 'sell', country: 'GB', fiat: 'GBP', crypto: 'DOT', paymentMethodType: 'PAYOUT_TO_BANK', amount: '10' },
+          {
+            provider: 'TRANSAK',
+            direction: 'sell',
+            category: 'bank',
+            country: 'GB',
+            fiat: 'GBP',
+            crypto: 'DOT',
+            paymentMethodType: 'PAYOUT_TO_BANK',
+            amount: '10',
+          },
         ],
       },
     ]);
   });
 
-  it('picks a provider\'s target within one country', () => {
+  it('picks a provider\'s target for one method category within one country', () => {
     const rows = [row('US', 'USD', { CREDIT_DEBIT_CARD: [banxa()] }), row('DE', 'EUR', { CREDIT_DEBIT_CARD: [banxa(), transak()] })];
-    expect(countryTarget(rows, 'BANXA', 'buy', 'DE', OPTIONS)).toMatchObject({ provider: 'BANXA', country: 'DE', fiat: 'EUR' });
-    expect(countryTarget(rows, 'TRANSAK', 'buy', 'US', OPTIONS)).toBeUndefined();
+    const key = (provider: string, category: 'card' | 'bank', scope: string) => ({ provider, direction: 'buy' as const, category, scope });
+    expect(countryTarget(rows, key('BANXA', 'card', 'DE'), OPTIONS)).toMatchObject({ provider: 'BANXA', country: 'DE', fiat: 'EUR' });
+    expect(countryTarget(rows, key('BANXA', 'bank', 'DE'), OPTIONS)).toBeUndefined();
+    expect(countryTarget(rows, key('TRANSAK', 'card', 'US'), OPTIONS)).toBeUndefined();
   });
 
   it('skips rows without stored providers and limits that are not plain decimals', () => {

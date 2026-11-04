@@ -4,7 +4,7 @@ import type { ProviderHealthRow } from '../../src/funding/store.js';
 import type { ProbeResult } from '../../src/health/classify.js';
 import { nextHealth, type HealthKey } from '../../src/health/transition.js';
 
-const KEY: HealthKey = { provider: 'BANXA', direction: 'buy', scope: 'global' };
+const KEY: HealthKey = { provider: 'BANXA', direction: 'buy', category: 'card', scope: 'global' };
 const UP: ProbeResult = { outcome: 'up' };
 const DOWN: ProbeResult = { outcome: 'down', code: 'INCOMPATIBLE_REQUEST' };
 const UNKNOWN: ProbeResult = { outcome: 'unknown', code: 'UNREACHABLE' };

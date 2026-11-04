@@ -220,9 +220,10 @@ supported:
     # - { asset: usdc@arbitrum }
     # - { asset: usdc@solana }
 
-# Provider probes behind `provider_health`: one Meld quote per provider and direction, pinned to that
-# provider, in two countries picked at random each round with different fiat currencies. A provider
-# Meld lists but cannot price is marked down. Runs only while `supported.enabled` is true, because
+# Provider probes behind `provider_health`: one Meld quote per provider, direction and method
+# category, pinned to that provider, in two countries picked at random each round with different
+# fiat currencies. A provider Meld lists but cannot price is marked down for that direction and
+# category. Runs only while `supported.enabled` is true, because
 # the probes are chosen from its corridors.
 health:
   enabled: true

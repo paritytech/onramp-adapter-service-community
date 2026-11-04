@@ -1186,6 +1186,7 @@ describe('provider health', () => {
   const down = {
     provider: 'BANXA',
     direction: 'buy' as const,
+    category: 'card' as const,
     scope: 'global',
     state: 'down' as const,
     failures: 2,
@@ -1196,19 +1197,21 @@ describe('provider health', () => {
     updated_at: 2_000,
   };
 
-  it('writes a row and replaces it on the same provider, direction and scope', async () => {
+  it('writes a row and replaces it on the same provider, direction, category and scope', async () => {
     await withStore(async (store) => {
       await store.writeProviderHealth(down);
       await store.writeProviderHealth({ ...down, direction: 'sell' });
+      await store.writeProviderHealth({ ...down, category: 'bank' });
       const up = { ...down, state: 'up' as const, failures: 0, last_ok_at: 3_000, updated_at: 3_000 };
       await store.writeProviderHealth(up);
 
-      expect(await store.readProviderHealth()).toEqual([up, { ...down, direction: 'sell' }]);
+      expect(await store.readProviderHealth()).toEqual([{ ...down, category: 'bank' }, up, { ...down, direction: 'sell' }]);
     });
   });
 
   it.each([
     ['a state outside the vocabulary', { state: 'maybe' }],
+    ['a category outside the vocabulary', { category: 'cash' }],
     ['a scope that is neither global nor a country code', { scope: 'usa' }],
     ['a negative failure count', { failures: -1 }],
   ])('refuses %s', async (_label, over) => {

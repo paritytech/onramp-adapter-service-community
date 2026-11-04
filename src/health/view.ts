@@ -1,5 +1,5 @@
 import type { ProviderHealthRow, StoredMethod, SupportedCorridorRow } from '../funding/store.js';
-import type { Corridor, MethodLimit, ProviderLimit } from '../meld/discovery.js';
+import type { Corridor, MethodCategory, MethodLimit, ProviderLimit } from '../meld/discovery.js';
 import { widestBound, type Bound } from '../money.js';
 import type { Direction } from '../rail.js';
 import { keyOf } from './transition.js';
@@ -15,7 +15,7 @@ export interface HealthView {
    * `method` bounded by its providers that are not down. Unchanged while none is down or none is
    * stored; with every provider down it keeps its bound and is `temporarily_unavailable`.
    */
-  apply<M extends Bound>(method: M, providers: readonly ProviderLimit[] | undefined, direction: Direction, country: string): WithAvailability<M>;
+  apply<M extends Bound & { category: MethodCategory }>(method: M, providers: readonly ProviderLimit[] | undefined, direction: Direction, country: string): WithAvailability<M>;
 }
 
 /**
@@ -24,11 +24,11 @@ export interface HealthView {
  */
 export function healthView(rows: readonly ProviderHealthRow[], now: number, staleMs: number): HealthView {
   const down = new Set(rows.filter((row) => row.state === 'down' && now - row.updated_at <= staleMs).map(keyOf));
-  const isDown = (provider: string, direction: Direction, country: string): boolean =>
-    down.has(keyOf({ provider, direction, scope: GLOBAL_SCOPE })) || down.has(keyOf({ provider, direction, scope: country }));
+  const isDown = (provider: string, direction: Direction, category: MethodCategory, country: string): boolean =>
+    down.has(keyOf({ provider, direction, category, scope: GLOBAL_SCOPE })) || down.has(keyOf({ provider, direction, category, scope: country }));
   return {
     apply: (method, providers = [], direction, country) => {
-      const [first, ...rest] = providers.filter((p) => !isDown(p.provider, direction, country));
+      const [first, ...rest] = providers.filter((p) => !isDown(p.provider, direction, method.category, country));
       if (first === undefined) return { ...method, availability: providers.length === 0 ? 'available' : 'temporarily_unavailable' };
       if (rest.length + 1 === providers.length) return { ...method, availability: 'available' };
       return { ...method, ...widestBound([first, ...rest]), availability: 'available' };

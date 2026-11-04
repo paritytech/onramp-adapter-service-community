@@ -1,9 +1,9 @@
 import type { ProviderHealthRow } from '../funding/store.js';
 import type { ProbeResult } from './classify.js';
 
-export type HealthKey = Pick<ProviderHealthRow, 'provider' | 'direction' | 'scope'>;
+export type HealthKey = Pick<ProviderHealthRow, 'provider' | 'direction' | 'category' | 'scope'>;
 
-export const keyOf = ({ provider, direction, scope }: HealthKey): string => `${provider}|${direction}|${scope}`;
+export const keyOf = ({ provider, direction, category, scope }: HealthKey): string => `${provider}|${direction}|${category}|${scope}`;
 
 type Down = Extract<ProbeResult, { outcome: 'down' }>;
 

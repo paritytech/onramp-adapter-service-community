@@ -17,21 +17,24 @@ const OPTIONS: ProbeOptions = {
   sellAmounts: new Map(),
 };
 
-const corridor = (country: string, fiat: string): SupportedCorridorRow => ({
+const PROVIDERS = [
+  { provider: 'BANXA', min: '20', max: '15000' },
+  { provider: 'TRANSAK', min: '5', max: '3000' },
+];
+
+const corridor = (country: string, fiat: string, bank = false): SupportedCorridorRow => ({
   destination_currency_code: 'DOT',
   direction: 'buy',
   country,
   name: country,
   fiat,
-  methods: [{ paymentMethodType: 'CREDIT_DEBIT_CARD', category: 'card', min: '5', max: '15000', currency: fiat }],
+  methods: [
+    { paymentMethodType: 'CREDIT_DEBIT_CARD', category: 'card', min: '5', max: '15000', currency: fiat },
+    ...(bank ? [{ paymentMethodType: 'SEPA', category: 'bank' as const, min: '5', max: '15000', currency: fiat }] : []),
+  ],
   method_providers: [
-    {
-      paymentMethodType: 'CREDIT_DEBIT_CARD',
-      providers: [
-        { provider: 'BANXA', min: '20', max: '15000' },
-        { provider: 'TRANSAK', min: '5', max: '3000' },
-      ],
-    },
+    { paymentMethodType: 'CREDIT_DEBIT_CARD', providers: PROVIDERS },
+    ...(bank ? [{ paymentMethodType: 'SEPA', providers: PROVIDERS }] : []),
   ],
   updated_at: 0,
 });
@@ -44,10 +47,13 @@ const banxaDown: PinnedQuote = async (target) => {
   return [{ serviceProvider: target.provider }];
 };
 
-function harness(quote: PinnedQuote, options: Partial<ProbeOptions> = {}) {
+function harness(
+  quote: PinnedQuote,
+  options: Partial<ProbeOptions> = {},
+  rows = [corridor('US', 'USD'), corridor('GB', 'GBP'), corridor('DE', 'EUR')],
+) {
   let now = 0;
   const health = new Map<string, ProviderHealthRow>();
-  const rows = [corridor('US', 'USD'), corridor('GB', 'GBP'), corridor('DE', 'EUR')];
   const log = { info: vi.fn<(message: string) => void>(), warn: vi.fn<(message: string) => void>() };
   const spy = vi.fn(quote);
   const store = {
@@ -55,7 +61,7 @@ function harness(quote: PinnedQuote, options: Partial<ProbeOptions> = {}) {
       rows.filter((r) => r.destination_currency_code === code && r.direction === direction),
     readProviderHealth: async () => [...health.values()],
     writeProviderHealth: async (row: ProviderHealthRow) => {
-      health.set(`${row.provider}|${row.direction}|${row.scope}`, row);
+      health.set(`${row.provider}|${row.direction}|${row.category}|${row.scope}`, row);
     },
   };
   const prober = createProber(
@@ -67,11 +73,11 @@ function harness(quote: PinnedQuote, options: Partial<ProbeOptions> = {}) {
     prober,
     round: () => prober.round(new AbortController().signal),
     check: (provider: string, country: string) =>
-      prober.check([{ provider, direction: 'buy', scope: country }], new AbortController().signal),
+      prober.check([{ provider, direction: 'buy', category: 'card', scope: country }], new AbortController().signal),
     advance: (ms: number) => {
       now += ms;
     },
-    state: (provider: string, scope = 'global') => health.get(`${provider}|buy|${scope}`),
+    state: (provider: string, scope = 'global', category = 'card') => health.get(`${provider}|buy|${category}|${scope}`),
     calls: (provider: string, country?: string) =>
       spy.mock.calls.filter(([t]) => t.provider === provider && (country === undefined || t.country === country)).length,
     spy,
@@ -97,7 +103,7 @@ describe('a probe round', () => {
     expect(h.calls('TRANSAK')).toBe(2);
     expect(h.spy.mock.calls.map(([t]) => t.country)).not.toContain('DE');
     expect(lines(h.log.warn)).toEqual([
-      'provider BANXA buy is down after 2 failed probe rounds in US/USD, GB/GBP: expected an offer, observed INCOMPATIBLE_REQUEST (Meld request req-1)',
+      'provider BANXA buy card is down after 2 failed probe rounds in US/USD, GB/GBP: expected an offer, observed INCOMPATIBLE_REQUEST (Meld request req-1)',
     ]);
   });
 
@@ -110,7 +116,20 @@ describe('a probe round', () => {
     await h.round();
 
     expect(h.state('BANXA')).toMatchObject({ state: 'up', failures: 0, last_code: 'INCOMPATIBLE_REQUEST' });
-    expect(lines(h.log.info)).toContain('provider BANXA buy is up again in US/USD, GB/GBP');
+    expect(lines(h.log.info)).toContain('provider BANXA buy card is up again in US/USD, GB/GBP');
+  });
+
+  it('probes each method category on its own, so a card outage leaves bank up', async () => {
+    const h = harness(
+      async (target) => (target.category === 'card' ? banxaDown(target) : [{ serviceProvider: target.provider }]),
+      {},
+      [corridor('US', 'USD'), corridor('GB', 'GBP', true), corridor('DE', 'EUR', true)],
+    );
+    await h.round();
+
+    expect(h.state('BANXA')).toMatchObject({ state: 'down' });
+    expect(h.state('BANXA', 'global', 'bank')).toMatchObject({ state: 'up' });
+    expect(h.spy.mock.calls.filter(([t]) => t.category === 'bank').map(([t]) => t.country)).not.toContain('US');
   });
 
   it('sends nothing once its signal is aborted', async () => {
@@ -191,7 +210,7 @@ describe('a country check', () => {
     expect(h.state('BANXA')).toMatchObject({ state: 'up', failures: 0 });
     expect(h.calls('BANXA', 'DE')).toBe(2);
     expect(lines(h.log.warn)).toEqual([
-      'provider BANXA buy in DE is down after 2 failed probe rounds in DE/EUR: expected an offer, observed INCOMPATIBLE_REQUEST (Meld request req-1)',
+      'provider BANXA buy card in DE is down after 2 failed probe rounds in DE/EUR: expected an offer, observed INCOMPATIBLE_REQUEST (Meld request req-1)',
     ]);
   });
 
@@ -279,14 +298,14 @@ describe('startProviderProbes', () => {
       { store, quote, jobs: [{ crypto: 'DOT', direction: 'buy' }], log: { info: vi.fn(), warn: vi.fn() } },
       OPTIONS,
     );
-    probes.suspect([{ provider: 'BANXA', direction: 'buy', scope: 'DE' }]);
+    probes.suspect([{ provider: 'BANXA', direction: 'buy', category: 'card', scope: 'DE' }]);
     await vi.waitFor(() => {
       expect(quote).toHaveBeenCalledWith(expect.objectContaining({ provider: 'BANXA', country: 'DE' }));
     });
     await probes.stop();
 
     const calls = quote.mock.calls.length;
-    probes.suspect([{ provider: 'TRANSAK', direction: 'buy', scope: 'DE' }]);
+    probes.suspect([{ provider: 'TRANSAK', direction: 'buy', category: 'card', scope: 'DE' }]);
     await new Promise((resolve) => setImmediate(resolve));
     expect(quote).toHaveBeenCalledTimes(calls);
   });
@@ -304,7 +323,7 @@ describe('startProviderProbes', () => {
       { store, quote: banxaDown, jobs: [{ crypto: 'DOT', direction: 'buy' }], log, random: () => 0 },
       { ...OPTIONS, intervalMs: 5 },
     );
-    probes.suspect([{ provider: 'BANXA', direction: 'buy', scope: 'DE' }]);
+    probes.suspect([{ provider: 'BANXA', direction: 'buy', category: 'card', scope: 'DE' }]);
     await vi.waitFor(() => {
       expect(lines(log.warn)).toEqual(
         expect.arrayContaining([
@@ -340,6 +359,7 @@ describe('pinnedQuote', () => {
   const target: ProbeTarget = {
     provider: 'TRANSAK',
     direction: 'buy',
+    category: 'card',
     country: 'GB',
     fiat: 'GBP',
     crypto: 'DOT',

@@ -59,9 +59,11 @@ return:
   provider serves it at all.
 - An off-ramp method is available when one of its lanes is, and its bound spans the available
   lanes.
+- Health is kept per provider, direction and method category (`card`, `bank`, `wallet`,
+  `other`). A provider down for card buys still serves bank buys and every sell.
 - A provider can be down in one country only. When a live `POST /quote` lacks an offer from a
   provider the corridor lists, and the amount is within that provider's limits, the probes check
-  that provider everywhere and then in that country.
+  that provider for that direction and method category everywhere and then in that country.
 
 A probe proves that a provider prices a request, not that its widget, KYC or settlement works.
 When probes stop reaching a conclusion, a down provider counts as available again after three

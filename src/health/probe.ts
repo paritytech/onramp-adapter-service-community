@@ -117,7 +117,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions): Prober {
   };
 
   const report = (group: ProbeGroup, previous: ProviderHealthRow | undefined, next: ProviderHealthRow): void => {
-    const name = `provider ${next.provider} ${next.direction}${next.scope === GLOBAL_SCOPE ? '' : ` in ${next.scope}`}`;
+    const name = `provider ${next.provider} ${next.direction} ${next.category}${next.scope === GLOBAL_SCOPE ? '' : ` in ${next.scope}`}`;
     const where = group.targets.map((t) => `${t.country}/${t.fiat}`).join(', ');
     const wasDown = previous?.state === 'down';
     if (next.state === 'down' && !wasDown) {
@@ -166,7 +166,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions): Prober {
     }
   };
 
-  const globalKey = (group: ProbeGroup): HealthKey => ({ provider: group.provider, direction: group.direction, scope: GLOBAL_SCOPE });
+  const globalKey = ({ provider, direction, category }: ProbeGroup): HealthKey => ({ provider, direction, category, scope: GLOBAL_SCOPE });
 
   const isDue = (key: HealthKey): boolean => clock() - (checkedAt.get(keyOf(key)) ?? -Infinity) >= options.intervalMs;
 
@@ -174,9 +174,9 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions): Prober {
   const checkCountries = async (suspects: readonly HealthKey[], { rows, known }: Snapshot, pass: Pass): Promise<void> => {
     for (const key of suspects) {
       if (known.get(keyOf({ ...key, scope: GLOBAL_SCOPE }))?.state === 'down') continue;
-      const target = countryTarget(rows, key.provider, key.direction, key.scope, options);
+      const target = countryTarget(rows, key, options);
       if (target === undefined) continue;
-      if (!(await settle({ provider: key.provider, direction: key.direction, targets: [target] }, key, known, pass))) return;
+      if (!(await settle({ provider: key.provider, direction: key.direction, category: key.category, targets: [target] }, key, known, pass))) return;
     }
   };
 
@@ -206,7 +206,9 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions): Prober {
     const pass = { signal, limit: Math.floor(options.maxProbesPerHour * CHECK_SHARE) };
     const current = await snapshot();
     for (const group of probeGroups(current.rows, options, random)) {
-      const suspected = due.some((key) => key.provider === group.provider && key.direction === group.direction);
+      const suspected = due.some(
+        (key) => key.provider === group.provider && key.direction === group.direction && key.category === group.category,
+      );
       if (!suspected || !isDue(globalKey(group))) continue;
       if (!(await settle(group, globalKey(group), current.known, pass))) return;
     }

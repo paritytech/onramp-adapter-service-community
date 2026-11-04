@@ -459,7 +459,7 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
         .map((r) => structuredClone(r)),
     readProviderHealth: async () => [...health.values()].map((r) => structuredClone(r)),
     writeProviderHealth: async (row: ProviderHealthRow) => {
-      health.set(`${row.provider}|${row.direction}|${row.scope}`, structuredClone(row));
+      health.set(`${row.provider}|${row.direction}|${row.category}|${row.scope}`, structuredClone(row));
     },
     close: async () => undefined,
   };

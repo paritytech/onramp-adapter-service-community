@@ -649,9 +649,9 @@ afterEach(async () => {
     expect(quote.statusCode).toBe(200);
 
     await vi.waitFor(() => {
-      expect(lines.join('')).toContain('provider BANXA buy is down after 2 failed probe rounds in US/USD');
+      expect(lines.join('')).toContain('provider BANXA buy card is down after 2 failed probe rounds in US/USD');
     });
-    expect(lines.join('')).toContain('provider BANXA buy failed a probe round in US/USD');
+    expect(lines.join('')).toContain('provider BANXA buy card failed a probe round in US/USD');
     expect(pinned).toHaveLength(2);
   });
 

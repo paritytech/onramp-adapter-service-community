@@ -321,7 +321,8 @@ export class Onramp {
     }
     const offered = new Set('quotes' in answer ? answer.quotes.map(offeredBy) : []);
     const method = corridor.methods.find((m) => m.paymentMethodType === priced.paymentMethodType);
-    const missing = (method?.providers ?? []).filter(
+    if (method === undefined) return;
+    const missing = method.providers.filter(
       (p) =>
         !offered.has(p.provider) &&
         ('quotes' in answer || classifyError(p.provider, answer.error).outcome === 'down') &&
@@ -329,7 +330,7 @@ export class Onramp {
           (compareDecimal(priced.sourceAmount, p.min) >= 0 && compareDecimal(priced.sourceAmount, p.max) <= 0)),
     );
     if (missing.length > 0) {
-      this.suspect(missing.map((p) => ({ provider: p.provider, direction: priced.direction, scope: priced.countryCode })));
+      this.suspect(missing.map((p) => ({ provider: p.provider, direction: priced.direction, category: method.category, scope: priced.countryCode })));
     }
   }
 

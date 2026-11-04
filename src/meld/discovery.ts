@@ -111,8 +111,10 @@ const fiatLimitsEnvelope = z.object({ fiatLimits: z.array(fiatLimitRow).nullish(
 
 // --- normalised output --------------------------------------------------------
 
-/** The category a UI groups a method under: `card` or `bank`. */
-export type MethodCategory = 'card' | 'bank' | 'wallet' | 'other';
+/** The categories a UI groups methods under. */
+export const METHOD_CATEGORIES = ['card', 'bank', 'wallet', 'other'] as const;
+
+export type MethodCategory = (typeof METHOD_CATEGORIES)[number];
 
 /** One provider's bound for a method, in the method's `currency`. */
 export interface ProviderLimit extends Bound {

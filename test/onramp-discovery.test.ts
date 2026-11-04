@@ -4,6 +4,7 @@ import type { AuditEvent, AuditLog } from '../src/audit.js';
 import { Refusal, reject } from '../src/contract.js';
 import type { Config } from '../src/config.js';
 import { activeCatalog } from '../src/meld/catalog.js';
+import type { HealthKey } from '../src/health/transition.js';
 import { MeldHttpError } from '../src/meld/client.js';
 import { Onramp } from '../src/onramp.js';
 import type { Corridor, CountryRow, Discovery, MethodLimit } from '../src/meld/discovery.js';
@@ -672,6 +673,7 @@ describe('provider health', () => {
     await store.writeProviderHealth({
       provider: 'BANXA',
       direction: 'buy',
+      category: 'card',
       scope: 'global',
       state: 'down',
       failures: 2,
@@ -742,7 +744,7 @@ describe('reporting providers a live quote misses', () => {
   const harness = (quote: () => Promise<unknown[]>, discovery = fakeDiscovery({ methods: [both] })) => {
     const rail = new FakeMeld();
     rail.quote = quote;
-    const suspect = vi.fn<(keys: readonly { provider: string; direction: string; scope: string }[]) => void>();
+    const suspect = vi.fn<(keys: readonly HealthKey[]) => void>();
     const svc = new Onramp(config(), { meld: rail }, new FakeAudit(), fakeStore(), rail, () => NOW, () => 'f', discovery, suspect);
     return { svc, suspect };
   };
@@ -751,7 +753,7 @@ describe('reporting providers a live quote misses', () => {
     const { svc, suspect } = harness(async () => [{ serviceProvider: 'TRANSAK' }]);
     await svc.quote(quoteBody({ sourceAmount: '100' }));
     await vi.waitFor(() => {
-      expect(suspect).toHaveBeenCalledWith([{ provider: 'BANXA', direction: 'buy', scope: 'US' }]);
+      expect(suspect).toHaveBeenCalledWith([{ provider: 'BANXA', direction: 'buy', category: 'card', scope: 'US' }]);
     });
   });
 
@@ -768,7 +770,7 @@ describe('reporting providers a live quote misses', () => {
     });
     await expect(svc.quote(quoteBody({ sourceAmount: '100' }))).rejects.toBeInstanceOf(MeldHttpError);
     await vi.waitFor(() => {
-      expect(suspect).toHaveBeenCalledWith(expect.arrayContaining([{ provider: 'BANXA', direction: 'buy', scope: 'US' }]));
+      expect(suspect).toHaveBeenCalledWith(expect.arrayContaining([{ provider: 'BANXA', direction: 'buy', category: 'card', scope: 'US' }]));
     });
   });
 
@@ -778,6 +780,17 @@ describe('reporting providers a live quote misses', () => {
       discovery.corridor = async () => {
         throw new Error('meld catalog unreachable');
       };
+      return [{ serviceProvider: 'TRANSAK' }];
+    }, discovery);
+    await svc.quote(quoteBody({ sourceAmount: '100' }));
+    await settle();
+    expect(suspect).not.toHaveBeenCalled();
+  });
+
+  it('reports nothing when the corridor no longer lists the quoted method', async () => {
+    const discovery = fakeDiscovery({ methods: [both] });
+    const { svc, suspect } = harness(async () => {
+      discovery.corridor = async (country, fiat, crypto) => ({ country, fiat, crypto, methods: [] });
       return [{ serviceProvider: 'TRANSAK' }];
     }, discovery);
     await svc.quote(quoteBody({ sourceAmount: '100' }));
