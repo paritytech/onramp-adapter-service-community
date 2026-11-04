@@ -100,7 +100,6 @@ data:
       "health": {
         "enabled": {{ .Values.health.enabled }},
         "interval_ms": {{ int .Values.health.interval_ms }},
-        "preferred_countries": {{ .Values.health.preferred_countries | toJson }},
         "sell_amounts": {{ .Values.health.sell_amounts | toJson }}
       }
     }

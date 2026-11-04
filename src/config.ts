@@ -610,7 +610,6 @@ const configSchema = z
         failures_to_down: z.number().int().min(1).max(10).default(2),
         throttle_pause_ms: z.number().int().min(60_000).max(86_400_000).default(900_000),
         max_probes_per_hour: z.number().int().min(1).max(10_000).default(120),
-        preferred_countries: z.array(z.string().regex(/^[A-Z]{2}$/, 'An ISO 3166-1 alpha-2 code.')).default(['US', 'GB']),
         sell_amounts: z
           .array(
             z

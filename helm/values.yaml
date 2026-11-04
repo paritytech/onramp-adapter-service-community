@@ -221,13 +221,12 @@ supported:
     # - { asset: usdc@solana }
 
 # Provider probes behind `provider_health`: one Meld quote per provider and direction, pinned to that
-# provider, in two fiat currencies. A provider Meld lists but cannot price is marked down. Runs only
-# while `supported.enabled` is true, because the probes are chosen from its corridors.
+# provider, in two countries picked at random each round with different fiat currencies. A provider
+# Meld lists but cannot price is marked down. Runs only while `supported.enabled` is true, because
+# the probes are chosen from its corridors.
 health:
   enabled: true
   interval_ms: 600000
-  # Countries probed first, in this order.
-  preferred_countries: [US, GB]
   # The crypto a sell probe prices, per asset. A sell asset without an amount is not probed. An
   # amount outside a provider's limits is inconclusive, never a failure.
   sell_amounts:

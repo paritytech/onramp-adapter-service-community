@@ -308,7 +308,6 @@ export async function start(
               failuresToDown: cfg.health.failures_to_down,
               throttlePauseMs: cfg.health.throttle_pause_ms,
               maxProbesPerHour: cfg.health.max_probes_per_hour,
-              preferredCountries: cfg.health.preferred_countries,
               sellAmounts: new Map(cfg.health.sell_amounts.map(({ code, amount }) => [code, amount])),
             },
             exclusive,

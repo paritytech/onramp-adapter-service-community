@@ -24,14 +24,9 @@ export interface ProbeGroup {
 }
 
 export interface TargetOptions {
-  /** Countries tried first, in this order. */
-  preferredCountries: readonly string[];
   /** The crypto a sell probe commits, by Meld code. A sell corridor without one is not probed. */
   sellAmounts: ReadonlyMap<string, string>;
 }
-
-/** At most this many targets per group, each in a different fiat currency. */
-const TARGETS_PER_GROUP = 2;
 
 interface Candidate {
   target: ProbeTarget;
@@ -39,19 +34,28 @@ interface Candidate {
 }
 
 /**
- * The probe groups the stored corridors support. A group's targets use different fiat currencies,
- * so an outage in one region cannot mark a provider down everywhere. Card methods and the preferred
- * countries come first; the rest is ordered by code, so the choice is stable across passes.
+ * Each round probes a provider in two countries picked at random among those its stored corridors
+ * list it in, with different fiat currencies, so an outage in one region cannot mark it down
+ * everywhere. Every country weighs the same, however many methods it lists.
  */
-export function probeGroups(rows: readonly SupportedCorridorRow[], options: TargetOptions): ProbeGroup[] {
-  const rank = (country: string): number => {
-    const index = options.preferredCountries.indexOf(country);
-    return index === -1 ? options.preferredCountries.length : index;
-  };
+export function probeGroups(rows: readonly SupportedCorridorRow[], options: TargetOptions, random: () => number): ProbeGroup[] {
+  return perCountry(rows, options).map(({ provider, direction, targets }) => {
+    const first = pick(targets, random) ?? targets[0];
+    const second = pick(
+      targets.filter((t) => t.fiat !== first.fiat),
+      random,
+    );
+    return { provider, direction, targets: second === undefined ? [first] : [first, second] };
+  });
+}
+
+const pick = <T>(list: readonly T[], random: () => number): T | undefined => list[Math.floor(random() * list.length)];
+
+/** One target per country for each provider and direction, a card method first, ordered by country code. */
+function perCountry(rows: readonly SupportedCorridorRow[], options: TargetOptions): ProbeGroup[] {
   const candidates = rows.flatMap((row) => candidatesOf(row, options));
   candidates.sort(
     (a, b) =>
-      rank(a.target.country) - rank(b.target.country) ||
       a.target.country.localeCompare(b.target.country) ||
       Number(b.card) - Number(a.card) ||
       a.target.crypto.localeCompare(b.target.crypto) ||
@@ -64,7 +68,7 @@ export function probeGroups(rows: readonly SupportedCorridorRow[], options: Targ
     const group = groups.get(key);
     if (group === undefined) {
       groups.set(key, { provider: target.provider, direction: target.direction, targets: [target] });
-    } else if (group.targets.length < TARGETS_PER_GROUP && group.targets.every((t) => t.fiat !== target.fiat)) {
+    } else if (group.targets[group.targets.length - 1]?.country !== target.country) {
       group.targets.push(target);
     }
   }
@@ -98,7 +102,7 @@ function buyAmount({ min, max }: ProviderLimit): string | undefined {
   return compareDecimal(doubled, max) <= 0 ? doubled : min;
 }
 
-/** The target that tests `provider` in one country, chosen as `probeGroups` would choose it. */
+/** The target that tests `provider` in one country, chosen as `probeGroups` would choose it there. */
 export function countryTarget(
   rows: readonly SupportedCorridorRow[],
   provider: string,
@@ -107,5 +111,5 @@ export function countryTarget(
   options: TargetOptions,
 ): ProbeTarget | undefined {
   const local = rows.filter((row) => row.country === country && row.direction === direction);
-  return probeGroups(local, options).find((group) => group.provider === provider)?.targets[0];
+  return perCountry(local, options).find((group) => group.provider === provider)?.targets[0];
 }

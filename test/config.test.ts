@@ -965,7 +965,6 @@ describe('parseConfig', () => {
         failures_to_down: 2,
         throttle_pause_ms: 900_000,
         max_probes_per_hour: 120,
-        preferred_countries: ['US', 'GB'],
         sell_amounts: [],
       });
     });
@@ -976,7 +975,7 @@ describe('parseConfig', () => {
       ]);
     });
 
-    it('refuses a malformed, zero or duplicated sell amount and a country that is not a code', () => {
+    it('refuses a malformed, zero or duplicated sell amount', () => {
       expect(health({ sell_amounts: [{ asset: 'dot@assethub', amount: '1e3' }] })).toThrow(/plain decimal/);
       expect(health({ sell_amounts: [{ asset: 'dot@assethub', amount: '0.00' }] })).toThrow(/above zero/);
       expect(
@@ -987,7 +986,6 @@ describe('parseConfig', () => {
           ],
         }),
       ).toThrow(/Duplicate sell amount "dot@assethub"/);
-      expect(health({ preferred_countries: ['usa'] })).toThrow(/alpha-2/);
     });
 
     it('refuses a sell amount for an asset `assets` does not name', () => {

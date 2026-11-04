@@ -14,7 +14,6 @@ const OPTIONS: ProbeOptions = {
   failuresToDown: 2,
   throttlePauseMs: 900_000,
   maxProbesPerHour: 100,
-  preferredCountries: ['US', 'GB'],
   sellAmounts: new Map(),
 };
 
@@ -60,7 +59,8 @@ function harness(quote: PinnedQuote, options: Partial<ProbeOptions> = {}) {
     },
   };
   const prober = createProber(
-    { store, quote: spy, jobs: [{ crypto: 'DOT', direction: 'buy' }], log, clock: () => now },
+    // The last country by code, then the last with another fiat: US, then GB.
+    { store, quote: spy, jobs: [{ crypto: 'DOT', direction: 'buy' }], log, clock: () => now, random: () => 0.9 },
     { ...OPTIONS, ...options },
   );
   return {
@@ -301,10 +301,8 @@ describe('startProviderProbes', () => {
     };
     const log = { info: vi.fn<(message: string) => void>(), warn: vi.fn<(message: string) => void>() };
     const probes = startProviderProbes(
-      { store, quote: banxaDown, jobs: [{ crypto: 'DOT', direction: 'buy' }], log },
+      { store, quote: banxaDown, jobs: [{ crypto: 'DOT', direction: 'buy' }], log, random: () => 0 },
       { ...OPTIONS, intervalMs: 5 },
-      undefined,
-      () => 0,
     );
     probes.suspect([{ provider: 'BANXA', direction: 'buy', scope: 'DE' }]);
     await vi.waitFor(() => {
@@ -327,10 +325,8 @@ describe('startProviderProbes', () => {
     };
     const log = { info: vi.fn(), warn: vi.fn() };
     const probes = startProviderProbes(
-      { store, quote, jobs: [{ crypto: 'DOT', direction: 'buy' }], log },
+      { store, quote, jobs: [{ crypto: 'DOT', direction: 'buy' }], log, random: () => 0 },
       { ...OPTIONS, intervalMs: 5 },
-      undefined,
-      () => 0,
     );
     await vi.waitFor(() => {
       expect(quote).toHaveBeenCalled();

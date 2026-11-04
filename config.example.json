@@ -125,7 +125,6 @@
   "health": {
     "enabled": true,
     "interval_ms": 600000,
-    "preferred_countries": ["US", "GB"],
     "sell_amounts": [{ "asset": "dot@assethub", "amount": "15" }]
   }
 }

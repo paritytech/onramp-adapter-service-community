@@ -34,6 +34,8 @@ export interface ProbeDeps {
   jobs: readonly RefreshJob[];
   log: ProbeLog;
   clock?: () => number;
+  /** Picks the probed countries and the jitter. */
+  random?: () => number;
 }
 
 const HOUR_MS = 3_600_000;
@@ -74,6 +76,7 @@ export interface Prober {
 
 export function createProber(deps: ProbeDeps, options: ProbeOptions): Prober {
   const clock = deps.clock ?? Date.now;
+  const random = deps.random ?? Math.random;
   const spent: number[] = [];
   const checkedAt = new Map<string, number>();
   let pausedUntil = 0;
@@ -185,7 +188,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions): Prober {
     try {
       const pass = { signal, limit: options.maxProbesPerHour };
       const current = await snapshot();
-      for (const group of probeGroups(current.rows, options)) {
+      for (const group of probeGroups(current.rows, options, random)) {
         if (!(await settle(group, globalKey(group), current.known, pass))) return;
       }
       const outages = [...current.known.values()].filter((row) => row.scope !== GLOBAL_SCOPE && row.state === 'down');
@@ -202,7 +205,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions): Prober {
     if (due.length === 0) return;
     const pass = { signal, limit: Math.floor(options.maxProbesPerHour * CHECK_SHARE) };
     const current = await snapshot();
-    for (const group of probeGroups(current.rows, options)) {
+    for (const group of probeGroups(current.rows, options, random)) {
       const suspected = due.some((key) => key.provider === group.provider && key.direction === group.direction);
       if (!suspected || !isDue(globalKey(group))) continue;
       if (!(await settle(group, globalKey(group), current.known, pass))) return;
@@ -221,11 +224,11 @@ export function startProviderProbes(
   deps: ProbeDeps,
   options: ProbeOptions,
   exclusive: Serial = serial(),
-  random: () => number = Math.random,
 ): { stop: (graceMs?: number) => Promise<void>; suspect: (keys: readonly HealthKey[]) => void } {
   const controller = new AbortController();
   const { signal } = controller;
   const { round, check } = createProber(deps, options);
+  const random = deps.random ?? Math.random;
   const pending = new Map<string, HealthKey>();
   const checks = new Set<Promise<void>>();
   let scheduled = false;
