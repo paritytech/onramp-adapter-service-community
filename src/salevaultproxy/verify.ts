@@ -152,7 +152,7 @@ export async function verifyWindow(
   v: VerifiedSaleVaultProxy,
   chainflip: Pick<ChainflipSource, 'arbitrumVault' | 'returnRoute' | 'bounds' | 'brokerRegistered'>,
 ): Promise<void> {
-  // A moved Vault stops new sells only, release and relay never send to it
+  // A moved Vault stops new sells only, release never sends to it
   const liveVault = await chainflip.arbitrumVault();
   if (liveVault !== v.vault) fail(`Chainflip's Arbitrum vault is ${liveVault}, config says ${v.vault}`);
   const route = await encoderRoute(v, chainflip);

@@ -35,7 +35,6 @@ import {
   supportedOfframpCorridorsQuery,
   supportedOfframpQuery,
   redeemRequest,
-  relayRequest,
   malformedRequest,
   notFound,
   Refusal,
@@ -48,7 +47,6 @@ import { AssetCatalog } from './meld/catalog.js';
 import { toCorridorDto } from './meld/discovery.js';
 import { toFundingRequestDto } from './funding/types.js';
 import { MeldHttpError } from './meld/client.js';
-import type { SaleVaultProxyRelay } from './salevaultproxy/relay.js';
 import type { SaleVaultProxyService } from './salevaultproxy/service.js';
 import { saleVaultProxyPayload } from './salevaultproxy/verify.js';
 import { railRefusal } from './meld/refusal.js';
@@ -95,7 +93,6 @@ export async function buildServer(
   personhood?: PersonhoodService,
   logDestination?: LogDestination,
   saleVaultProxy?: SaleVaultProxyService,
-  relay?: SaleVaultProxyRelay,
 ): Promise<FastifyInstance> {
   const app = Fastify({
     // A request id on every log line and every error body, so a support conversation can
@@ -434,13 +431,6 @@ export async function buildServer(
     return reply.send({ sale });
   });
 
-  // Relay a claimer's signed USDC transferWithAuthorization through the keeper. 202 once broadcast.
-  app.post('/offramp/relay', asCaller, async (request, reply) => {
-    const subject = gate.subjectOf(request);
-    const body = parse(relayRequest, request.body);
-    if (relay === undefined) throw saleVaultProxyUnavailable('the relay needs a running sale vault proxy keeper');
-    return reply.code(202).send({ relay: await relay.relay(subject, body) });
-  });
 
   // A body-less `POST` must not depend on the caller omitting a header.
   //

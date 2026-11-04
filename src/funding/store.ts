@@ -168,7 +168,7 @@ export interface KeeperCandidate extends NewSaleVaultProxyRow {
 }
 
 /** The keeper's on-chain actions, pinned by a CHECK in `schema.ts`. */
-export type ProxyCallAction = 'deliver' | 'expire' | 'flush' | 'deploy' | 'return' | 'release' | 'skim' | 'pause' | 'relay';
+export type ProxyCallAction = 'deliver' | 'expire' | 'flush' | 'deploy' | 'return' | 'release' | 'skim' | 'pause';
 
 /** USDC that reached a claimer: a proxy's release or a factory flush the proxy refused. */
 export type PayoutKind = 'released' | 'flushed';
@@ -197,7 +197,7 @@ export interface WatchedProxy {
 /** A keeper call's lifecycle, pinned by a CHECK in `schema.ts`. */
 export type ProxyCallStatus = 'sending' | 'sent' | 'mined' | 'reverted' | 'dropped';
 
-/** A keeper call before it is signed. For a skim or a pause `proxy` holds the factory, for a relay the claimer. */
+/** A keeper call before it is signed. For a skim or a pause `proxy` holds the factory. */
 export interface NewProxyCall {
   id: string;
   chain_id: number;
@@ -1130,25 +1130,6 @@ export class FundingStore {
       [fundingRequestId],
     );
     return result.rows[0];
-  }
-
-  // Whether a sale of this product recorded this claimer, the relay's only gate on whose USDC it moves
-  async isSellerClaimer(productId: string, claimer: string): Promise<boolean> {
-    const result = await this.pool.query(
-      'SELECT 1 FROM funding_requests WHERE seller_claimer = $1 AND product_id = $2 LIMIT 1',
-      [claimer.toLowerCase(), productId],
-    );
-    return result.rowCount === 1;
-  }
-
-  // Whether an address is any sale's claimer or one of the chain's recorded proxies
-  async isSaleAddress(chainId: number, address: string): Promise<boolean> {
-    const result = await this.pool.query(
-      'SELECT 1 FROM funding_requests WHERE seller_claimer = $1 ' +
-        'UNION ALL SELECT 1 FROM sale_vault_proxies WHERE chain_id = $2 AND proxy = $1 LIMIT 1',
-      [address.toLowerCase(), chainId],
-    );
-    return result.rowCount === 1;
   }
 
   // Every payout recorded to one home and claimer on a factory, oldest first, with when the keeper read it

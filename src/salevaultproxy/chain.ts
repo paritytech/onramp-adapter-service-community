@@ -7,7 +7,6 @@ import {
   decodeClaimerProxyState,
   decodeDelivery,
   decodeUint,
-  encodeAuthorizationState,
   encodeBalanceOf,
   encodeCall,
   encodeClaimerTermsCall,
@@ -187,16 +186,6 @@ export class SaleVaultProxyChain {
 
   async usdcBalance(usdc: string, address: string): Promise<bigint> {
     return this.decoded(await this.call(usdc, encodeBalanceOf(address)), decodeUint, 'balanceOf');
-  }
-
-  /** A no-argument bytes32 getter such as `DOMAIN_SEPARATOR()`, lowercase. */
-  async bytes32Of(to: string, signature: string): Promise<string> {
-    return this.decoded(await this.call(to, encodeCall(signature)), decodeBytes32, signature);
-  }
-
-  /** Whether an EIP-3009 authorization nonce of `authorizer` is used or cancelled. */
-  async authorizationUsed(token: string, authorizer: string, nonce: string): Promise<boolean> {
-    return this.decoded(await this.call(token, encodeAuthorizationState(authorizer, nonce)), decodeBool, 'authorizationState');
   }
 
   /** USDC the factory owes a home and claimer that a delivery could not move to its proxy. */

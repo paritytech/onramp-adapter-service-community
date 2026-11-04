@@ -500,33 +500,6 @@ export const createSessionRequest = z
     directionalFields(value, ctx, true);
   });
 
-// A uint256 as a decimal string without leading zeros
-const uint256Decimal = z
-  .string()
-  // Aborts, so BigInt never sees a string that is not a whole number
-  .regex(/^(0|[1-9][0-9]*)$/, { message: 'Must be a whole number.', abort: true })
-  .refine((v) => BigInt(v) < 2n ** 256n, 'Must fit in a uint256.');
-
-/** The POST /offramp/relay body, one EIP-3009 transferWithAuthorization a claimer signed. */
-export const relayRequest = z
-  .object({
-    from: evmAccount,
-    to: evmAccount,
-    /** USDC base units, a transfer of nothing only spends gas. */
-    value: uint256Decimal.refine((v) => v !== '0', 'Must be greater than zero.'),
-    /** Unix seconds, the token accepts the transfer strictly after it. */
-    validAfter: uint256Decimal,
-    /** Unix seconds, the token accepts the transfer strictly before it. */
-    validBefore: uint256Decimal,
-    nonce: z.string().regex(/^0x[0-9a-fA-F]{64}$/, 'Must be 32 bytes of hex.'),
-    /** r, s and v as 65 bytes of hex, v 27 or 28. */
-    signature: z.string().regex(/^0x[0-9a-fA-F]{130}$/, 'Must be 65 bytes of hex.'),
-  })
-  .strict();
-
-/** A validated `POST /offramp/relay` body. */
-export type RelayRequest = z.infer<typeof relayRequest>;
-
 /** A validated `POST /quote` body. */
 export type QuoteRequest = z.infer<typeof quoteRequest>;
 /** A validated `POST /session` body. */

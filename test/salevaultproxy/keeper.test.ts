@@ -2012,28 +2012,13 @@ describe('signing', () => {
   });
 });
 
-describe('relay', () => {
-  it('sends a claimer transfer through the signing queue, keyed by the claimer, one in flight', async () => {
-    const mem = memoryStore([]);
-    const { keeper } = keeperFor(world(), mem);
-    expect(await keeper.relay(421614, SEPOLIA.usdc, CLAIMER, '0xe3ee160e', 5n)).toBe('sent');
-    expect(mem.calls).toMatchObject([{ action: 'relay', target: SEPOLIA.usdc, proxy: CLAIMER, amount: '5', status: 'sent' }]);
-    expect(await keeper.relay(421614, SEPOLIA.usdc, CLAIMER, '0xe3ee160e', 5n)).toBe('skipped');
-  });
-
+describe('claimerBalance', () => {
   it("reads a claimer's live balance in the deployment's own USDC", async () => {
     const w0 = world({ balance: 7n });
     const { keeper } = keeperFor(w0, memoryStore([]));
     await keeper.verify();
     expect(await keeper.claimerBalance(keeper.current() as NonNullable<ReturnType<typeof keeper.current>>, PROXY)).toBe(7n);
     expect(w0.calls.at(-1)?.params[0]).toMatchObject({ to: SEPOLIA.usdc, data: encodeBalanceOf(PROXY) });
-  });
-
-  it('answers locked, not skipped, while another replica holds the keeper lock', async () => {
-    const mem = memoryStore([]);
-    mem.otherReplica(true);
-    expect(await keeperFor(world(), mem).keeper.relay(421614, SEPOLIA.usdc, CLAIMER, '0xe3ee160e', 5n)).toBe('locked');
-    expect(mem.calls).toEqual([]);
   });
 });
 

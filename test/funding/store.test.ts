@@ -1228,27 +1228,6 @@ describe('the sale vault proxy tables', () => {
     });
   });
 
-  it('knows a claimer only under the product whose sale recorded it', async () => {
-    await withStore(async (store) => {
-      await store.create(sell({ wallet_address: PROXY, seller_account: SELLER, seller_claimer: CLAIMER }));
-      await store.create(sell({ id: 'funding-2', client_reference: 'other', wallet_address: PROXY, seller_account: SELLER }));
-      expect(await store.isSellerClaimer('app.dot', CLAIMER.toUpperCase().replace('0X', '0x'))).toBe(true);
-      expect(await store.isSellerClaimer('another-product', CLAIMER)).toBe(false);
-      expect(await store.isSellerClaimer('app.dot', `0x${'cd'.repeat(20)}`)).toBe(false);
-    });
-  });
-
-  it('knows any sale claimer and the chain recorded proxies as sale addresses', async () => {
-    await withStore(async (store) => {
-      await opened(store, 'a');
-      await store.create(sell({ id: 'b', client_reference: 'b', wallet_address: PROXY, seller_account: SELLER, seller_claimer: CLAIMER, product_id: 'another-product' }));
-      expect(await store.isSaleAddress(421614, PROXY.toUpperCase().replace('0X', '0x'))).toBe(true);
-      expect(await store.isSaleAddress(42161, PROXY)).toBe(false);
-      expect(await store.isSaleAddress(42161, CLAIMER)).toBe(true);
-      expect(await store.isSaleAddress(421614, RECIPIENT)).toBe(false);
-    });
-  });
-
   it('inserts once, lowercases addresses and the ref, reads back, and deletes', async () => {
     await withStore(async (store) => {
       await store.insertSaleVaultProxy(proxyRow('a'));

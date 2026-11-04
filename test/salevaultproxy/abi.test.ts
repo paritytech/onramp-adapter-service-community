@@ -13,7 +13,6 @@ import {
   decodePendingFlushed,
   decodeShortString,
   decodeUint,
-  encodeAuthorizationState,
   encodeBalanceOf,
   encodeCall,
   encodeClaimerTermsCall,
@@ -210,7 +209,6 @@ describe('the claimer-bound contract', () => {
 
   it('refuses a short or non-hex bytes32 nonce, ref or home', () => {
     for (const bad of [`0x${'ab'.repeat(31)}`, `0x${'zz'.repeat(32)}`]) {
-      expect(() => encodeAuthorizationState(CLAIMER, bad)).toThrow(/nonce is malformed/);
       expect(() => encodeHomeClaimerCall('flush(bytes32,address)', bad, CLAIMER)).toThrow(/home is malformed/);
       expect(() => encodeDelivery({ ...TERMS, ref: bad })).toThrow(/ref is malformed/);
     }

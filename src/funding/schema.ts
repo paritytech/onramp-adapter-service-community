@@ -23,7 +23,7 @@ import { DIRECTIONS } from '../rail.js';
 import { FUNDING_STATES } from './state.js';
 
 /** The current schema version. Bump with each migration added here. */
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 /** A migration: bring the previous version's rows to this version's shape. */
 export interface Migration {
@@ -240,7 +240,7 @@ const SELLER_CLAIMER_COLUMN = ' seller_claimer TEXT';
 const SELLER_CLAIMER_CONSTRAINT =
   "CONSTRAINT funding_seller_claimer CHECK (seller_claimer IS NULL OR (seller_account IS NOT NULL AND seller_claimer ~ '^0x[0-9a-f]{40}$'))";
 
-// The relay's lookup of a claimer under one product
+// Added at v10 for the claimer relay, dropped at v12 with it, kept here for the v9 -> v10 step
 const SELLER_CLAIMER_INDEX =
   'CREATE INDEX IF NOT EXISTS funding_by_seller_claimer ON funding_requests (seller_claimer, product_id) WHERE seller_claimer IS NOT NULL';
 
@@ -270,9 +270,9 @@ const SALE_VAULT_PROXIES_INDEXES = [
   'CREATE INDEX IF NOT EXISTS sale_vault_proxies_activity ON sale_vault_proxies (chain_id, factory, last_activity_at)',
 ];
 
-// The keeper actions a call row may carry, shared by the table and the v10 -> v11 step
+// The keeper actions a call row may carry, shared by the table and the v11 -> v12 step
 const SALE_VAULT_PROXY_CALLS_ACTION_CONSTRAINT =
-  "CONSTRAINT sale_vault_proxy_calls_action_known CHECK (action IN ('deliver', 'expire', 'flush', 'deploy', 'return', 'release', 'skim', 'pause', 'relay'))";
+  "CONSTRAINT sale_vault_proxy_calls_action_known CHECK (action IN ('deliver', 'expire', 'flush', 'deploy', 'return', 'release', 'skim', 'pause'))";
 
 // Every keeper transaction, claimed before it is signed and settled from its receipt
 const SALE_VAULT_PROXY_CALLS_TABLE =
@@ -363,7 +363,7 @@ const SALE_VAULT_PROXY_SCHEMA = [
  *
  * A fresh database is created at `SCHEMA_VERSION` directly by `freshSchema()`, so this list is
  * what an existing database walks through, one step at a time. The next migration appends
- * `{ from: 11, to: 12, sql: [...] }` and bumps `SCHEMA_VERSION`. `store.ts` needs no change.
+ * `{ from: 12, to: 13, sql: [...] }` and bumps `SCHEMA_VERSION`. `store.ts` needs no change.
  *
  * This chain is one-way. A build expecting v1 refuses a v2 database: the version check is
  * `!==`, deliberately, because reading a shape you do not understand is worse than not starting.
@@ -646,10 +646,21 @@ export const MIGRATIONS: readonly Migration[] = [
   {
     from: 10,
     to: 11,
-    // v10 -> v11: let a call row carry the keeper's pause action
+    // v10 -> v11: let a call row carry the keeper's pause action, its own shape since v12 drops relay
     sql: [
       'ALTER TABLE sale_vault_proxy_calls DROP CONSTRAINT sale_vault_proxy_calls_action_known',
+      "ALTER TABLE sale_vault_proxy_calls ADD CONSTRAINT sale_vault_proxy_calls_action_known CHECK (action IN ('deliver', 'expire', 'flush', 'deploy', 'return', 'release', 'skim', 'pause', 'relay'))",
+    ],
+  },
+  {
+    from: 11,
+    to: 12,
+    // v11 -> v12: the claimer relay is gone, drop its settled call rows, its action and its index
+    sql: [
+      "DELETE FROM sale_vault_proxy_calls WHERE action = 'relay'",
+      'ALTER TABLE sale_vault_proxy_calls DROP CONSTRAINT sale_vault_proxy_calls_action_known',
       `ALTER TABLE sale_vault_proxy_calls ADD ${SALE_VAULT_PROXY_CALLS_ACTION_CONSTRAINT}`,
+      'DROP INDEX IF EXISTS funding_by_seller_claimer',
     ],
   },
 ];
@@ -736,7 +747,6 @@ export function freshSchema(): string[] {
     // The supported-corridors cache, at the current (v8) shape. See the v7 -> v8 migration for
     // what an existing database walks through to reach the same table.
     SUPPORTED_CORRIDORS_TABLE_CURRENT,
-    SELLER_CLAIMER_INDEX,
     // The sale vault proxy tables, the same statements the v9 -> v10 migration runs
     ...SALE_VAULT_PROXY_SCHEMA,
   ];

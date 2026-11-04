@@ -56,7 +56,7 @@ export interface OfframpSaleDto {
   releaseAt: number | null;
   /** What release would send the claimer now. */
   releasable: string;
-  /** The claimer's live USDC balance, what a relay can move off it. */
+  /** The claimer's live USDC balance, what the seller can move with the claim key. */
   claimerBalance: string;
   /** Every release to the claimer the keeper read, oldest first. */
   released: PayoutDto[];
@@ -64,7 +64,7 @@ export interface OfframpSaleDto {
   flushedToClaimer: PayoutDto[];
   blockedReason: BlockedReason | null;
   call: {
-    action: Exclude<ProxyCallAction, 'skim' | 'pause' | 'relay'>;
+    action: Exclude<ProxyCallAction, 'skim' | 'pause'>;
     status: 'sending' | 'sent' | 'mined' | 'reverted' | 'dropped';
     txHash: string | null;
     at: number;
@@ -79,7 +79,7 @@ export type SaleVaultProxyServiceKeeper = Pick<SaleVaultProxyKeeper, 'trigger' |
 
 const STATUS_NAMES = ['none', 'paid', 'held'] as const;
 
-/** The refusal for a chain read that failed, shared with the relay. */
+/** The refusal for a chain read that failed. */
 export const chainUnavailable = (detail: string) =>
   reject(
     { tag: 'Other', value: { code: 'SALE_VAULT_PROXY_CHAIN_UNAVAILABLE', message: 'The sale vault proxy chain could not be read.' } },
@@ -144,7 +144,7 @@ export class SaleVaultProxyService {
     }
     const [latest, payouts] = await Promise.all([this.store.readLatestProxyCall(row.chain_id, row.proxy), this.store.readPayouts(row)]);
     const call =
-      latest === undefined || latest.action === 'skim' || latest.action === 'pause' || latest.action === 'relay'
+      latest === undefined || latest.action === 'skim' || latest.action === 'pause'
         ? null
         : { action: latest.action, status: latest.status, txHash: latest.tx_hash, at: latest.updated_at };
     return toDto(row, v, evaluation, sale, terms, this.clock(), call, payouts, claimerBalance);

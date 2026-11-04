@@ -59,13 +59,6 @@ export function encodeBalanceOf(address: string): string {
   return u8aToHex(u8aConcat(selector('balanceOf(address)'), bytes32(checked(address, EVM_ADDRESS, 'address'))));
 }
 
-/** calldata for USDC's EIP-3009 `authorizationState(address,bytes32)`. */
-export function encodeAuthorizationState(authorizer: string, nonce: string): string {
-  return u8aToHex(
-    u8aConcat(selector('authorizationState(address,bytes32)'), bytes32(checked(authorizer, EVM_ADDRESS, 'authorizer')), bytes32(checked(nonce, BYTES32, 'nonce'))),
-  );
-}
-
 /** One sale's exact terms, the key the factory books it under, the proxy keying it bar home and claimer. */
 export interface SaleTerms {
   readonly home: string;

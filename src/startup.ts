@@ -32,7 +32,6 @@ import { fetchTransport, SaleVaultProxyChain } from './salevaultproxy/chain.js';
 import { FailedCalls, type FailedCallSource } from './salevaultproxy/failed-calls.js';
 import { SaleVaultProxyKeeper, type KeeperLog, type KeeperStore } from './salevaultproxy/keeper.js';
 import { ReturnLimits } from './salevaultproxy/limits.js';
-import { SaleVaultProxyRelay } from './salevaultproxy/relay.js';
 import { SaleVaultProxyService } from './salevaultproxy/service.js';
 import { KeeperSigner, parseKeeperKey } from './salevaultproxy/signer.js';
 import { saleVaultProxyNetwork } from './salevaultproxy/networks.js';
@@ -178,11 +177,6 @@ export async function start(
           },
           keeperChain,
         );
-  // Only beside the keeper loop, which settles every call the relay sends
-  const relay =
-    keeper !== undefined && keeperChain !== undefined && cfg.sale_vault_proxy?.keeper.enabled === true
-      ? new SaleVaultProxyRelay(funding, keeperChain, keeper)
-      : undefined;
   const saleVaultProxy = (): VerifiedSaleVaultProxy | undefined => keeper?.verified();
 
   // The audit sink is the request logger: one append-only record per externally observable
@@ -207,7 +201,6 @@ export async function start(
       personhood,
       logDestination,
       new SaleVaultProxyService(funding, keeper),
-      relay,
     );
     // A non-optional handle for the callbacks below: `app` has to be declared outside this block
     // so the `catch` can close it, and TypeScript cannot narrow a mutable binding inside a closure.

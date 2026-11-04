@@ -215,7 +215,7 @@ export class SaleVaultProxyKeeper {
     return this.windowFits ? this.current() : undefined;
   }
 
-  /** The configured deployment once identity-verified, open to new sells or not, which a claimer's relay still needs after a retire. */
+  /** The configured deployment once identity-verified, open to new sells or not, still served after a retire. */
   current(): VerifiedSaleVaultProxy | undefined {
     return this.deployments.get(this.deps.deployment.factory.toLowerCase());
   }
@@ -960,11 +960,6 @@ export class SaleVaultProxyKeeper {
     if (outcome === 'sent') this.deps.log('error', `sale vault proxy factory ${v.factory} returns paused by the keeper: ${moved}, only its guardian unpauses`);
     // Another call on the factory key, such as a skim, holds the slot until it settles
     else this.deps.log('warn', `sale vault proxy factory ${v.factory} pause ${outcome}, sent again next pass: ${moved}`);
-  }
-
-  /** Send a claimer's signed USDC transfer, keyed by the claimer so one relay per claimer is in flight. */
-  async relay(chainId: number, usdc: string, claimer: string, data: string, amount: bigint): Promise<SendOutcome> {
-    return this.send(chainId, claimer, { action: 'relay', target: usdc, data, amount });
   }
 
   // Push a factory's free USDC to the treasury once it is worth the gas

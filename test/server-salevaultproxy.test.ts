@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { reject } from '../src/contract.js';
 import { buildServer } from '../src/server.js';
-import type { SaleVaultProxyRelay } from '../src/salevaultproxy/relay.js';
 import type { OfframpSaleDto, SaleVaultProxyService } from '../src/salevaultproxy/service.js';
 import type { VerifiedSaleVaultProxy } from '../src/salevaultproxy/verify.js';
 import { config } from './fixtures.js';
@@ -42,7 +41,7 @@ afterEach(async () => {
   app = undefined;
 });
 
-const serve = async (saleVaultProxy?: Partial<SaleVaultProxyService>, relay?: Partial<SaleVaultProxyRelay>) => {
+const serve = async (saleVaultProxy?: Partial<SaleVaultProxyService>) => {
   app = await buildServer(
     config(),
     () =>
@@ -52,7 +51,6 @@ const serve = async (saleVaultProxy?: Partial<SaleVaultProxyService>, relay?: Pa
     undefined,
     undefined,
     saleVaultProxy as SaleVaultProxyService | undefined,
-    relay as SaleVaultProxyRelay | undefined,
   );
   return app;
 };
@@ -138,35 +136,4 @@ describe('the sale vault proxy routes', () => {
     }
   });
 
-  it('POST /offramp/relay parses the body and answers 202 with the broadcast', async () => {
-    const body = {
-      from: '0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A',
-      to: '0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc',
-      value: '1500000',
-      validAfter: '0',
-      validBefore: '1900000000',
-      nonce: `0x${'cd'.repeat(32)}`,
-      signature: `0x${'11'.repeat(64)}1b`,
-    };
-    const relay = vi.fn(async () => ({ status: 'sent' as const, chainId: 421614, txHash: '0xabc' }));
-    const built = await serve(undefined, { relay });
-    const ok = await built.inject({ method: 'POST', url: '/offramp/relay', headers: DEV_HEADERS, payload: body });
-    expect(ok.statusCode).toBe(202);
-    expect(ok.json()).toEqual({ relay: { status: 'sent', chainId: 421614, txHash: '0xabc' } });
-    expect(relay).toHaveBeenCalledWith(expect.objectContaining({ productId: 'app.dot' }), { ...body, from: body.from.toLowerCase() });
-    const malformed = await built.inject({ method: 'POST', url: '/offramp/relay', headers: DEV_HEADERS, payload: { ...body, value: '0' } });
-    expect(malformed.statusCode).toBe(400);
-    // Not a whole number or a short mixed-case address answers 400, never a thrown refine
-    for (const bad of [{ value: '1.5' }, { value: 'abc' }, { validAfter: '1.5' }, { to: '0xAb' }]) {
-      const refused = await built.inject({ method: 'POST', url: '/offramp/relay', headers: DEV_HEADERS, payload: { ...body, ...bad } });
-      expect(refused.statusCode).toBe(400);
-      expect(refused.json()).toMatchObject({ error: { value: { code: 'MALFORMED_REQUEST' } } });
-    }
-    expect(relay).toHaveBeenCalledTimes(1);
-    await app?.close();
-    const unwired = await serve();
-    const absent = await unwired.inject({ method: 'POST', url: '/offramp/relay', headers: DEV_HEADERS, payload: body });
-    expect(absent.statusCode).toBe(503);
-    expect(absent.json()).toMatchObject({ error: { value: { code: 'SALE_VAULT_PROXY_UNAVAILABLE' } } });
-  });
 });

@@ -385,7 +385,7 @@ describe('the v5 -> v6 migration', () => {
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Not just [5, 6]: `openIn` always walks to `SCHEMA_VERSION`, so a database stamped at 5
       // takes the v6 to v11 steps in one boot.
-      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8, 9, 10, 11]);
+      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8, 9, 10, 11, 12]);
     } finally {
       await dropSchema(schema);
     }
@@ -506,8 +506,9 @@ describe('a fresh database and a migrated one are the same database', () => {
         expect(await tableConstraintsOf(migrated, table)).toEqual(await tableConstraintsOf(fresh, table));
       }
       expect(await saleVaultProxyIndexesOf(migrated)).toEqual(await saleVaultProxyIndexesOf(fresh));
+      // The claimer index was added at v10 for the relay and dropped at v12 with it
       expect(await claimerIndexOf(migrated)).toEqual(await claimerIndexOf(fresh));
-      expect(await claimerIndexOf(fresh)).toHaveLength(1);
+      expect(await claimerIndexOf(fresh)).toHaveLength(0);
     } finally {
       await dropSchema(fresh);
       await dropSchema(migrated);
@@ -538,7 +539,7 @@ describe('a fresh database and a migrated one are the same database', () => {
       }
       expect(await query(migrated, 'SELECT funding_request_id FROM vault_sales')).toEqual([{ funding_request_id: 'kept' }]);
       const applied = await query(migrated, 'SELECT version FROM schema_migrations ORDER BY version');
-      expect(applied.map((r) => Number(r.version))).toEqual([9, 10, 11]);
+      expect(applied.map((r) => Number(r.version))).toEqual([9, 10, 11, 12]);
     } finally {
       await dropSchema(fresh);
       await dropSchema(migrated);
@@ -554,7 +555,7 @@ describe('the v10 -> v11 migration', () => {
       await (await openIn(fresh)).close();
 
       // The v10 call table as first shipped, without the pause action
-      const atV10 = (sql: string): string => sql.replace("'skim', 'pause', 'relay'", "'skim', 'relay'");
+      const atV10 = (sql: string): string => sql.replace("'skim', 'pause'", "'skim', 'relay'");
       for (const sql of freshSchema().map(atV10)) await raw(migrated, sql);
       await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
       await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (10, 0)');
@@ -574,7 +575,51 @@ describe('the v10 -> v11 migration', () => {
         query(schema, "SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'sale_vault_proxy_calls'::regclass ORDER BY conname");
       expect(await constraintsOf(migrated)).toEqual(await constraintsOf(fresh));
       const applied = await query(migrated, 'SELECT version FROM schema_migrations ORDER BY version');
-      expect(applied.map((r) => Number(r.version))).toEqual([10, 11]);
+      expect(applied.map((r) => Number(r.version))).toEqual([10, 11, 12]);
+    } finally {
+      await dropSchema(fresh);
+      await dropSchema(migrated);
+    }
+  });
+});
+
+describe('the v11 -> v12 migration', () => {
+  it('clears relay rows, drops the relay action and its claimer index from a v11 database', async () => {
+    const fresh = await createSchema();
+    const migrated = await createSchema();
+    try {
+      await (await openIn(fresh)).close();
+
+      // The v11 call table and claimer index as shipped, with the relay action
+      const atV11 = (sql: string): string => sql.replace("'skim', 'pause'", "'skim', 'pause', 'relay'");
+      for (const sql of freshSchema().map(atV11)) await raw(migrated, sql);
+      await raw(migrated, 'CREATE INDEX IF NOT EXISTS funding_by_seller_claimer ON funding_requests (seller_claimer, product_id) WHERE seller_claimer IS NOT NULL');
+      // A settled relay call from when the feature was live, which the migration clears rather than choke on
+      await raw(
+        migrated,
+        "INSERT INTO sale_vault_proxy_calls (id, chain_id, sender, target, proxy, action, status, created_at, updated_at) VALUES ('relayed', 421614, '0x1', '0x2', '0x2', 'relay', 'mined', 1, 1)",
+      );
+      await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
+      await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (11, 0)');
+      await (await openIn(migrated)).close();
+
+      // The old relay row is gone, not left to fail the new action check
+      expect(await query(migrated, "SELECT 1 FROM sale_vault_proxy_calls WHERE action = 'relay'")).toEqual([]);
+      await expect(
+        raw(
+          migrated,
+          "INSERT INTO sale_vault_proxy_calls (id, chain_id, sender, target, proxy, action, created_at, updated_at) VALUES ('relayed', 421614, '0x1', '0x2', '0x2', 'relay', 1, 1)",
+        ),
+      ).rejects.toThrow(/sale_vault_proxy_calls_action_known/);
+      expect(
+        await query(migrated, "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'funding_by_seller_claimer'"),
+      ).toEqual([]);
+
+      const constraintsOf = async (schema: string) =>
+        query(schema, "SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'sale_vault_proxy_calls'::regclass ORDER BY conname");
+      expect(await constraintsOf(migrated)).toEqual(await constraintsOf(fresh));
+      const applied = await query(migrated, 'SELECT version FROM schema_migrations ORDER BY version');
+      expect(applied.map((r) => Number(r.version))).toEqual([11, 12]);
     } finally {
       await dropSchema(fresh);
       await dropSchema(migrated);
@@ -780,7 +825,7 @@ describe('the real migration chain', () => {
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     } finally {
       await dropSchema(schema);
     }

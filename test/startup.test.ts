@@ -1195,22 +1195,6 @@ describe('start with a sale vault proxy', () => {
     return path;
   };
 
-  // A well-formed relay from an address no sale recorded as its claimer
-  const relay = async (app: FastifyInstance) =>
-    app.inject({
-      method: 'POST',
-      url: '/offramp/relay',
-      headers: { 'x-dev-product-id': 'app.dot' },
-      payload: {
-        from: `0x${'19'.repeat(20)}`,
-        to: `0x${'3c'.repeat(20)}`,
-        value: '1',
-        validAfter: '0',
-        validBefore: '99999999999',
-        nonce: `0x${'cd'.repeat(32)}`,
-        signature: `0x${'11'.repeat(64)}1b`,
-      },
-    });
 
   const corridors = async (app: FastifyInstance) =>
     (await app.inject({ method: 'GET', url: '/supported/offramp/corridors', headers: { 'x-dev-product-id': 'app.dot' } })).json<{
@@ -1233,8 +1217,6 @@ describe('start with a sale vault proxy', () => {
       implementation: IMPL,
     });
     expect(lines.some((line) => line.includes('below keeper.min_eth'))).toBe(true);
-    // The relay runs beside the keeper loop and asks the store who is a claimer
-    expect((await relay(handle.app)).json()).toMatchObject({ error: { value: { code: 'RELAY_NOT_CLAIMER' } } });
     const stop = vi.spyOn(SaleVaultProxyKeeper.prototype, 'stop');
     try {
       await handle.close();
@@ -1256,8 +1238,6 @@ describe('start with a sale vault proxy', () => {
       });
       expect((await corridors(handle.app)).saleVaultProxy).toBeUndefined();
       expect(retry).toHaveBeenCalledTimes(1);
-      // No keeper loop to settle what it sends, so no relay
-      expect((await relay(handle.app)).statusCode).toBe(503);
     } finally {
       retry.mockRestore();
     }

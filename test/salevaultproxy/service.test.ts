@@ -260,7 +260,7 @@ describe('SaleVaultProxyService.status', () => {
       updated_at: NOW + 5,
     };
     expect((await serviceWith({ latest: call }).service.status(ALICE, ID))?.call).toEqual({ action: 'deliver', status: 'mined', txHash: '0xabc', at: NOW + 5 });
-    for (const action of ['skim', 'pause', 'relay'] as const) {
+    for (const action of ['skim', 'pause'] as const) {
       expect((await serviceWith({ latest: { ...call, action } }).service.status(ALICE, ID))?.call).toBeNull();
     }
   });

@@ -3,11 +3,11 @@
 Every route, its request and response shape, and the errors it returns.
 See [README.md](../README.md) for what the service is and how to run it.
 
-Fifteen routes are authenticated by the short-lived JWT the handshake mints: `GET /assets`,
+Fourteen routes are authenticated by the short-lived JWT the handshake mints: `GET /assets`,
 `POST /quote`, `POST /session`, `GET /supported`, `GET /supported/countries`,
 `GET /supported/corridors`, `GET /supported/offramp`, `GET /supported/offramp/corridors`,
 `GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel`, `GET /offramp/sale/:id`,
-`POST /offramp/returns/:id`, `POST /offramp/relay` and `GET /transaction/:id`. The
+`POST /offramp/returns/:id` and `GET /transaction/:id`. The
 unauthenticated remainder is `GET /health`, `GET /meld/return` and the two handshake routes.
 
 | Endpoint | Proxies | Purpose |
@@ -27,7 +27,6 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | `GET /funding/:id` | none | One funding request's status + timeline + terms, and, on a live sell whose provider has disclosed one, the deposit address, amount and currency to send to. |
 | `GET /offramp/sale/:id` | none (reads Arbitrum) | The on-chain state of one of the caller's Arbitrum sells: `{sale}`. See "Sale vault proxies" below. |
 | `POST /offramp/returns/:id` | none (asks the keeper) | Asks the keeper to act on that sale's proxy now, then answers `{sale}` as the GET does. Body-less. |
-| `POST /offramp/relay` | USDC `transferWithAuthorization` (sent by the keeper) | Moves USDC off a seller claimer that holds no ETH, from the claimer's own EIP-3009 signature: `202 {relay}`. See "Relaying USDC off a claimer" below. |
 | `POST /funding/:id/cancel` | none | Withdraw a request the buyer no longer wants. Takes away the settlement surface; **does not conclude the request**, so a payment already in flight is still observed and still settles. Refused once a payment has been seen, or, on a sell, once a deposit address has been disclosed. Idempotent. |
 | `GET /health` | none | Liveness. No auth. |
 | `GET /meld/return` | `?flow=sell` | The completion page the widget redirects to, served from this origin so it frames cleanly. Posts `meld:paid` to its parent frame, or `meld:verified` with `?flow=sell` (the seller is back from KYC, nothing was paid). Carries no status and needs no auth; the caller's own `GET /funding/:id` poll stays authoritative. |
@@ -790,8 +789,8 @@ below `minReturn`, plus `STALE_DELAY` otherwise; `0` once the factory is retired
 returns were sent and the balance is at least `minReturn` above what the last return left behind while that return's refund window (`lastReturnAt` plus `RELEASE_DELAY`) is open, meaning open now; `null` before the deploy and while a balance of at least
 `minReturn` has no delivery or return yet and returns are not paused, when the contract has no release time for it; while paused it is the factory's `pausedAt()` plus `STALE_DELAY`); `releasable`, what `release()` would
 send the claimer right now (the whole balance once `releaseAt` passed, else `"0"`); `claimerBalance`,
-the claimer's live USDC balance in base units, read on every request, which is what a relay can move
-off it; `released`, every
+the claimer's live USDC balance in base units, read on every request, which the seller moves with the
+claim key; `released`, every
 `Released` log of the proxy the keeper read, whoever sent the release; `flushedToClaimer`, every `PendingFlushed` log whose
 `to` is the claimer (the proxy refused the credit). Both lists are `[{ "amount", "txHash", "at" }]`,
 oldest first, `amount` in base units and `at` the epoch ms the keeper read the log.
@@ -816,53 +815,6 @@ Both routes answer `404` for an unknown id and for another caller's alike, `409 
 for a sell that does not pay through a proxy, `503 Other{ SALE_VAULT_PROXY_UNAVAILABLE }` while the
 sale's deployment is not configured or not verified (a sale of a `sale_vault_proxy.retired` factory
 is still served), and `503 Other{ SALE_VAULT_PROXY_CHAIN_UNAVAILABLE }` when Arbitrum could not be read.
-
-### Relaying USDC off a claimer
-
-USDC a proxy releases lands on the seller's claimer, an address that usually holds no ETH for gas.
-`POST /offramp/relay` sends a USDC `transferWithAuthorization` (EIP-3009) the claimer signed, with
-the keeper's key paying the gas:
-
-```json
-{
-  "from": "0x6666666666666666666666666666666666666666",
-  "to": "0x5555555555555555555555555555555555555555",
-  "value": "1500000",
-  "validAfter": "0",
-  "validBefore": "1900000000",
-  "nonce": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
-  "signature": "0x<r><s><v>"
-}
-```
-
-The client signs EIP-712 typed data `TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)`
-under the USDC token's own domain (on both Arbitrum networks `name` is `USD Coin` and `version` is
-`2`; the service reads the token's `DOMAIN_SEPARATOR()` rather than assuming them). `value` is USDC
-base units and must be the claimer's whole balance, the window is unix seconds, `nonce` is any unused 32 bytes, `signature` is 65 bytes
-`r || s || v` with `v` 27 or 28. `202` answers `{ "relay": { "status": "sent", "chainId", "txHash" } }`
-once the keeper broadcast it; read the outcome on chain.
-
-Before any gas is spent the service refuses, in this order:
-
-| Status | Code | When |
-| --- | --- | --- |
-| 503 | `SALE_VAULT_PROXY_UNAVAILABLE` | No verified deployment, the keeper loop is off, or the token's `TRANSFER_WITH_AUTHORIZATION_TYPEHASH()` is not the struct above. |
-| 400 | `RELAY_SELF_TRANSFER` | `to` equals `from`. |
-| 400 | `RELAY_OUTSIDE_WINDOW` | Now is not strictly after `validAfter` and strictly before `validBefore`, the token's own rule. |
-| 403 | `RELAY_NOT_CLAIMER` | `from` is not the `sellerClaimer` of any sale under the caller's product. |
-| 400 | `RELAY_TO_SALE_ADDRESS` | `to` is a recorded claimer or proxy, which would let one balance cycle through relays on the keeper's gas. |
-| 400 | `RELAY_BAD_SIGNATURE` | The signature does not recover to `from`, or is one the token refuses (high `s`, `v` not 27 or 28). |
-| 409 | `RELAY_NONCE_USED` | The token's `authorizationState(from, nonce)` says it was used or cancelled. |
-| 409 | `RELAY_INSUFFICIENT_BALANCE` | `balanceOf(from)` is below `value`. |
-| 409 | `RELAY_NOT_WHOLE_BALANCE` | `balanceOf(from)` is above `value`: a relay moves the whole balance, so each keeper-paid relay empties the claimer and refilling it costs the sender gas. Re-read the balance and sign again. |
-| 422 | `RELAY_WOULD_REVERT` | Gas estimation reverts (the token is paused, either side is blacklisted, or the state changed). |
-| 409 | `RELAY_BUSY` | A relay from this claimer is still in flight. Retry shortly. |
-| 503 | `RELAY_KEEPER_BUSY` | Another keeper pass holds the keeper lock, on this replica or another. Retry shortly. |
-| 503 | `SALE_VAULT_PROXY_CHAIN_UNAVAILABLE` | Arbitrum could not be read, before or while preparing the send. |
-
-`to` is the seller's choice: the token pays only the `to` they signed, so nobody relaying it can
-redirect it. A replay is refused by the token's nonce. The route counts against the caller's rate
-limit, and one relay per claimer is in flight at a time.
 
 ## Durable funding
 
@@ -916,7 +868,6 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 400 | `Other{ SELLER_ACCOUNT_REQUIRED }` | An Arbitrum sell without `sellerAccount`, which its sending address is derived from. |
 | 400 | `Other{ SELLER_CLAIMER_REQUIRED }` | An Arbitrum sell without `sellerClaimer`, which its sending address is derived from. |
 | 400 | `Other{ SELLER_CLAIMER_UNEXPECTED }` | A `sellerClaimer` on an Asset Hub sell, which has no proxy to bind it to. |
-| 400 to 503 | `Other{ RELAY_* }` | `POST /offramp/relay` refusals, see "Relaying USDC off a claimer". |
 | 503 | `Other{ SALE_VAULT_PROXY_UNAVAILABLE }` | An Arbitrum sell `/quote` or `/session`, or a sale route, while the sale vault proxy deployment is not configured or not verified on chain, or its sale vault proxy could not be recorded. Retry later. |
 | 503 | `Other{ SALE_VAULT_PROXY_CHAIN_UNAVAILABLE }` | A sale route could not read Arbitrum. Retry later. |
 | 409 | `Other{ SALE_NOT_VAULT_PROXY }` | A sale route for a sell that does not pay through a sale vault proxy. |

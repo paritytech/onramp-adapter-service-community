@@ -1,9 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  encodeAuthorizationState,
   encodeBalanceOf,
-  encodeCall,
   encodeClaimerTermsCall,
   encodeDelivery,
   encodeHomeClaimerCall,
@@ -94,20 +92,6 @@ describe('SaleVaultProxyChain reads', () => {
     expect(await chain.usdcBalance(SEPOLIA.usdc, PROXY)).toBe(9n);
     expect(await chain.pending(FACTORY, HOME, CLAIMER)).toBe(3n);
     expect(await chain.retired(FACTORY)).toBe(true);
-  });
-
-  it('reads a bytes32 getter and an EIP-3009 authorization state', async () => {
-    const nonce = `0x${'cd'.repeat(32)}`;
-    const chain = chainWith({
-      eth_call: ([{ data }]: [{ to: string; data: string }]) => {
-        if (data === encodeCall('DOMAIN_SEPARATOR()')) return `0x${'85'.repeat(32)}`;
-        if (data === encodeAuthorizationState(PROXY, nonce)) return `0x${w(1n)}`;
-        return `0x${w(2n)}`;
-      },
-    });
-    expect(await chain.bytes32Of(SEPOLIA.usdc, 'DOMAIN_SEPARATOR()')).toBe(`0x${'85'.repeat(32)}`);
-    expect(await chain.authorizationUsed(SEPOLIA.usdc, PROXY, nonce)).toBe(true);
-    await expect(chain.authorizationUsed(SEPOLIA.usdc, PROXY, `0x${'ef'.repeat(32)}`)).rejects.toThrow(/rpc authorizationState: not a bool/);
   });
 
   it('reads no state where no code is deployed, and turns a short reply into ChainUnavailableError', async () => {
