@@ -142,13 +142,14 @@ export interface RailBuySession extends RailSessionCommon {
 /**
  * Opening a sell: the seller commits `cryptoAmount` and the provider issues a deposit address.
  *
- * `walletAddress` is the seller's own, never where the crypto goes: the account it is sent from,
- * which the provider refunds to. The deposit address is the provider's, disclosed after the
- * session exists. Absent when the client sent none; see `normalizeSellerAddress`.
+ * The deposit address on a sell is the provider's, disclosed after the session exists. The
+ * optional `walletAddress` is not that: it is the seller's own sending and refund address, which
+ * the service derives from the seller's account (`address.ts` `sellWalletFor`).
  */
 export interface RailSellSession extends RailSessionCommon {
   direction: 'sell';
   cryptoAmount: string;
+  /** The seller's own sending and refund address, already derived, absent when none was pinned. */
   walletAddress?: string | undefined;
 }
 

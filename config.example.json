@@ -117,9 +117,7 @@
     "sell_routes_interval_ms": 43200000,
     "offramp_lanes": [
       { "asset": "usdt@assethub" },
-      { "asset": "dot@assethub" },
-      { "asset": "usdc@arbitrum" },
-      { "asset": "usdc@solana" }
+      { "asset": "dot@assethub" }
     ]
   }
 }

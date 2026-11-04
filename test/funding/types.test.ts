@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { fundingRecord, sellRecord } from '../fixtures.js';
-import { toFundingRequestDto, type FundingRecord } from '../../src/funding/types.js';
+import { directionTermsViolation, toFundingRequestDto, type FundingRecord } from '../../src/funding/types.js';
 
 // Every droppable field is populated. Left `undefined`, both `toEqual` and
 // `JSON.stringify` ignore an undefined-valued property, so adding `reason`, `clientReference` and
@@ -253,4 +253,20 @@ describe('toFundingRequestDto: the deposit disclosure', () => {
     expect(dto).not.toHaveProperty('deposit');
   });
 
+});
+
+describe('the seller account', () => {
+  const SELLER = '15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5';
+
+  it('is echoed on a sell that carries one, and absent otherwise', () => {
+    const sold = sellRecord({ wallet_address: SELLER, seller_account: SELLER });
+    expect(toFundingRequestDto(sold, BEFORE)).toMatchObject({ walletAddress: SELLER, sellerAccount: SELLER });
+    expect(toFundingRequestDto(sellRecord(), BEFORE)).not.toHaveProperty('sellerAccount');
+  });
+
+  it('is refused on a buy and on a sell with no wallet address', () => {
+    expect(directionTermsViolation(fundingRecord({ seller_account: SELLER }))).toBe('funding_seller_account');
+    expect(directionTermsViolation(sellRecord({ seller_account: SELLER }))).toBe('funding_seller_account');
+    expect(directionTermsViolation(sellRecord({ wallet_address: SELLER, seller_account: SELLER }))).toBeUndefined();
+  });
 });

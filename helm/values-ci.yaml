@@ -52,3 +52,11 @@ secrets:
   jwtKey:
     existingSecret: onramp-jwt-key
     key: jwt-key
+  saleVaultProxyKeeperKey:
+    existingSecret: onramp-sale-vault-proxy-keeper-key
+    key: sale-vault-proxy-keeper-key
+
+# Enabled so the sale vault proxy block and its keeper-key mount are rendered and parsed on every commit
+sale_vault_proxy:
+  enabled: true
+  factory: "0x1111111111111111111111111111111111111111"

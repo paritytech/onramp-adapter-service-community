@@ -7,6 +7,7 @@
  */
 
 import type { MethodLimit } from './meld/discovery.js';
+import { SALE_VAULT_PROXY_CHAIN } from './salevaultproxy/networks.js';
 
 export interface OfframpLane {
   /** This service's own name for the asset, which a Meld rename does not change. */
@@ -14,6 +15,11 @@ export interface OfframpLane {
   /** Meld's current code for it, the one a quote or session for this lane must send. */
   readonly code: string;
   readonly chain: string;
+}
+
+/** Whether a sell can open on a lane's chain: Asset Hub always, Arbitrum with a sale vault proxy, never Solana. */
+export function laneSellable(chain: string, saleVaultProxy: boolean): boolean {
+  return chain === 'assethub' || (chain === SALE_VAULT_PROXY_CHAIN && saleVaultProxy);
 }
 
 type Method = Omit<MethodLimit, 'providers'>;

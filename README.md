@@ -96,7 +96,8 @@ The unit suite needs a Postgres; see [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Deploying it
 
 The Helm chart is in [helm/](helm/). It renders a Deployment, a Service, an Ingress, a
-NetworkPolicy and a ConfigMap holding `config.json`, with the three secrets mounted as files.
+NetworkPolicy and a ConfigMap holding `config.json`, with the three secrets mounted as files, plus
+the sale vault proxy keeper key when `sale_vault_proxy.enabled`.
 
 **It runs exactly one replica and cannot be scaled horizontally.** The rate limiter is in-process
 and keyed on the caller's personhood alias, so a second pod gives every caller twice their ceiling

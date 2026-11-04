@@ -15,7 +15,9 @@ import { compile } from '@fastify/proxy-addr';
 import { z } from 'zod';
 
 import { ASSETS, ASSET_IDS, type AssetId } from './meld/catalog.js';
-import { MINOR_UNIT_DECIMAL, toMinorUnits } from './money.js';
+import { evmAccount } from './contract.js';
+import { ETH_AMOUNT, ETH_DECIMALS, MINOR_UNIT_DECIMAL, toMinorUnits, USDC_AMOUNT, USDC_DECIMALS } from './money.js';
+import { SALE_VAULT_PROXY_NETWORKS } from './salevaultproxy/networks.js';
 
 /** Shared so the refinement below can re-test it; see the guard in `limit`. */
 const DECIMAL = MINOR_UNIT_DECIMAL;
@@ -131,6 +133,9 @@ const isClusterInternal = (host: string): boolean =>
   host !== 'localhost' &&
   (/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/u.test(host) || /^[a-z0-9][a-z0-9-.]*\.svc(\.cluster\.local)?$/u.test(host));
 
+const usdcDecimal = z.string().regex(USDC_AMOUNT, `A USDC amount with at most ${String(USDC_DECIMALS)} decimals.`);
+const ethDecimal = z.string().regex(ETH_AMOUNT, `An ETH amount with at most ${String(ETH_DECIMALS)} decimals.`);
+
 const secretSource = z.discriminatedUnion('mode', [
   z.object({ mode: z.literal('file'), path: z.string().min(1) }).strict(),
   z.object({ mode: z.literal('env'), var: z.string().min(1) }).strict(),
@@ -186,6 +191,15 @@ const limit = z
       });
     }
   });
+
+// new URL() or undefined, so a field z.url() already refused never throws out of superRefine
+function parsedUrl(value: string): URL | undefined {
+  try {
+    return new URL(value);
+  } catch {
+    return undefined;
+  }
+}
 
 const configSchema = z
   .object({
@@ -595,6 +609,55 @@ const configSchema = z
       .strict()
       // `.prefault({})` like `cors`/`rate_limit`: an absent block is the documented defaults.
       .prefault({}),
+    // The Arbitrum sale vault proxy deployment and its keeper. Optional, so a deployment without the lane validates.
+    sale_vault_proxy: z
+      .object({
+        // Signed into every keeper transaction and checked against the RPC at boot
+        chain_id: z.number().int().positive(),
+        // The implementation is read off this factory's own immutable
+        factory: evmAccount,
+        // Earlier factories on the same chain whose proxies are still watched and served, each with its own Vault and USDC
+        retired: z
+          .array(z.object({ factory: evmAccount, chainflip_vault: evmAccount, usdc: evmAccount }).strict())
+          .max(8)
+          .default([]),
+        // Chainflip's Arbitrum Vault and the USDC it swaps, checked against the factory and live Chainflip
+        chainflip_vault: evmAccount,
+        usdc: evmAccount,
+        rpc_url: z.url(),
+        keeper_key: secretSource,
+        keeper: z
+          .object({
+            enabled: z.boolean().default(true),
+            interval_ms: z.number().int().min(15_000).max(3_600_000).default(60_000),
+            // Due sale rows and idle proxies read per pass
+            batch: z.number().int().min(1).max(200).default(25),
+            // How long a sent call may go unmined before it is checked for a drop, and how long a reverting call waits
+            resend_ms: z.number().int().min(60_000).max(3_600_000).default(600_000),
+            // The most blocks one eth_getLogs spans, capped at the public Arbitrum RPCs' limit for the topic-only Released read
+            log_range: z.number().int().min(100).max(30_000).default(10_000),
+            // USDC, the least free factory balance a skim sends, a dust guard since the gas is far smaller
+            min_skim: usdcDecimal.default('5'),
+            // ETH, below which each pass logs an error, enough for 200 deliver calls, its costliest, at the Arbitrum fee cap
+            min_eth: ethDecimal.refine((v) => /[1-9]/.test(v), 'keeper.min_eth must be above 0.').default('0.002'),
+          })
+          .strict()
+          .prefault({}),
+        chainflip: z
+          .object({
+            // The State Chain RPC that reports Chainflip's swap limits
+            rpc_url: z.url(),
+            // Development only, for a local fake, else the network's own backend
+            backend_url: z.url().optional(),
+            // How far above the proxy's floor a quote net of the egress fee must be before a return is sent, a chosen buffer
+            quote_margin_bps: z.number().int().min(0).max(1_000).default(50),
+            // How long one read of Chainflip's live limits and broker registration is reused
+            limits_ttl_ms: z.number().int().min(0).max(600_000).default(30_000),
+          })
+          .strict(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((cfg, ctx) => {
@@ -621,26 +684,6 @@ const configSchema = z
     renewable(cfg.meld.defaults_cache_ttl_ms, 'defaults_cache_ttl_ms', cfg.supported.catalog_interval_ms, 'catalog_interval_ms');
     renewable(cfg.meld.routes_cache_ttl_ms, 'routes_cache_ttl_ms', cfg.supported.routes_interval_ms, 'routes_interval_ms');
     renewable(cfg.meld.routes_cache_ttl_ms, 'routes_cache_ttl_ms', cfg.supported.sell_routes_interval_ms, 'sell_routes_interval_ms');
-
-    /**
-     * Parse a URL that a field-level `z.url()` has already looked at, or give up quietly.
-     *
-     * `superRefine` runs even when a field failed its own check (zod marks the result dirty
-     * rather than aborting), so `new URL()` here would throw a bare `TypeError: Invalid URL` out
-     * of `parseConfig`, past the error aggregation, and out of `main` as `Startup failed: Invalid
-     * URL`, naming no field. That is what the shipped default values produce.
-     *
-     * Returning `undefined` and skipping the extra checks leaves the field's own `z.url()`
-     * message as the one the operator reads: one error per problem, which is the contract this
-     * function promises.
-     */
-    const parsedUrl = (value: string): URL | undefined => {
-      try {
-        return new URL(value);
-      } catch {
-        return undefined;
-      }
-    };
 
     /**
      * The endpoint must be the one this environment is allowed to talk to, pinned by host name.
@@ -732,6 +775,7 @@ const configSchema = z
       // redaction hooks do nothing for `process.env`, which is the whole reason this loop exists.
       ['store.password', cfg.store.password],
       ...(cfg.auth.personhood === undefined ? [] : [['auth.personhood.jwt_key', cfg.auth.personhood.jwt_key] as const]),
+      ...(cfg.sale_vault_proxy === undefined ? [] : [['sale_vault_proxy.keeper_key', cfg.sale_vault_proxy.keeper_key] as const]),
     ] as const) {
       if (source.mode === 'env' && cfg.environment !== 'development') {
         ctx.addIssue({
@@ -778,6 +822,8 @@ const configSchema = z
         });
       }
     }
+
+    if (cfg.sale_vault_proxy !== undefined) saleVaultProxyRules(cfg, cfg.sale_vault_proxy, ctx);
 
     // The store link carries every funding row (aliases, wallet addresses, amounts) and the
     // password that opens it. Plaintext across a VPC is refused for the same reason
@@ -973,6 +1019,64 @@ const configSchema = z
 
 /** The validated configuration. Every consumer takes this, never the raw parsed JSON. */
 export type Config = z.output<typeof configSchema>;
+
+// The sale vault proxy's endpoints carry signed transactions and price returns, so they are pinned per network
+function saleVaultProxyRules(
+  cfg: Pick<Config, 'environment' | 'store'>,
+  sp: NonNullable<Config['sale_vault_proxy']>,
+  ctx: z.RefinementCtx,
+): void {
+  const urls = [
+    [['sale_vault_proxy', 'rpc_url'], sp.rpc_url],
+    [['sale_vault_proxy', 'chainflip', 'rpc_url'], sp.chainflip.rpc_url],
+  ] as const;
+  for (const [path, value] of urls) {
+    if (cfg.environment !== 'development' && !value.startsWith('https://')) {
+      ctx.addIssue({ code: 'custom', path: [...path], message: `${path.join('.')} must use https outside development: "${value}" is plaintext.` });
+    }
+  }
+  // A keeper pass or a returns call holds one connection under the lock, so HTTP needs at least one more
+  if (cfg.store.pool_max < 2) {
+    ctx.addIssue({ code: 'custom', path: ['store', 'pool_max'], message: 'store.pool_max must be at least 2 while sale_vault_proxy is set.' });
+  }
+  // One factory is one deployment, so a repeat would be verified and scanned twice
+  const factories = [sp.factory, ...sp.retired.map((r) => r.factory)];
+  factories.forEach((factory, index) => {
+    if (factories.indexOf(factory) !== index) {
+      ctx.addIssue({ code: 'custom', path: ['sale_vault_proxy', 'retired', index - 1, 'factory'], message: `sale_vault_proxy factory ${factory} is listed twice.` });
+    }
+  });
+  const network = SALE_VAULT_PROXY_NETWORKS[sp.chain_id];
+  if (network === undefined) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['sale_vault_proxy', 'chain_id'],
+      message: `sale_vault_proxy.chain_id must be one of ${Object.keys(SALE_VAULT_PROXY_NETWORKS).join(', ')}.`,
+    });
+    return;
+  }
+  if (cfg.environment === 'production' && sp.chain_id !== 42161) {
+    ctx.addIssue({ code: 'custom', path: ['sale_vault_proxy', 'chain_id'], message: 'sale_vault_proxy.chain_id must be 42161 (Arbitrum One) in production.' });
+  }
+  // Development keeps local fakes, verification still proves the State Chain by name there
+  if (cfg.environment === 'development') return;
+  if (sp.chainflip.backend_url !== undefined) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['sale_vault_proxy', 'chainflip', 'backend_url'],
+      message: `sale_vault_proxy.chainflip.backend_url is for development only, chain ${String(sp.chain_id)} uses ${network.backendUrl}.`,
+    });
+  }
+  // The State Chain RPC host is not pinned, verification proves its network by name
+  const stateHost = parsedUrl(sp.chainflip.rpc_url)?.host;
+  if (stateHost !== undefined && stateHost.includes('perseverance') !== network.stateChain.includes('Perseverance')) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['sale_vault_proxy', 'chainflip', 'rpc_url'],
+      message: `sale_vault_proxy.chainflip.rpc_url must be a ${network.stateChain} endpoint for chain ${String(sp.chain_id)}, not "${stateHost}".`,
+    });
+  }
+}
 
 /**
  * Parse and validate, or throw with every problem at once.

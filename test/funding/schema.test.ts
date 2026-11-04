@@ -317,7 +317,10 @@ describe('creating a fresh schema', () => {
  * says the fixture was not kept up, rather than passing while proving less.
  */
 const atV5 = (sql: string): string =>
-  sql
+  // The sale vault proxy tables and the claimer index are new at v10, so a v5 database has none. An empty string is skipped.
+  /^CREATE (UNIQUE )?(TABLE|INDEX) IF NOT EXISTS (sale_vault_prox|funding_by_seller_claimer)/.test(sql)
+    ? ''
+    : sql
     .replace(" direction TEXT NOT NULL DEFAULT 'buy',", '')
     .replace(' crypto_amount TEXT,', '')
     .replace(' deposit_address TEXT,', '')
@@ -329,6 +332,9 @@ const atV5 = (sql: string): string =>
     .replace(' deposit_conflict_address TEXT,', '')
     .replace(' deposit_conflict_reason TEXT,', '')
     .replace(' deposit_conflict_at BIGINT,', '')
+    // v9 -> v10: the seller account and claimer. Their constraints go with the cut below.
+    .replace(' seller_account TEXT,', '')
+    .replace(' seller_claimer TEXT,', '')
     // Every constraint from v6 onward is contiguous and last, so one cut removes all of them
     // (the v7 one included) and closes the statement.
     .replace(/, CONSTRAINT funding_direction_known .*$/, ')')
@@ -349,7 +355,7 @@ describe('the v5 -> v6 migration', () => {
   /** A v5 database with one buy row in it, stamped at 5. Returns the schema name. */
   const atVersionFive = async (): Promise<string> => {
     const schema = await createSchema();
-    for (const sql of freshSchema().map(atV5)) await raw(schema, sql);
+    for (const sql of freshSchema().map(atV5)) if (sql !== '') await raw(schema, sql);
     await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
     await raw(schema, 'INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)');
     await raw(
@@ -378,8 +384,8 @@ describe('the v5 -> v6 migration', () => {
 
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Not just [5, 6]: `openIn` always walks to `SCHEMA_VERSION`, so a database stamped at 5
-      // takes the v6, v7 and v8 steps in one boot.
-      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8]);
+      // takes the v6 to v11 steps in one boot.
+      expect(applied.map((r) => Number(r.version))).toEqual([5, 6, 7, 8, 9, 10, 11, 12]);
     } finally {
       await dropSchema(schema);
     }
@@ -437,6 +443,31 @@ describe('a fresh database and a migrated one are the same database', () => {
         "WHERE conrelid = 'supported_corridors'::regclass ORDER BY conname",
     );
 
+  const tableColumnsOf = async (schema: string, table: string) =>
+    query(
+      schema,
+      'SELECT ordinal_position, column_name, data_type, is_nullable, column_default ' +
+        `FROM information_schema.columns WHERE table_name = '${table}' ` +
+        'AND table_schema = current_schema() ORDER BY ordinal_position',
+    );
+  const tableConstraintsOf = async (schema: string, table: string) =>
+    query(
+      schema,
+      `SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = '${table}'::regclass ORDER BY conname`,
+    );
+  const saleVaultProxyIndexesOf = async (schema: string) =>
+    (
+      await query(
+        schema,
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename LIKE 'sale_vault_prox%' ORDER BY indexname",
+      )
+    ).map((r) => ({ name: r.indexname, def: String(r.indexdef).replace(`${schema}.`, '') }));
+
+  const claimerIndexOf = async (schema: string) =>
+    (await query(schema, "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'funding_by_seller_claimer'")).map((r) =>
+      String(r.indexdef).replace(`${schema}.`, ''),
+    );
+
   it('agrees column for column and constraint for constraint', async () => {
     // This is the test that was missing, and the omission shipped a real divergence:
     // `crypto_amount` was hand-placed after `source_amount` in `freshSchema()` while the
@@ -456,7 +487,7 @@ describe('a fresh database and a migrated one are the same database', () => {
     try {
       await (await openIn(fresh)).close();
 
-      for (const sql of freshSchema().map(atV5)) await raw(migrated, sql);
+      for (const sql of freshSchema().map(atV5)) if (sql !== '') await raw(migrated, sql);
       await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
       await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)');
       await (await openIn(migrated)).close();
@@ -469,6 +500,126 @@ describe('a fresh database and a migrated one are the same database', () => {
       // that only proves the table exists.
       expect(await corridorColumnsOf(migrated)).toEqual(await corridorColumnsOf(fresh));
       expect(await corridorConstraintsOf(migrated)).toEqual(await corridorConstraintsOf(fresh));
+      // The v10 sale vault proxy tables and their indexes, created by the migration on one path
+      for (const table of ['sale_vault_proxies', 'sale_vault_proxy_calls', 'sale_vault_proxy_deferrals', 'sale_vault_proxy_payouts']) {
+        expect(await tableColumnsOf(migrated, table)).toEqual(await tableColumnsOf(fresh, table));
+        expect(await tableConstraintsOf(migrated, table)).toEqual(await tableConstraintsOf(fresh, table));
+      }
+      expect(await saleVaultProxyIndexesOf(migrated)).toEqual(await saleVaultProxyIndexesOf(fresh));
+      // The claimer index was added at v10 for the relay and dropped at v12 with it
+      expect(await claimerIndexOf(migrated)).toEqual(await claimerIndexOf(fresh));
+      expect(await claimerIndexOf(fresh)).toHaveLength(0);
+    } finally {
+      await dropSchema(fresh);
+      await dropSchema(migrated);
+    }
+  });
+
+  it("brings another build's v9, which added only a vault_sales table, to the same database and keeps that table", async () => {
+    const fresh = await createSchema();
+    const migrated = await createSchema();
+    try {
+      await (await openIn(fresh)).close();
+
+      const atV8 = (sql: string): string =>
+        /^CREATE (UNIQUE )?(TABLE|INDEX) IF NOT EXISTS (sale_vault_prox|funding_by_seller_claimer)/.test(sql)
+          ? ''
+          : sql.replace(' seller_account TEXT,', '').replace(' seller_claimer TEXT,', '').replace(/, CONSTRAINT funding_seller_account .*$/, ')');
+      for (const sql of freshSchema().map(atV8)) if (sql !== '') await raw(migrated, sql);
+      await raw(migrated, 'CREATE TABLE vault_sales (funding_request_id TEXT PRIMARY KEY)');
+      await raw(migrated, "INSERT INTO vault_sales (funding_request_id) VALUES ('kept')");
+      await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
+      await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (9, 0)');
+      await (await openIn(migrated)).close();
+
+      expect(await columnsOf(migrated)).toEqual(await columnsOf(fresh));
+      expect(await constraintsOf(migrated)).toEqual(await constraintsOf(fresh));
+      for (const table of ['sale_vault_proxies', 'sale_vault_proxy_calls', 'sale_vault_proxy_deferrals', 'sale_vault_proxy_payouts']) {
+        expect(await tableColumnsOf(migrated, table)).toEqual(await tableColumnsOf(fresh, table));
+      }
+      expect(await query(migrated, 'SELECT funding_request_id FROM vault_sales')).toEqual([{ funding_request_id: 'kept' }]);
+      const applied = await query(migrated, 'SELECT version FROM schema_migrations ORDER BY version');
+      expect(applied.map((r) => Number(r.version))).toEqual([9, 10, 11, 12]);
+    } finally {
+      await dropSchema(fresh);
+      await dropSchema(migrated);
+    }
+  });
+});
+
+describe('the v10 -> v11 migration', () => {
+  it('lets a database stamped at v10 with the old action check claim a pause call', async () => {
+    const fresh = await createSchema();
+    const migrated = await createSchema();
+    try {
+      await (await openIn(fresh)).close();
+
+      // The v10 call table as first shipped, without the pause action
+      const atV10 = (sql: string): string => sql.replace("'skim', 'pause'", "'skim', 'relay'");
+      for (const sql of freshSchema().map(atV10)) await raw(migrated, sql);
+      await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
+      await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (10, 0)');
+      await expect(
+        raw(
+          migrated,
+          "INSERT INTO sale_vault_proxy_calls (id, chain_id, sender, target, proxy, action, created_at, updated_at) VALUES ('before', 421614, '0x1', '0x2', '0x2', 'pause', 1, 1)",
+        ),
+      ).rejects.toThrow(/sale_vault_proxy_calls_action_known/);
+
+      const store = await openIn(migrated);
+      const claimed = await store.keeperRows().claimProxyCall({ id: 'paused', chain_id: 421614, sender: '0x1', target: '0x2', proxy: '0x2', action: 'pause', amount: null });
+      expect(claimed).toBe(true);
+      await store.close();
+
+      const constraintsOf = async (schema: string) =>
+        query(schema, "SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'sale_vault_proxy_calls'::regclass ORDER BY conname");
+      expect(await constraintsOf(migrated)).toEqual(await constraintsOf(fresh));
+      const applied = await query(migrated, 'SELECT version FROM schema_migrations ORDER BY version');
+      expect(applied.map((r) => Number(r.version))).toEqual([10, 11, 12]);
+    } finally {
+      await dropSchema(fresh);
+      await dropSchema(migrated);
+    }
+  });
+});
+
+describe('the v11 -> v12 migration', () => {
+  it('clears relay rows, drops the relay action and its claimer index from a v11 database', async () => {
+    const fresh = await createSchema();
+    const migrated = await createSchema();
+    try {
+      await (await openIn(fresh)).close();
+
+      // The v11 call table and claimer index as shipped, with the relay action
+      const atV11 = (sql: string): string => sql.replace("'skim', 'pause'", "'skim', 'pause', 'relay'");
+      for (const sql of freshSchema().map(atV11)) await raw(migrated, sql);
+      await raw(migrated, 'CREATE INDEX IF NOT EXISTS funding_by_seller_claimer ON funding_requests (seller_claimer, product_id) WHERE seller_claimer IS NOT NULL');
+      // A settled relay call from when the feature was live, which the migration clears rather than choke on
+      await raw(
+        migrated,
+        "INSERT INTO sale_vault_proxy_calls (id, chain_id, sender, target, proxy, action, status, created_at, updated_at) VALUES ('relayed', 421614, '0x1', '0x2', '0x2', 'relay', 'mined', 1, 1)",
+      );
+      await raw(migrated, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
+      await raw(migrated, 'INSERT INTO schema_migrations (version, applied_at) VALUES (11, 0)');
+      await (await openIn(migrated)).close();
+
+      // The old relay row is gone, not left to fail the new action check
+      expect(await query(migrated, "SELECT 1 FROM sale_vault_proxy_calls WHERE action = 'relay'")).toEqual([]);
+      await expect(
+        raw(
+          migrated,
+          "INSERT INTO sale_vault_proxy_calls (id, chain_id, sender, target, proxy, action, created_at, updated_at) VALUES ('relayed', 421614, '0x1', '0x2', '0x2', 'relay', 1, 1)",
+        ),
+      ).rejects.toThrow(/sale_vault_proxy_calls_action_known/);
+      expect(
+        await query(migrated, "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'funding_by_seller_claimer'"),
+      ).toEqual([]);
+
+      const constraintsOf = async (schema: string) =>
+        query(schema, "SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'sale_vault_proxy_calls'::regclass ORDER BY conname");
+      expect(await constraintsOf(migrated)).toEqual(await constraintsOf(fresh));
+      const applied = await query(migrated, 'SELECT version FROM schema_migrations ORDER BY version');
+      expect(applied.map((r) => Number(r.version))).toEqual([11, 12]);
     } finally {
       await dropSchema(fresh);
       await dropSchema(migrated);
@@ -516,6 +667,19 @@ describe('the per-direction term constraints', () => {
     ['funding_sell_terms', () => sellRecord({ id: 'bad', crypto_amount: undefined })],
     ['funding_buy_terms', () => fundingRecord({ id: 'bad', wallet_address: undefined })],
     ['funding_buy_terms', () => fundingRecord({ id: 'bad', source_amount: undefined })],
+    ['funding_seller_account', () => fundingRecord({ id: 'bad', seller_account: '15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5' })],
+    ['funding_seller_account', () => sellRecord({ id: 'bad', seller_account: '15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5' })],
+    ['funding_seller_claimer', () => sellRecord({ id: 'bad', seller_claimer: `0x${'33'.repeat(20)}` })],
+    [
+      'funding_seller_claimer',
+      () =>
+        sellRecord({
+          id: 'bad',
+          wallet_address: '0xb7967f92fd611b5ff68b6a043daf49034cad476b',
+          seller_account: '15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5',
+          seller_claimer: `0x${'AB'.repeat(20)}`,
+        }),
+    ],
   ])('has the in-memory fake refuse a %s row exactly as Postgres does', async (constraint, row) => {
     // The repo's rule is that a rule lives in one place: `mergeAdvance` is shared with the fake
     // so the advance cannot drift. These constraints cannot be shared that way, because one side
@@ -577,7 +741,7 @@ describe('the real migration chain', () => {
         )
         // Everything v6 adds, stripped by the same helper the v5 fixture uses.
         .map(atV5);
-      for (const sql of v1) await raw(schema, sql);
+      for (const sql of v1) if (sql !== '') await raw(schema, sql);
       await raw(schema, 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at BIGINT NOT NULL)');
       await raw(schema, 'INSERT INTO schema_migrations (version, applied_at) VALUES (1, 0)');
       await raw(
@@ -661,7 +825,7 @@ describe('the real migration chain', () => {
       const applied = await query(schema, 'SELECT version FROM schema_migrations ORDER BY version');
       // Every step, in order, not just the last one. A chain that skipped a step and stamped the
       // end version would leave a shape this build reads against columns that do not exist.
-      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(applied.map((r) => Number(r.version))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     } finally {
       await dropSchema(schema);
     }
@@ -706,7 +870,7 @@ describe('applying a migration', () => {
         " direction TEXT NOT NULL DEFAULT 'buy', crypto_amount TEXT, deposit_address TEXT," +
         ' deposit_amount TEXT, deposit_currency TEXT, deposit_memo TEXT, deposit_observed_at BIGINT,' +
         ' deposit_conflict_address TEXT, deposit_conflict_reason TEXT, deposit_conflict_at BIGINT,' +
-        ' claimed_by TEXT, claimed_until BIGINT)',
+        ' seller_account TEXT, seller_claimer TEXT, claimed_by TEXT, claimed_until BIGINT)',
     );
     return schema;
   };

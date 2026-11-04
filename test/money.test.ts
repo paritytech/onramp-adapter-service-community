@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { toMinorUnits } from '../src/money.js';
+import { toBaseUnits, toMinorUnits } from '../src/money.js';
 
 describe('toMinorUnits', () => {
   it.each([
@@ -22,5 +22,13 @@ describe('toMinorUnits', () => {
     expect(toMinorUnits('20.00')).toBe(2000n);
     expect(toMinorUnits('19.99') < toMinorUnits('20.00')).toBe(true);
     expect(toMinorUnits('0.10') + toMinorUnits('0.20')).toBe(30n);
+  });
+});
+
+describe('toBaseUnits', () => {
+  it('scales a decimal to integer base units', () => {
+    expect(toBaseUnits('0.5', 6)).toBe(500_000n);
+    expect(toBaseUnits('5', 6)).toBe(5_000_000n);
+    expect(toBaseUnits('0.002', 18)).toBe(2_000_000_000_000_000n);
   });
 });

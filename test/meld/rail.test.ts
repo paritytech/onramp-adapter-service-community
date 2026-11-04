@@ -137,7 +137,7 @@ describe('MeldRail', () => {
     expect(offers).toEqual(OFFERS);
   });
 
-  it('opens a sell session with the legs crossed, the crypto amount, and no address', async () => {
+  it("opens a sell session with the legs crossed, the crypto amount, and the seller's own address", async () => {
     const { stub, createWidgetSession } = client();
     const rail = new MeldRail(stub);
 
@@ -145,16 +145,15 @@ describe('MeldRail', () => {
       railSellSessionInput({ clientReference: 'funding-sell-1', redirectUrl: 'https://app.example/sold' }),
     );
 
-    // `toEqual` on the whole argument rather than `toMatchObject`: the absence of a
-    // `walletAddress` is one of the things being asserted, and a partial match cannot assert an
-    // absence. A sell has no caller-supplied address, Meld does not require one, and Meld's
-    // session endpoint accepts unknown fields with a `200` — so nothing upstream would object to
-    // a stray one and this seam is where it would have to be invented.
+    // `toEqual` on the whole argument rather than `toMatchObject`, so nothing else rides along.
+    // Meld's session endpoint accepts unknown fields with a `200`, so nothing upstream would
+    // object to a stray one and this seam is where it would have to be invented.
     expect(createWidgetSession).toHaveBeenCalledWith({
       direction: 'sell',
       cryptoCurrencyCode: 'DOT',
       fiatCurrencyCode: 'GBP',
       cryptoAmount: '12.3456789012',
+      walletAddress: ALICE,
       countryCode: 'GB',
       paymentMethodType: 'PAYOUT_TO_BANK',
       serviceProvider: 'TRANSAK',
@@ -162,6 +161,17 @@ describe('MeldRail', () => {
       redirectUrl: 'https://app.example/sold',
     });
     expect(session.providerSessionId).toBe('meld-1');
+  });
+
+  it("hands a sell's own sending address to the client, and none when absent", async () => {
+    const { stub, createWidgetSession } = client();
+    const rail = new MeldRail(stub);
+
+    await rail.createSession(railSellSessionInput({ walletAddress: BOB }));
+    await rail.createSession(railSellSessionInput({ walletAddress: undefined }));
+
+    expect(createWidgetSession).toHaveBeenNthCalledWith(1, expect.objectContaining({ direction: 'sell', walletAddress: BOB }));
+    expect((createWidgetSession.mock.calls[1] as unknown[])[0]).toMatchObject({ walletAddress: undefined });
   });
 
   it('carries no expiry on a sell when Meld supplies none, which is always', async () => {
@@ -577,6 +587,40 @@ describe('MeldRail.observation', () => {
           cryptoDetails: { destinationWalletAddress: ALICE },
         });
         expect(await rail.observation().finder(sellRecord())).not.toHaveProperty('deposit');
+      }
+    });
+
+    it("never discloses the seller's own address as the deposit", async () => {
+      // Meld may echo the walletAddress a sell was opened with, and the crypto must not go back to it
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT' };
+      const echoed = sellClient({ id: 'tx-1', status: 'PENDING', ...terms, cryptoDetails: { destinationWalletAddress: ALICE_PREFIX_42 } });
+      expect(await echoed.rail.observation().finder(sellRecord({ wallet_address: ALICE, seller_account: ALICE }))).not.toHaveProperty('deposit');
+
+      const other = sellClient({ id: 'tx-1', status: 'PENDING', ...terms, cryptoDetails: { destinationWalletAddress: BOB } });
+      expect((await other.rail.observation().finder(sellRecord({ wallet_address: ALICE, seller_account: ALICE })))?.deposit?.address).toBe(BOB);
+
+      // A sale vault proxy echoed in lowercase is still the row's EIP-55 wallet address
+      const proxy = '0xfb63126B916e3bD2497702a0139AD2B344aC7536';
+      const evm = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: '30',
+        sourceCurrencyCode: 'USDC_ARBITRUM',
+        cryptoDetails: { destinationWalletAddress: proxy.toLowerCase() },
+      });
+      const arbitrum = sellRecord({ destination_currency_code: 'USDC_ARBITRUM', wallet_address: proxy, seller_account: ALICE });
+      expect(await evm.rail.observation().finder(arbitrum)).not.toHaveProperty('deposit');
+    });
+
+    it('discloses the real deposit when the other field only echoes the seller, whichever field it is in', async () => {
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT' };
+      const record = sellRecord({ wallet_address: ALICE, seller_account: ALICE });
+      for (const cryptoDetails of [
+        { destinationWalletAddress: ALICE_PREFIX_42, offrampDestinationWalletAddress: BOB },
+        { destinationWalletAddress: BOB, offrampDestinationWalletAddress: ALICE },
+      ]) {
+        const client = sellClient({ id: 'tx-1', status: 'PENDING', ...terms, cryptoDetails });
+        expect((await client.rail.observation().finder(record))?.deposit?.address).toBe(BOB);
       }
     });
 
