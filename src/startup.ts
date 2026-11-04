@@ -157,6 +157,8 @@ export async function start(
   let worker: ReturnType<typeof startWorker> | undefined;
   let supported: ReturnType<typeof startSupportedRefresh> | undefined;
   let probes: ReturnType<typeof startProviderProbes> | undefined;
+  // The probes read the corridors the supported refresh stores, so they run only beside it.
+  const probing = cfg.supported.enabled && cfg.health.enabled;
   // The worker starts only after this and after the port opens. Constructed earlier, a boot that
   // then failed on a bad credential would leave a loop advancing durable funding rows with no
   // handle to stop it, because `start` rejects and the caller never gets a `close`.
@@ -170,9 +172,21 @@ export async function start(
     app = await buildServer(
       cfg,
       (audit) =>
-        new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery, (keys) => {
-          probes?.suspect(keys);
-        }),
+        new Onramp(
+          cfg,
+          rails,
+          audit,
+          funding,
+          meldRail,
+          Date.now,
+          () => crypto.randomUUID(),
+          discovery,
+          probing
+            ? (keys) => {
+                probes?.suspect(keys);
+              }
+            : undefined,
+        ),
       personhood,
       logDestination,
     );
@@ -287,7 +301,7 @@ export async function start(
         )
       : undefined;
     probes =
-      cfg.supported.enabled && cfg.health.enabled
+      probing
         ? startProviderProbes(
             {
               store: funding,
