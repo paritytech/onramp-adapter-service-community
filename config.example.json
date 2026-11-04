@@ -121,5 +121,10 @@
       { "asset": "usdc@arbitrum" },
       { "asset": "usdc@solana" }
     ]
+  },
+  "health": {
+    "enabled": true,
+    "interval_ms": 600000,
+    "sell_amounts": [{ "asset": "dot@assethub", "amount": "15" }]
   }
 }

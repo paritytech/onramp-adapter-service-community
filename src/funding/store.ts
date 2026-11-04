@@ -22,7 +22,8 @@
 import { Pool, types as pgTypes, type PoolClient, type PoolConfig } from 'pg';
 
 import type { FundingFailure } from '../contract.js';
-import type { CorridorDto } from '../meld/discovery.js';
+import type { ProviderState } from '../health/types.js';
+import type { CorridorDto, MethodCategory, MethodProviders } from '../meld/discovery.js';
 import type { Direction, RailName } from '../rail.js';
 import type { Secret } from '../secret.js';
 import type { FundingState } from './state.js';
@@ -115,8 +116,33 @@ export interface SupportedCorridorRow {
   name: string;
   fiat: string;
   methods: StoredMethod[];
+  /** Absent on rows written before v9. */
+  method_providers?: MethodProviders[];
   updated_at: number;
 }
+
+/** One provider's health for one direction, method category and scope. */
+export interface ProviderHealthRow {
+  provider: string;
+  direction: Direction;
+  category: MethodCategory;
+  /** `GLOBAL_SCOPE`, or an ISO 3166-1 alpha-2 country. */
+  scope: string;
+  state: ProviderState;
+  /** Consecutive failed probe rounds. */
+  failures: number;
+  last_ok_at: number | null;
+  last_failed_at: number | null;
+  last_code: string | null;
+  last_request_id: string | null;
+  updated_at: number;
+  /** When the row stops counting, unless a probe writes it again first. */
+  expires_at: number;
+}
+
+const HEALTH_KEY = ['provider', 'direction', 'category', 'scope'] as const;
+const HEALTH_FIELDS = ['state', 'failures', 'last_ok_at', 'last_failed_at', 'last_code', 'last_request_id', 'updated_at', 'expires_at'] as const;
+const HEALTH_COLUMNS = [...HEALTH_KEY, ...HEALTH_FIELDS] satisfies readonly (keyof ProviderHealthRow)[];
 
 /** The outcome of a reservation attempt. See `reserve`. */
 export type Reservation =
@@ -731,11 +757,21 @@ export class FundingStore {
   // the table, reintroduced at the one write site if this list ever drifted from it.
   async upsertCorridor(row: Omit<SupportedCorridorRow, 'updated_at'>): Promise<void> {
     await this.pool.query(
-      'INSERT INTO supported_corridors (destination_currency_code, direction, country, name, fiat, methods, updated_at) ' +
-        'VALUES ($1, $2, $3, $4, $5, $6, $7) ' +
+      'INSERT INTO supported_corridors (destination_currency_code, direction, country, name, fiat, methods, method_providers, updated_at) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ' +
         'ON CONFLICT (destination_currency_code, direction, country) DO UPDATE SET ' +
-        'name = EXCLUDED.name, fiat = EXCLUDED.fiat, methods = EXCLUDED.methods, updated_at = EXCLUDED.updated_at',
-      [row.destination_currency_code, row.direction, row.country, row.name, row.fiat, JSON.stringify(row.methods), Date.now()],
+        'name = EXCLUDED.name, fiat = EXCLUDED.fiat, methods = EXCLUDED.methods, ' +
+        'method_providers = EXCLUDED.method_providers, updated_at = EXCLUDED.updated_at',
+      [
+        row.destination_currency_code,
+        row.direction,
+        row.country,
+        row.name,
+        row.fiat,
+        JSON.stringify(row.methods),
+        row.method_providers === undefined ? null : JSON.stringify(row.method_providers),
+        Date.now(),
+      ],
     );
   }
 
@@ -745,12 +781,34 @@ export class FundingStore {
   // `upsertCorridor`'s caller already must (`Onramp.supportedCorridors` is where an omitted wire
   // `direction` becomes `buy`; see `rail.ts`'s `DEFAULT_DIRECTION`).
   async readCorridors(code: string, direction: Direction, freshAfter = 0): Promise<SupportedCorridorRow[]> {
-    const result = await this.pool.query<SupportedCorridorRow>(
-      'SELECT destination_currency_code, direction, country, name, fiat, methods, updated_at FROM supported_corridors ' +
+    const result = await this.pool.query<Omit<SupportedCorridorRow, 'method_providers'> & { method_providers: MethodProviders[] | null }>(
+      'SELECT destination_currency_code, direction, country, name, fiat, methods, method_providers, updated_at FROM supported_corridors ' +
         'WHERE destination_currency_code = $1 AND direction = $2 AND updated_at >= $3 ORDER BY name ASC, country ASC',
       [code, direction, freshAfter],
     );
+    return result.rows.map(({ method_providers, ...row }) => (method_providers === null ? row : { ...row, method_providers }));
+  }
+
+  async readProviderHealth(): Promise<ProviderHealthRow[]> {
+    const result = await this.pool.query<ProviderHealthRow>(
+      `SELECT ${HEALTH_COLUMNS.join(', ')} FROM provider_health ORDER BY ${HEALTH_KEY.join(', ')}`,
+    );
     return result.rows;
+  }
+
+  async writeProviderHealth(row: ProviderHealthRow): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO provider_health (${HEALTH_COLUMNS.join(', ')}) ` +
+        `VALUES (${HEALTH_COLUMNS.map((_, i) => `$${String(i + 1)}`).join(', ')}) ` +
+        `ON CONFLICT (${HEALTH_KEY.join(', ')}) DO UPDATE SET ` +
+        HEALTH_FIELDS.map((column) => `${column} = EXCLUDED.${column}`).join(', '),
+      HEALTH_COLUMNS.map((column) => row[column]),
+    );
+  }
+
+  /** Moves the expiry of every row not yet expired at `now` later by `ms`. */
+  async extendProviderHealth(ms: number, now: number): Promise<void> {
+    await this.pool.query('UPDATE provider_health SET expires_at = expires_at + $1 WHERE expires_at > $2', [ms, now]);
   }
 
   /**

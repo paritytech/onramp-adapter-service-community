@@ -18,11 +18,13 @@
  * `BEGIN IMMEDIATE`, which served the same purpose against one file.
  */
 
+import { GLOBAL_SCOPE, PROVIDER_STATES } from '../health/types.js';
+import { METHOD_CATEGORIES } from '../meld/discovery.js';
 import { DIRECTIONS } from '../rail.js';
 import { FUNDING_STATES } from './state.js';
 
 /** The current schema version. Bump with each migration added here. */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /** A migration: bring the previous version's rows to this version's shape. */
 export interface Migration {
@@ -76,6 +78,35 @@ const SUPPORTED_CORRIDORS_DIRECTION_COLUMN = " direction TEXT NOT NULL DEFAULT '
 const SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT = `CONSTRAINT supported_corridors_direction_known CHECK (direction IN (${DIRECTIONS.map((d) => `'${d}'`).join(', ')}))`;
 
 /**
+ * Each method's providers with their own limits, which the API never returns. Null on rows written
+ * before v9. Appended by the v8 -> v9 migration, so `freshSchema()` places it last too.
+ */
+const SUPPORTED_CORRIDORS_PROVIDERS_COLUMN = ' method_providers JSONB';
+
+/** Provider health from probe quotes, one row per provider, direction, method category and scope. */
+const PROVIDER_HEALTH_TABLE =
+  'CREATE TABLE IF NOT EXISTS provider_health (' +
+  ' provider TEXT NOT NULL,' +
+  ' direction TEXT NOT NULL,' +
+  ' category TEXT NOT NULL,' +
+  ' scope TEXT NOT NULL,' +
+  ' state TEXT NOT NULL,' +
+  ' failures INTEGER NOT NULL,' +
+  ' last_ok_at BIGINT,' +
+  ' last_failed_at BIGINT,' +
+  ' last_code TEXT,' +
+  ' last_request_id TEXT,' +
+  ' updated_at BIGINT NOT NULL,' +
+  ' expires_at BIGINT NOT NULL,' +
+  ' PRIMARY KEY (provider, direction, category, scope),' +
+  ` CONSTRAINT provider_health_direction_known CHECK (direction IN (${DIRECTIONS.map((d) => `'${d}'`).join(', ')})),` +
+  ` CONSTRAINT provider_health_category_known CHECK (category IN (${METHOD_CATEGORIES.map((c) => `'${c}'`).join(', ')})),` +
+  ` CONSTRAINT provider_health_state_known CHECK (state IN (${PROVIDER_STATES.map((st) => `'${st}'`).join(', ')})),` +
+  ` CONSTRAINT provider_health_scope_known CHECK (scope = '${GLOBAL_SCOPE}' OR scope ~ '^[A-Z]{2}$'),` +
+  ' CONSTRAINT provider_health_failures_counted CHECK (failures >= 0)' +
+  ')';
+
+/**
  * The current shape of `supported_corridors`: one row per (crypto, direction, country), which is
  * what `upsertCorridor`'s `ON CONFLICT` target and `readCorridors`' predicate both assume from the
  * day this ships. Without `direction` in the key, a sell refresh pass upserting `(DOT, GB)`
@@ -107,6 +138,7 @@ const SUPPORTED_CORRIDORS_TABLE_CURRENT =
   ' methods JSONB NOT NULL,' +
   ' updated_at BIGINT NOT NULL,' +
   `${SUPPORTED_CORRIDORS_DIRECTION_COLUMN},` +
+  `${SUPPORTED_CORRIDORS_PROVIDERS_COLUMN},` +
   ' PRIMARY KEY (destination_currency_code, direction, country),' +
   ` ${SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT}` +
   ')';
@@ -490,6 +522,12 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE supported_corridors ADD ${SUPPORTED_CORRIDORS_DIRECTION_CONSTRAINT}`,
     ],
   },
+  {
+    from: 8,
+    to: 9,
+    /** v8 -> v9: keep each method's per-provider limits, and record provider health. */
+    sql: [`ALTER TABLE supported_corridors ADD COLUMN${SUPPORTED_CORRIDORS_PROVIDERS_COLUMN}`, PROVIDER_HEALTH_TABLE],
+  },
 ];
 
 /**
@@ -566,9 +604,10 @@ export function freshSchema(): string[] {
     // The worker's claim scan orders by (created_at, id) within the non-terminal rows. Leading on
     // `status` lets the planner cut to those first.
     'CREATE INDEX funding_claim_scan ON funding_requests (status, created_at, id)',
-    // The supported-corridors cache, at the current (v8) shape. See the v7 -> v8 migration for
-    // what an existing database walks through to reach the same table.
+    // The supported-corridors cache, at the current (v9) shape. See the v7 -> v8 and v8 -> v9
+    // migrations for what an existing database walks through to reach the same table.
     SUPPORTED_CORRIDORS_TABLE_CURRENT,
+    PROVIDER_HEALTH_TABLE,
   ];
 }
 

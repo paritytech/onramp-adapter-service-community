@@ -6,7 +6,9 @@
  * limits, so the client can pick the lane. The method's own min/max span all of them.
  */
 
+import type { Availability, WithAvailability } from './health/view.js';
 import type { MethodLimit } from './meld/discovery.js';
+import { widestBound } from './money.js';
 
 export interface OfframpLane {
   /** This service's own name for the asset, which a Meld rename does not change. */
@@ -23,16 +25,19 @@ export interface OfframpLaneOffer extends OfframpLane {
   min: string;
   max: string;
   currency: string;
+  availability: Availability;
 }
 
 export interface OfframpMethod {
   paymentMethodType: string;
   category: Method['category'];
-  /** The smallest lane minimum. Exact decimal text. */
+  /** The smallest minimum of the available lanes, or of every lane when none is. Exact decimal text. */
   min: string;
-  /** The largest lane maximum. Exact decimal text. */
+  /** The largest maximum, chosen like `min`. */
   max: string;
   currency: string;
+  /** Available when one lane is. */
+  availability: Availability;
   lanes: OfframpLaneOffer[];
 }
 
@@ -42,7 +47,7 @@ export interface LaneCorridor {
   country: string;
   name?: string;
   fiat: string;
-  methods: readonly Method[];
+  methods: readonly WithAvailability<Method>[];
 }
 
 export interface OfframpCorridor {
@@ -52,23 +57,15 @@ export interface OfframpCorridor {
   methods: OfframpMethod[];
 }
 
-const DECIMAL = /^(\d+)(?:\.(\d+))?$/;
-
-/** Exact comparison of two non-negative decimal strings, -1 | 0 | 1. Unparseable text sorts as 0. */
-function compareDecimal(a: string, b: string): number {
-  const [pa, pb] = [DECIMAL.exec(a), DECIMAL.exec(b)];
-  const scale = Math.max(pa?.[2]?.length ?? 0, pb?.[2]?.length ?? 0);
-  const big = (m: RegExpExecArray | null): bigint => BigInt((m?.[1] ?? '0') + (m?.[2] ?? '').padEnd(scale, '0'));
-  const [x, y] = [big(pa), big(pb)];
-  return x < y ? -1 : x > y ? 1 : 0;
-}
-
 /**
  * Merge one country's per-lane views (in lane order). Every lane offering a method is kept; method
  * order is first-seen; `currency` is the country fiat when given.
  */
 export function mergeMethods(views: readonly LaneCorridor[], fiat?: string): OfframpMethod[] {
-  const merged = new Map<string, OfframpMethod>();
+  const merged = new Map<
+    string,
+    Omit<OfframpMethod, 'min' | 'max' | 'availability' | 'lanes'> & { lanes: [OfframpLaneOffer, ...OfframpLaneOffer[]] }
+  >();
   for (const view of views) {
     for (const method of view.methods) {
       const offer: OfframpLaneOffer = {
@@ -78,25 +75,27 @@ export function mergeMethods(views: readonly LaneCorridor[], fiat?: string): Off
         min: method.min,
         max: method.max,
         currency: method.currency,
+        availability: method.availability,
       };
       const existing = merged.get(method.paymentMethodType);
       if (existing === undefined) {
         merged.set(method.paymentMethodType, {
           paymentMethodType: method.paymentMethodType,
           category: method.category,
-          min: method.min,
-          max: method.max,
           currency: fiat ?? method.currency,
           lanes: [offer],
         });
-        continue;
+      } else {
+        existing.lanes.push(offer);
       }
-      existing.lanes.push(offer);
-      if (compareDecimal(method.min, existing.min) < 0) existing.min = method.min;
-      if (compareDecimal(method.max, existing.max) > 0) existing.max = method.max;
     }
   }
-  return [...merged.values()];
+  return [...merged.values()].map((method) => {
+    const [first, ...rest] = method.lanes.filter((lane) => lane.availability === 'available');
+    return first === undefined
+      ? { ...method, ...widestBound(method.lanes), availability: 'temporarily_unavailable' as const }
+      : { ...method, ...widestBound([first, ...rest]), availability: 'available' as const };
+  });
 }
 
 /**

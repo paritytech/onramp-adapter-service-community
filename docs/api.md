@@ -42,6 +42,40 @@ country's default fiat is resolved differently for a sell too, because Meld has 
 endpoint for `CRYPTO_OFFRAMP` (it answers `404` for every country); the substitute is documented at
 "Off-ramp corridor discovery" below.
 
+### Provider availability
+
+Meld lists a provider once it is enabled on the account, whether or not it can price a request.
+So this service probes each provider with quotes pinned to it (`health.*` in
+[configuration](configuration.md)) and applies the result to every method `GET /supported`,
+`GET /supported/corridors`, `GET /supported/offramp` and `GET /supported/offramp/corridors`
+return:
+
+- `availability` is `"available"` or `"temporarily_unavailable"`, on every method and on every
+  off-ramp lane.
+- An available method's `min` and `max` span only the providers currently answering. With Banxa
+  down and Transak up, a US card method reads `5` to `3000` USD rather than `5` to `15000`.
+- A method none of whose providers answers is `"temporarily_unavailable"` and keeps its last
+  bound. It is not offered right now, which differs from a method that is absent because no
+  provider serves it at all.
+- An off-ramp method is available when one of its lanes is, and its bound spans the available
+  lanes.
+- Health is kept per provider, direction and method category (`card`, `bank`, `wallet`,
+  `other`). A provider down for card buys still serves bank buys and every sell.
+- A provider can be down in one country only. When a live `POST /quote` lacks an offer from a
+  provider the corridor lists, and the amount is within that provider's limits, the probes check
+  that provider for that direction and method category everywhere and then in that country.
+
+A probe proves that a provider prices a request, not that its widget, KYC or settlement works.
+Each stored result expires after three times the time between two probes of its provider,
+direction and category, and a pause after Meld throttles a probe pushes every expiry back by the
+pause. When probes stop reaching a conclusion, a down provider counts as available again once its
+result expires. `POST /session` checks the amount against the same narrowed bound, except that
+the `serviceProvider` it names always counts: that provider comes from the live offers of
+`POST /quote`, which does not filter by availability, and a live offer outranks a probe. With
+Banxa down, a 10000 USD card session naming Banxa is checked against `5` to `15000`, and one naming
+Transak against `5` to `3000`. When every provider is down the full bound applies, so availability
+never refuses a session on its own.
+
 ## Bounds a caller will meet
 
 - Request body limit **16 KiB**. Whole request and idle connection bounded by

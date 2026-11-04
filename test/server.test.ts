@@ -2155,7 +2155,14 @@ describe('the discovery routes', () => {
 
   it('GET /supported/corridors returns the cached corridors under a `corridors` key', async () => {
     const corridors = [
-      { country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [{ paymentMethodType: 'PIX', category: 'bank' as const, min: '10', max: '5000', currency: 'BRL' }] },
+      {
+        country: 'BR',
+        name: 'Brazil',
+        fiat: 'BRL',
+        methods: [
+          { paymentMethodType: 'PIX', category: 'bank' as const, min: '10', max: '5000', currency: 'BRL', availability: 'available' as const },
+        ],
+      },
     ];
     const built = await serve(undefined, config(), { supportedCorridors: async () => corridors });
     const response = await built.inject({
@@ -2192,7 +2199,10 @@ describe('the discovery routes', () => {
             min: '10',
             max: '5000',
             currency: 'BRL',
-            lanes: [{ asset: 'usdt@solana', code: 'USDT_SOLANA', chain: 'solana', min: '10', max: '5000', currency: 'BRL' }],
+            availability: 'available' as const,
+            lanes: [
+              { asset: 'usdt@solana', code: 'USDT_SOLANA', chain: 'solana', min: '10', max: '5000', currency: 'BRL', availability: 'available' as const },
+            ],
           },
         ],
       },

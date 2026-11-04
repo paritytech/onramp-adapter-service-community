@@ -3,7 +3,7 @@ import { encodeAddress } from '@polkadot/util-crypto';
 import { parseConfig, type Config } from '../src/config.js';
 import { TERMINAL_STATES, type FundingState } from '../src/funding/state.js';
 import { mergeAdvance } from '../src/funding/merge.js';
-import type { FundingStore, SupportedCorridorRow } from '../src/funding/store.js';
+import type { FundingStore, ProviderHealthRow, SupportedCorridorRow } from '../src/funding/store.js';
 import { directionTermsViolation, type FundingRecord } from '../src/funding/types.js';
 import type { Direction, RailBuySession, RailSellSession } from '../src/rail.js';
 
@@ -300,6 +300,7 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
   // In-memory supported-corridors cache, keyed `${code}|${direction}|${country}`, mirroring the
   // real table's v7 -> v8 primary key.
   const corridors = new Map<string, SupportedCorridorRow>();
+  const health = new Map<string, ProviderHealthRow>();
 
   /** The row already holding this record's (alias, product, reference), if any. */
   const held = (record: FundingRecord): FundingRecord | undefined =>
@@ -456,6 +457,13 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
       [...corridors.values()]
         .filter((r) => r.destination_currency_code === code && r.direction === direction && r.updated_at >= freshAfter)
         .map((r) => structuredClone(r)),
+    readProviderHealth: async () => [...health.values()].map((r) => structuredClone(r)),
+    writeProviderHealth: async (row: ProviderHealthRow) => {
+      health.set(`${row.provider}|${row.direction}|${row.category}|${row.scope}`, structuredClone(row));
+    },
+    extendProviderHealth: async (ms: number, now: number) => {
+      for (const row of health.values()) if (row.expires_at > now) row.expires_at += ms;
+    },
     close: async () => undefined,
   };
 }
