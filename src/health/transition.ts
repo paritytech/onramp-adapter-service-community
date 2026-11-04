@@ -49,3 +49,11 @@ export function nextHealth(
     expires_at: expiresAt,
   };
 }
+
+/**
+ * `previous` with a pending failure cleared, for a round that proved nothing, so a later failure
+ * is confirmed again rather than counted with an older one. The state and expiry stay as they were.
+ */
+export function clearPending(previous: ProviderHealthRow | undefined): ProviderHealthRow | undefined {
+  return previous?.state === 'up' && previous.failures > 0 ? { ...previous, failures: 0 } : undefined;
+}

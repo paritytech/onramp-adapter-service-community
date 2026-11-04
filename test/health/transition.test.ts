@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { ProviderHealthRow } from '../../src/funding/store.js';
 import type { ProbeResult } from '../../src/health/classify.js';
-import { nextHealth, type HealthKey } from '../../src/health/transition.js';
+import { clearPending, nextHealth, type HealthKey } from '../../src/health/transition.js';
 
 const KEY: HealthKey = { provider: 'BANXA', direction: 'buy', category: 'card', scope: 'global' };
 const UP: ProbeResult = { outcome: 'up' };
@@ -66,5 +66,19 @@ describe('nextHealth', () => {
   ] as const)('changes nothing on %s', (_label, results) => {
     const previous = step(undefined, [DOWN, DOWN], 1);
     expect(step(previous, [...results], 2)).toBeUndefined();
+  });
+});
+
+describe('clearPending', () => {
+  it('clears the failure an up provider was waiting to confirm, and nothing else', () => {
+    const once = step(undefined, [DOWN, DOWN], 1);
+    expect(clearPending(once)).toEqual({ ...once, failures: 0 });
+  });
+
+  it('leaves a provider without a pending failure, or already down, as it is', () => {
+    const down = step(step(undefined, [DOWN, DOWN], 1), [DOWN, DOWN], 2);
+    expect(clearPending(undefined)).toBeUndefined();
+    expect(clearPending(step(undefined, [UP], 1))).toBeUndefined();
+    expect(clearPending(down)).toBeUndefined();
   });
 });

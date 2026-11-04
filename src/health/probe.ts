@@ -6,7 +6,7 @@ import type { MeldClient } from '../meld/client.js';
 import type { RefreshJob } from '../supported/refresh.js';
 import { classifyError, classifyQuotes, type ProbeResult } from './classify.js';
 import { countryTarget, probeGroups, type ProbeGroup, type ProbeTarget, type TargetOptions } from './targets.js';
-import { keyOf, nextHealth, type HealthKey } from './transition.js';
+import { clearPending, keyOf, nextHealth, type HealthKey } from './transition.js';
 import { GLOBAL_SCOPE, STALE_ROUNDS } from './types.js';
 
 export interface ProbeOptions extends TargetOptions {
@@ -175,7 +175,11 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
       const results = await probe(group, check, signal);
       if (results === undefined) return false;
       const next = nextHealth(key, previous, results, clock(), options.failuresToDown, clock() + STALE_ROUNDS * cycleMs);
-      if (next === undefined) return true;
+      if (next === undefined) {
+        const cleared = clearPending(previous);
+        if (cleared !== undefined) await deps.store.writeProviderHealth(cleared);
+        return true;
+      }
       concludedAt = clock();
       staleReported = false;
       await deps.store.writeProviderHealth(next);

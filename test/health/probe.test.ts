@@ -167,6 +167,25 @@ describe('the probe pace', () => {
     expect(h.sent.slice(4).map(({ at }) => at)).toEqual([4 * GAP, 5 * GAP]);
   });
 
+  it('confirms a failure again when the repeat of an earlier one proved nothing', async () => {
+    let banxa = 0;
+    const h = harness(async (target) => {
+      if (target.provider !== 'BANXA') return offers(target);
+      banxa += 1;
+      // A failed round, an inconclusive repeat, then an outage.
+      if (banxa === 3 || banxa === 4) throw new MeldHttpError(400, 'INVALID_AMOUNT_TOO_LOW');
+      throw BANXA_DOWN;
+    });
+    await h.step();
+    expect(h.state('BANXA')).toMatchObject({ state: 'up', failures: 0, last_code: 'INCOMPATIBLE_REQUEST' });
+
+    await h.step();
+    h.advance(INTERVAL);
+    await h.step();
+    expect(h.state('BANXA')).toMatchObject({ state: 'down', failures: 2 });
+    expect(h.calls('BANXA')).toBe(8);
+  });
+
   it('brings a provider back up the next time it answers', async () => {
     let down = true;
     const h = harness(async (target) => (down ? banxaDown(target) : offers(target)));
