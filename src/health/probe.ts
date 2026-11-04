@@ -113,7 +113,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
     return checkLimit - checksSpent.length;
   };
 
-  /** One answer per target, or `undefined` when Meld throttled a probe. */
+  /** The answers up to the first offer, since one offer clears the provider, or `undefined` when Meld throttled a probe. */
   const probe = async (group: ProbeGroup, check: boolean, signal: AbortSignal): Promise<ProbeResult[] | undefined> => {
     const results: ProbeResult[] = [];
     for (const target of group.targets) {
@@ -134,13 +134,14 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
         return undefined;
       }
       results.push(result);
+      if (result.outcome === 'up') break;
     }
     return results;
   };
 
-  const report = (group: ProbeGroup, previous: ProviderHealthRow | undefined, next: ProviderHealthRow): void => {
+  const report = (probed: readonly ProbeTarget[], previous: ProviderHealthRow | undefined, next: ProviderHealthRow): void => {
     const name = `provider ${next.provider} ${next.direction} ${next.category}${next.scope === GLOBAL_SCOPE ? '' : ` in ${next.scope}`}`;
-    const where = group.targets.map((t) => `${t.country}/${t.fiat}`).join(', ');
+    const where = probed.map((t) => `${t.country}/${t.fiat}`).join(', ');
     const wasDown = previous?.state === 'down';
     if (next.state === 'down' && !wasDown) {
       deps.log.warn(
@@ -183,7 +184,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
       concludedAt = clock();
       staleReported = false;
       await deps.store.writeProviderHealth(next);
-      report(group, previous, next);
+      report(group.targets.slice(0, results.length), previous, next);
       known.set(keyOf(key), next);
       previous = next;
       if (next.failures === 0 || next.state === 'down' || !affordable()) return true;
@@ -216,7 +217,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
     if (stretched === wasStretched) return;
     deps.log.info(
       stretched
-        ? `${String(work.length)} provider probes need ${String(quotes)} quotes at one every ${String(gapMs)}ms: each is repeated every ${String(cycleMs)}ms`
+        ? `${String(work.length)} provider probes need up to ${String(quotes)} quotes at one every ${String(gapMs)}ms: each is repeated within ${String(cycleMs)}ms`
         : `each provider probe is repeated every ${String(options.intervalMs)}ms again`,
     );
   };

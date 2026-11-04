@@ -164,7 +164,15 @@ describe('the probe pace', () => {
 
     await h.step();
     expect(h.state('TRANSAK')).toMatchObject({ state: 'up', failures: 0 });
-    expect(h.sent.slice(4).map(({ at }) => at)).toEqual([4 * GAP, 5 * GAP]);
+    expect(h.sent.slice(4).map(({ at }) => at)).toEqual([4 * GAP]);
+  });
+
+  it('stops a probe at its first offer, and tries the second country only when the first fails', async () => {
+    const h = harness(async (target) => (target.provider === 'BANXA' && target.country === 'US' ? banxaDown(target) : offers(target)));
+    await h.step();
+    await h.step();
+    expect(h.sent.map(({ target }) => `${target.provider} ${target.country}`)).toEqual(['BANXA US', 'BANXA GB', 'TRANSAK US']);
+    expect(h.state('BANXA')).toMatchObject({ state: 'up', failures: 0 });
   });
 
   it('confirms a failure again when the repeat of an earlier one proved nothing', async () => {
@@ -196,19 +204,19 @@ describe('the probe pace', () => {
     await h.step();
 
     expect(h.state('BANXA')).toMatchObject({ state: 'up', failures: 0, last_code: 'INCOMPATIBLE_REQUEST' });
-    expect(lines(h.log.info)).toContain('provider BANXA buy card is up again in US/USD, GB/GBP');
+    expect(lines(h.log.info)).toContain('provider BANXA buy card is up again in US/USD');
   });
 
   it('probes the group probed longest ago next, and no group more often than the interval', async () => {
     const h = harness(offers);
-    await h.until(4);
+    await h.until(2);
     await h.step();
-    expect(h.sent).toHaveLength(4);
+    expect(h.sent).toHaveLength(2);
 
-    await h.until(6);
-    expect(h.sent.slice(4).map(({ target, at }) => [target.provider, at >= INTERVAL])).toEqual([
+    await h.until(4);
+    expect(h.sent.slice(2).map(({ target, at }) => [target.provider, at >= INTERVAL])).toEqual([
       ['BANXA', true],
-      ['BANXA', true],
+      ['TRANSAK', true],
     ]);
   });
 
@@ -217,7 +225,7 @@ describe('the probe pace', () => {
     await h.step();
     await h.step();
     expect(h.calls('BANXA')).toBe(0);
-    expect(h.calls('TRANSAK')).toBe(2);
+    expect(h.calls('TRANSAK')).toBe(1);
   });
 
   it('probes each group less often when the groups need more quotes than the rate allows in the interval', async () => {
@@ -226,7 +234,7 @@ describe('the probe pace', () => {
     expect(h.calls('BANXA')).toBe(4);
     expect(h.calls('TRANSAK')).toBe(4);
     expect(h.sent.map(({ at }) => at)).toEqual([0, 1, 2, 3, 4, 5, 6, 7].map((i) => i * 360_000));
-    expect(lines(h.log.info)).toEqual(['2 provider probes need 4 quotes at one every 360000ms: each is repeated every 1440000ms']);
+    expect(lines(h.log.info)).toEqual(['2 provider probes need up to 4 quotes at one every 360000ms: each is repeated within 1440000ms']);
 
     h.rows.splice(0);
     await h.step();
@@ -381,24 +389,24 @@ describe('a live-quote check', () => {
   });
 
   it('starts only what half the hour\'s quotes cover, leaving the rest to the groups', async () => {
-    const h = harness(downInGermany, { maxProbesPerHour: 4 });
+    // One quote an hour for checks: the check everywhere needs up to two, the country one.
+    const h = harness(downInGermany, { maxProbesPerHour: 2 });
     h.suspect('BANXA', 'DE');
     await h.step();
-    expect(h.calls('BANXA')).toBe(2);
-    expect(h.calls('BANXA', 'DE')).toBe(0);
+    expect(h.calls('BANXA')).toBe(1);
+    expect(h.calls('BANXA', 'DE')).toBe(1);
 
     await h.step();
-    expect(h.calls('TRANSAK')).toBe(2);
+    expect(h.calls('BANXA', 'US')).toBe(1);
 
-    h.advance(INTERVAL);
     h.suspect('BANXA', 'DE');
     await h.step();
-    expect(h.calls('BANXA')).toBe(2);
+    expect(h.calls('BANXA', 'DE')).toBe(1);
 
     h.advance(HOUR);
     h.suspect('BANXA', 'DE');
     await h.step();
-    expect(h.calls('BANXA')).toBe(4);
+    expect(h.calls('BANXA', 'DE')).toBe(2);
   });
 
   it('stops before the country when Meld throttles the check everywhere', async () => {
