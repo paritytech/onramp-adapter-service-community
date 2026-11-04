@@ -961,7 +961,6 @@ describe('parseConfig', () => {
       expect(parseConfig(rawConfig()).health).toEqual({
         enabled: true,
         interval_ms: 600_000,
-        confirm_delay_ms: 5_000,
         failures_to_down: 2,
         throttle_pause_ms: 900_000,
         max_probes_per_hour: 120,

@@ -629,7 +629,7 @@ afterEach(async () => {
     const raw = JSON.parse(await readFile(path, 'utf8')) as Record<string, Record<string, unknown> | undefined>;
     raw.supported = { enabled: true, catalog_interval_ms: 120_000, routes_interval_ms: 120_000 };
     raw.meld = { ...raw.meld, countries_cache_ttl_ms: 60_000, defaults_cache_ttl_ms: 60_000, routes_cache_ttl_ms: 60_000 };
-    raw.health = { confirm_delay_ms: 0, sell_amounts: [{ asset: 'dot@assethub', amount: '15' }] };
+    raw.health = { max_probes_per_hour: 10_000, sell_amounts: [{ asset: 'dot@assethub', amount: '15' }] };
     await writeFile(path, JSON.stringify(raw));
     const lines: string[] = [];
     handle = await start(path, { write: (line) => lines.push(line) });

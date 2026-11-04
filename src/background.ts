@@ -1,11 +1,11 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 
 /** Runs passes one at a time, in call order. A failed pass does not block the next one. */
-export type Serial = (pass: () => Promise<void>) => Promise<void>;
+export type Serial = <T>(pass: () => Promise<T>) => Promise<T>;
 
 export function serial(): Serial {
-  let chain: Promise<void> = Promise.resolve();
-  return (pass) => {
+  let chain: Promise<unknown> = Promise.resolve();
+  return <T>(pass: () => Promise<T>): Promise<T> => {
     const next = chain.then(pass, pass);
     chain = next.then(
       () => undefined,

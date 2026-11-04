@@ -304,7 +304,6 @@ export async function start(
             },
             {
               intervalMs: cfg.health.interval_ms,
-              confirmDelayMs: cfg.health.confirm_delay_ms,
               failuresToDown: cfg.health.failures_to_down,
               throttlePauseMs: cfg.health.throttle_pause_ms,
               maxProbesPerHour: cfg.health.max_probes_per_hour,

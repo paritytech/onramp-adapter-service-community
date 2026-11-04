@@ -220,13 +220,14 @@ supported:
     # - { asset: usdc@arbitrum }
     # - { asset: usdc@solana }
 
-# Provider probes behind `provider_health`: one Meld quote per provider, direction and method
-# category, pinned to that provider, in two countries picked at random each round with different
-# fiat currencies. A provider Meld lists but cannot price is marked down for that direction and
-# category. Runs only while `supported.enabled` is true, because
-# the probes are chosen from its corridors.
+# Provider probes behind `provider_health`: Meld quotes pinned to one provider, sent one at a time,
+# for each provider, direction and method category, in two countries picked at random with
+# different fiat currencies. A provider Meld lists but cannot price is marked down for that
+# direction and category. Runs only while `supported.enabled` is true, because the probes are
+# chosen from its corridors.
 health:
   enabled: true
+  # The least time between two probes of one provider, direction and category.
   interval_ms: 600000
   # The crypto a sell probe prices, per asset. A sell asset without an amount is not probed. An
   # amount outside a provider's limits is inconclusive, never a failure.

@@ -606,7 +606,6 @@ const configSchema = z
       .object({
         enabled: z.boolean().default(true),
         interval_ms: z.number().int().min(60_000).max(86_400_000).default(600_000),
-        confirm_delay_ms: z.number().int().min(0).max(300_000).default(5_000),
         failures_to_down: z.number().int().min(1).max(10).default(2),
         throttle_pause_ms: z.number().int().min(60_000).max(86_400_000).default(900_000),
         max_probes_per_hour: z.number().int().min(1).max(10_000).default(120),
