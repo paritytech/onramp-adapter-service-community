@@ -14,7 +14,7 @@
 # service and reads the secrets from where the orchestrator mounts them.
 
 # ---- build -------------------------------------------------------------------
-FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS build
+FROM node:22.23.4-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS build
 
 # System CA bundle for TLS to Meld and the People-chain WebSocket transport.
 # node:22-slim omits ca-certificates.crt; the release notes where that bites are
@@ -34,7 +34,7 @@ COPY src/ ./src/
 RUN npm run build
 
 # ---- runtime stage -----------------------------------------------------------
-FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS runtime
+FROM node:22.23.4-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS runtime
 
 # Same CA rationale as the build stage; also curl for the healthcheck.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
