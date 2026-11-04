@@ -514,13 +514,20 @@ describe('sell-only codes across the sell paths', () => {
     const svc = build(discovery, withLanes('DOT'));
     expect(await refusalOf(() => svc.quote(asQuote(sellQuoteBody({ destinationCurrencyCode: SOL_CODE }))))).toEqual({ tag: 'RegionUnavailable' });
     expect(
-      await refusalOf(() => svc.createSession(SUBJECT, asSession(sellRequest({ destinationCurrencyCode: SOL_CODE })), 'req-sol-off')),
+      await refusalOf(() =>
+        svc.createSession(
+          SUBJECT,
+          asSession(sellRequest({ destinationCurrencyCode: SOL_CODE, walletAddress: undefined })),
+          'req-sol-off',
+        ),
+      ),
     ).toEqual({ tag: 'RegionUnavailable' });
     // The lane still listed sells as before.
     expect((await svc.quote(asQuote(sellQuoteBody()))).quotes).toHaveLength(1);
   });
 
-  it('still refuses a walletAddress on a sell session', async () => {
+  it('refuses a seller address that is not one on the lane\'s own chain', async () => {
+    // The provider refunds to it, so a malformed one is refused rather than sent.
     const svc = build(fakeDiscovery());
     await expect(
       svc.createSession(SUBJECT, asSession(sellRequest({ destinationCurrencyCode: SOL_CODE, walletAddress: 'x' })), 'req-sol-w'),

@@ -53,7 +53,18 @@ export function mergeAdvance(
   // Any other self-loop attempt still goes through `transition` and still throws exactly as
   // before. This is not a general loosening of the machine, and `state.ts` and its exhaustive
   // transition test are untouched.
-  const factOnly = to === previous.status && deposit !== undefined && !TERMINAL_STATES.includes(previous.status);
+  //
+  // The provider's own status is the second such fact. A Meld transaction moves through PENDING,
+  // SETTLING and SETTLED, and only the last moves the row; SETTLING (the provider approved the
+  // payment and is sending the crypto) arrives while the row sits in `transaction_seen`, and the
+  // app hands the buyer from the provider's widget to its own timeline on it. Only a status that
+  // differs from the one on file counts, so an unchanged re-read is still a refused self-loop.
+  const providerStatusMoved =
+    extra?.providerStatus !== undefined && (extra.providerStatus ?? undefined) !== previous.provider_status;
+  const factOnly =
+    to === previous.status &&
+    (deposit !== undefined || providerStatusMoved) &&
+    !TERMINAL_STATES.includes(previous.status);
   const next = factOnly ? to : transition(previous.status, to);
 
   const merged = mergeDeposit(previous, deposit, now);

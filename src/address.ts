@@ -128,6 +128,7 @@ export function sellLaneUnsupported(code: string): Refusal {
   return reject({ tag: 'RegionUnavailable' }, `SELL_LANE_UNSUPPORTED: ${code} cannot be sold through this service.`);
 }
 
+
 /**
  * Canonicalise an address a RAIL disclosed (a sell's deposit address), or say it could not be.
  *

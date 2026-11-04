@@ -172,8 +172,17 @@ export async function tick(
         // The state staying put is not, on its own, "nothing to do": a sell's deposit address can
         // be disclosed while the row sits in `transaction_seen` unmoved, and that fact still has
         // to reach the row. So the skip condition is "no move AND nothing newly discovered",
-        // not "no move" alone -- the one case this whole step exists to open a channel for.
-        if (done === undefined || (done.state === record.status && done.discovered?.deposit === undefined)) {
+        // not "no move" alone -- the one case this whole step exists to open a channel for. The
+        // provider's own status is the other such fact: PENDING -> SETTLING leaves the row in
+        // `transaction_seen`, and SETTLING is what the app hands the buyer off the widget on.
+        const providerStatusMoved =
+          done !== undefined &&
+          done.discovered !== undefined &&
+          (done.discovered.providerStatus ?? undefined) !== record.provider_status;
+        if (
+          done === undefined ||
+          (done.state === record.status && done.discovered?.deposit === undefined && !providerStatusMoved)
+        ) {
           consecutiveFailures = 0;
           continue;
         }
@@ -550,11 +559,11 @@ async function advanceOne(
   // written, so a concluded row never carries an address nobody was shown.
   const ended = TERMINAL_STATES.includes(state);
   // The refreshed facts ride along with the state move, so a conclusion records the status it
-  // concluded on. The id/status pair is written only when the state actually changes (`tick`
-  // skips the write otherwise), which is why the re-observation above, not the stored value, is
-  // what keeps a still-pending transaction mapping against the newest fact. `deposit` is the one
-  // exception: `tick` writes it even when `state` does not move, because a sell's deposit address
-  // is exactly the fact that arrives while a row sits here unmoved.
+  // concluded on. The id/status pair is written when the state changes or the provider's status
+  // does (`tick` skips the write otherwise), which is why the re-observation above, not the stored
+  // value, is what keeps a still-pending transaction mapping against the newest fact. `deposit` is
+  // written even when neither moves, because a sell's deposit address is exactly the fact that
+  // arrives while a row sits here unmoved.
   return txn === undefined
     ? { state }
     : {

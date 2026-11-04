@@ -124,6 +124,11 @@ interface RailSessionCommon {
    * it reaches a rail; no rail re-checks it, so nothing may reach one unvalidated.
    */
   redirectUrl: string | undefined;
+  /**
+   * The end user's public address, for a provider's geo and fraud checks. Absent when the caller's
+   * address is not a public one (see `publicClientIp`); a rail that has no use for it ignores it.
+   */
+  clientIpAddress?: string | undefined;
 }
 
 /** Opening a buy: the buyer pays `sourceAmount` of fiat and the crypto is delivered to an address. */

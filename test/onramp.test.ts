@@ -2074,6 +2074,7 @@ describe('a sell request', () => {
       serviceProvider: 'TRANSAK',
       clientReference: 'funding-1',
       redirectUrl: undefined,
+      clientIpAddress: undefined,
     });
     expect(asBuy(meld.calls[0])).toBeUndefined();
   });

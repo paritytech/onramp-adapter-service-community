@@ -464,6 +464,12 @@ on `sessionData`, not per-field `*Locked` booleans, which are silently ignored. 
 sent locked: `cryptoCurrency`, `destinationCurrencyCode`, `walletAddress`, `sourceAmount`,
 `sourceCurrencyCode`, `paymentMethodType`.
 
+**The caller's address is passed on** as `sessionData.clientIpAddress`, buy and sell. Meld asks for
+the end user's public address on every session, and some providers refuse one without it: Transak
+answers `CLIENT_IP_ADDRESS_REQUIRED`. Only a public address is sent; a private, loopback or
+link-local one (an untrusted ingress hop, or local development) is left out. It is the forwarded
+client only when `server.trusted_proxy_cidrs` trusts the hop in front.
+
 **`country` is echoed, not locked.** Meld exposes no `lockFields` entry for it, so a buyer who
 changes jurisdiction inside Meld's flow is not stopped here. `pinned` records what was committed,
 not necessarily what the buyer transacted under. See threat model R11.
@@ -506,6 +512,7 @@ and `sellerAccount` in place of `walletAddress`:
   "destinationCurrencyCode": "DOT",
   "sellerAccount": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
   "cryptoAmount": "12.3456789012",
+  "walletAddress": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
   "paymentMethodType": "PAYOUT_TO_BANK",
   "serviceProvider": "TRANSAK"
 }
@@ -877,6 +884,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 401 | `Other{ UNAUTHORIZED }` | Caller not verified. |
 | 400 | `RouteWithdrawn` | The operator has disabled session creation. |
 | 400 | `Other{ UNKNOWN_RAIL }` | A rail this build knows but this deployment has not wired. |
+| 400 | `Other{ AMOUNT_REJECTED }` | A provider turned the amount down without naming a bound (Meld's `INVALID_AMOUNT`). Not retryable as sent; the remedy is a different amount. Unlike `BelowMinimum`/`AboveMaximum`, there is no `value` to show. |
 | 400 | `Other{ PROVIDER_REJECTED }` | Meld understood the request and declined it, for a reason not enumerated above. Not retryable. |
 | 400 | `Other{ DIRECTION_UNSUPPORTED }` | The named rail does not serve that direction. `chainflip` refuses `direction: "sell"` permanently, having no fiat leg to pay a seller from; `meld` serves both. Not retryable; the remedy is a different rail or a different direction, never the same request again. |
 | 400 | `Other{ RAIL_REFUSED }` | The Chainflip rail refuses **session creation**: it swaps on-chain assets and has no fiat leg. Not retryable. (Its quote leg answers `422 NoQuotesAvailable`.) |
