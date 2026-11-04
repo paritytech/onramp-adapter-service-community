@@ -69,8 +69,12 @@ A probe proves that a provider prices a request, not that its widget, KYC or set
 Each stored result expires after three times the time between two probes of its provider,
 direction and category, and a pause after Meld throttles a probe pushes every expiry back by the
 pause. When probes stop reaching a conclusion, a down provider counts as available again once its
-result expires. `POST /session` checks the amount against the same narrowed bound; when every
-provider is down it checks the full bound, so availability never refuses a session on its own.
+result expires. `POST /session` checks the amount against the same narrowed bound, except that
+the `serviceProvider` it names always counts: that provider comes from the live offers of
+`POST /quote`, which does not filter by availability, and a live offer outranks a probe. With
+Banxa down, a 10000 USD card session naming Banxa is checked against `5` to `15000`, and one naming
+Transak against `5` to `3000`. When every provider is down the full bound applies, so availability
+never refuses a session on its own.
 
 ## Bounds a caller will meet
 

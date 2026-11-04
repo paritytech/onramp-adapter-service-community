@@ -1147,6 +1147,7 @@ export class Onramp {
     country: string,
     method: string,
     onOutage?: 'refuse',
+    chosen?: string,
   ): Promise<{ min: string; max: string }>;
   private async buyLimit(
     code: string,
@@ -1161,6 +1162,7 @@ export class Onramp {
     country: string,
     method: string,
     onOutage: 'refuse' | 'ungate' = 'refuse',
+    chosen?: string,
   ): Promise<{ min: string; max: string } | undefined> {
     // Ground truth is Meld's live route catalog, not a hand-maintained list. The old static
     // `config.limits` refused any currency it did not enumerate, so a Canadian buyer met
@@ -1174,9 +1176,10 @@ export class Onramp {
     if (this.discovery !== undefined) {
       const corridorMethod = await this.corridorMethod(this.discovery, code, currency, country, method, 'buy');
       if (corridorMethod !== undefined) {
-        // Bounded by the providers that answer. With none answering, the full bound stays: health
-        // narrows what a session may charge, it never refuses one on its own.
-        const offered = (await this.health()).apply(corridorMethod, corridorMethod.providers, 'buy', country);
+        // Bounded by the providers that answer and the one the session names. With none answering,
+        // the full bound stays: health narrows what a session may charge, it never refuses one on
+        // its own.
+        const offered = (await this.health()).apply(corridorMethod, corridorMethod.providers, 'buy', country, chosen);
         // A configured (code, currency) row is a business floor that tightens the live bound.
         const floor = this.cfg.limits.find((l) => l.code === code && l.currency === currency);
         if (floor === undefined) return { min: offered.min, max: offered.max };
@@ -1332,7 +1335,7 @@ export class Onramp {
     // `docs/api.md`.
     if (rail.provider === 'meld') {
       if (direction === 'buy') {
-        const limit = await this.buyLimit(destination.code, currency, request.country, request.paymentMethodType);
+        const limit = await this.buyLimit(destination.code, currency, request.country, request.paymentMethodType, 'refuse', request.serviceProvider);
         // The threshold rides on the failure, as it does on the Meld-derived form of the same two
         // tags (`server.ts`'s `meld400`). The type has always carried `value`; only the rail's
         // version filled it, so a config-derived refusal reached the buyer as a bare "that amount is

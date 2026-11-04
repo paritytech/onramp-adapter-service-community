@@ -46,6 +46,12 @@ describe('healthView', () => {
     expect(view.apply(card, providers, 'buy', 'US')).toEqual({ ...card, availability: 'temporarily_unavailable' });
   });
 
+  it('never counts the chosen provider as down', () => {
+    const view = healthView([down()], NOW);
+    expect(view.apply(card, providers, 'buy', 'US', 'BANXA')).toMatchObject({ max: '15000', availability: 'available' });
+    expect(view.apply(card, providers, 'buy', 'US', 'TRANSAK')).toMatchObject({ max: '3000' });
+  });
+
   it('applies a country-scoped outage to that country only', () => {
     const view = healthView([down({ scope: 'DE' })], NOW);
     expect(view.apply(card, providers, 'buy', 'DE')).toMatchObject({ max: '3000' });

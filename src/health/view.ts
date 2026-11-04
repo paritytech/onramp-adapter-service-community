@@ -13,9 +13,17 @@ export type WithAvailability<T> = T & { availability: Availability };
 export interface HealthView {
   /**
    * `method` bounded by its providers that are not down. Unchanged while none is down or none is
-   * stored; with every provider down it keeps its bound and is `temporarily_unavailable`.
+   * stored; with every provider down it keeps its bound and is `temporarily_unavailable`. `chosen`,
+   * a provider taken from a live offer, never counts as down: that offer is fresher evidence than
+   * a probe.
    */
-  apply<M extends Bound & { category: MethodCategory }>(method: M, providers: readonly ProviderLimit[] | undefined, direction: Direction, country: string): WithAvailability<M>;
+  apply<M extends Bound & { category: MethodCategory }>(
+    method: M,
+    providers: readonly ProviderLimit[] | undefined,
+    direction: Direction,
+    country: string,
+    chosen?: string,
+  ): WithAvailability<M>;
 }
 
 /**
@@ -27,8 +35,8 @@ export function healthView(rows: readonly ProviderHealthRow[], now: number): Hea
   const isDown = (provider: string, direction: Direction, category: MethodCategory, country: string): boolean =>
     down.has(keyOf({ provider, direction, category, scope: GLOBAL_SCOPE })) || down.has(keyOf({ provider, direction, category, scope: country }));
   return {
-    apply: (method, providers = [], direction, country) => {
-      const [first, ...rest] = providers.filter((p) => !isDown(p.provider, direction, method.category, country));
+    apply: (method, providers = [], direction, country, chosen) => {
+      const [first, ...rest] = providers.filter((p) => p.provider === chosen || !isDown(p.provider, direction, method.category, country));
       if (first === undefined) return { ...method, availability: providers.length === 0 ? 'available' : 'temporarily_unavailable' };
       if (rest.length + 1 === providers.length) return { ...method, availability: 'available' };
       return { ...method, ...widestBound([first, ...rest]), availability: 'available' };

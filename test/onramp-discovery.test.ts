@@ -715,11 +715,19 @@ describe('provider health', () => {
   });
 
   it('refuses a session above the bound of the providers that answer', async () => {
-    const body = sessionBody({ fiat: 'USD', country: 'US', sourceAmount: '10000.00' });
+    const body = sessionBody({ fiat: 'USD', country: 'US', sourceAmount: '10000.00', serviceProvider: 'TRANSAK' });
     const down = service(await banxaDown(), fakeDiscovery({ methods: [both] }));
     expect((await refusalOf(() => down.createSession(SUBJECT, body, 'req-1'))).tag).toBe('AboveMaximum');
     const healthy = service(fakeStore(), fakeDiscovery({ methods: [both] }));
     expect((await healthy.createSession(SUBJECT, body, 'req-2')).fundingRequestId).toBe('funding-1');
+  });
+
+  it('keeps the provider a session names in its bound, though probes have it down', async () => {
+    const svc = service(await banxaDown(), fakeDiscovery({ methods: [both] }));
+    const body = (sourceAmount: string, idempotencyKey: string) =>
+      sessionBody({ fiat: 'USD', country: 'US', sourceAmount, serviceProvider: 'BANXA', idempotencyKey });
+    expect((await svc.createSession(SUBJECT, body('10000.00', 'idem-high'), 'req-1')).fundingRequestId).toBe('funding-1');
+    expect((await refusalOf(() => svc.createSession(SUBJECT, body('16000.00', 'idem-over'), 'req-2'))).tag).toBe('AboveMaximum');
   });
 
   it('serves every provider when health is disabled', async () => {
