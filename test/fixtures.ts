@@ -461,6 +461,9 @@ export function fakeStore(initial: readonly FundingRecord[] = []) {
     writeProviderHealth: async (row: ProviderHealthRow) => {
       health.set(`${row.provider}|${row.direction}|${row.category}|${row.scope}`, structuredClone(row));
     },
+    extendProviderHealth: async (ms: number, now: number) => {
+      for (const row of health.values()) if (row.expires_at > now) row.expires_at += ms;
+    },
     close: async () => undefined,
   };
 }

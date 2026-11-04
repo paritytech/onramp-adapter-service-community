@@ -22,6 +22,7 @@ export function nextHealth(
   results: readonly ProbeResult[],
   now: number,
   failuresToDown: number,
+  expiresAt: number,
 ): ProviderHealthRow | undefined {
   const kept = {
     last_ok_at: previous?.last_ok_at ?? null,
@@ -30,7 +31,7 @@ export function nextHealth(
     last_request_id: previous?.last_request_id ?? null,
   };
   if (results.some((result) => result.outcome === 'up')) {
-    return { ...key, ...kept, state: 'up', failures: 0, last_ok_at: now, updated_at: now };
+    return { ...key, ...kept, state: 'up', failures: 0, last_ok_at: now, updated_at: now, expires_at: expiresAt };
   }
   const down = results.filter(isDown);
   const [first] = down;
@@ -45,5 +46,6 @@ export function nextHealth(
     last_code: first.code,
     last_request_id: first.requestId ?? null,
     updated_at: now,
+    expires_at: expiresAt,
   };
 }

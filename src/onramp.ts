@@ -50,7 +50,6 @@ import { compareDecimal, toMinorUnits } from './money.js';
 import type { Corridor, CorridorDto, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
 import { classifyError } from './health/classify.js';
 import type { HealthKey } from './health/transition.js';
-import { STALE_ROUNDS } from './health/types.js';
 import { healthView, liveMethods, NO_HEALTH, storedMethods, type HealthView, type WithAvailability } from './health/view.js';
 
 /** Just the store surface onramp touches, injectable in a test. */
@@ -338,7 +337,7 @@ export class Onramp {
   private async health(): Promise<HealthView> {
     if (!this.cfg.health.enabled) return NO_HEALTH;
     try {
-      return healthView(await this.funding.readProviderHealth(), this.clock(), this.cfg.health.interval_ms * STALE_ROUNDS);
+      return healthView(await this.funding.readProviderHealth(), this.clock());
     } catch {
       return NO_HEALTH;
     }

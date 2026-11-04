@@ -28,7 +28,7 @@ export interface ProbeLog {
 }
 
 export interface ProbeDeps {
-  store: Pick<FundingStore, 'readCorridors' | 'readProviderHealth' | 'writeProviderHealth'>;
+  store: Pick<FundingStore, 'readCorridors' | 'readProviderHealth' | 'writeProviderHealth' | 'extendProviderHealth'>;
   quote: PinnedQuote;
   /** The (crypto, direction) pairs whose stored corridors hold the probe targets. */
   jobs: readonly RefreshJob[];
@@ -91,7 +91,8 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
   const checksSpent: number[] = [];
   let lastQuoteAt = -Infinity;
   let pausedUntil = 0;
-  let stretched = false;
+  /** The time between two probes of one group: `intervalMs`, or longer when the groups need more quotes than the rate allows. */
+  let cycleMs = options.intervalMs;
   let concludedAt = clock();
   let staleReported = false;
 
@@ -128,6 +129,8 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
       if (result.outcome === 'throttled') {
         pausedUntil = clock() + options.throttlePauseMs;
         deps.log.warn(`Meld throttled a provider probe (${result.code}); probing pauses for ${String(options.throttlePauseMs)}ms`);
+        // A deliberate pause is no evidence that a provider recovered, so stored health outlasts it.
+        await deps.store.extendProviderHealth(options.throttlePauseMs, clock());
         return undefined;
       }
       results.push(result);
@@ -153,7 +156,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
 
   const reportStale = (): void => {
     const silentMs = clock() - concludedAt;
-    if (staleReported || silentMs <= STALE_ROUNDS * options.intervalMs) return;
+    if (staleReported || silentMs <= STALE_ROUNDS * cycleMs) return;
     staleReported = true;
     deps.log.warn(`no provider probe has reached a conclusion for ${String(silentMs)}ms; stored provider health is stale`);
   };
@@ -171,7 +174,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
     for (;;) {
       const results = await probe(group, check, signal);
       if (results === undefined) return false;
-      const next = nextHealth(key, previous, results, clock(), options.failuresToDown);
+      const next = nextHealth(key, previous, results, clock(), options.failuresToDown, clock() + STALE_ROUNDS * cycleMs);
       if (next === undefined) return true;
       concludedAt = clock();
       staleReported = false;
@@ -201,11 +204,12 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
       .flatMap((row) => countryWork(row, current) ?? []),
   ];
 
-  const reportPace = (work: readonly Work[]): void => {
+  const pace = (work: readonly Work[]): void => {
     const quotes = work.reduce((sum, w) => sum + w.group.targets.length, 0);
-    const cycleMs = quotes * gapMs;
-    if (cycleMs > options.intervalMs === stretched) return;
-    stretched = !stretched;
+    const wasStretched = cycleMs > options.intervalMs;
+    cycleMs = Math.max(options.intervalMs, quotes * gapMs);
+    const stretched = cycleMs > options.intervalMs;
+    if (stretched === wasStretched) return;
     deps.log.info(
       stretched
         ? `${String(work.length)} provider probes need ${String(quotes)} quotes at one every ${String(gapMs)}ms: each is repeated every ${String(cycleMs)}ms`
@@ -247,7 +251,7 @@ export function createProber(deps: ProbeDeps, options: ProbeOptions, exclusive: 
         return;
       }
       const work = regularWork(current);
-      reportPace(work);
+      pace(work);
       const [next] = work
         .filter((w) => isDue(w.key, current.known))
         .sort((a, b) => lastProbe(a.key, current.known) - lastProbe(b.key, current.known));

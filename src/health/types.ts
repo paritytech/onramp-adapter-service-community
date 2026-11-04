@@ -6,5 +6,5 @@ export type ProviderState = (typeof PROVIDER_STATES)[number];
 /** The scope of a provider's health across every country, as opposed to one ISO country code. */
 export const GLOBAL_SCOPE = 'global';
 
-/** Probe intervals without a conclusive round after which stored health no longer applies. */
+/** How many times the time between two probes of a group its stored health stays valid. */
 export const STALE_ROUNDS = 3;

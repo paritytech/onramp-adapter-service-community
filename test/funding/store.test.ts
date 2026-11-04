@@ -1195,6 +1195,7 @@ describe('provider health', () => {
     last_code: 'INCOMPATIBLE_REQUEST',
     last_request_id: 'req-1',
     updated_at: 2_000,
+    expires_at: 5_000,
   };
 
   it('writes a row and replaces it on the same provider, direction, category and scope', async () => {
@@ -1206,6 +1207,19 @@ describe('provider health', () => {
       await store.writeProviderHealth(up);
 
       expect(await store.readProviderHealth()).toEqual([{ ...down, category: 'bank' }, up, { ...down, direction: 'sell' }]);
+    });
+  });
+
+  it('moves later the expiry of every row not yet expired, and of no other', async () => {
+    await withStore(async (store) => {
+      await store.writeProviderHealth(down);
+      await store.writeProviderHealth({ ...down, provider: 'TRANSAK', expires_at: 3_000 });
+      await store.extendProviderHealth(1_000, 3_000);
+
+      expect((await store.readProviderHealth()).map((r) => [r.provider, r.expires_at])).toEqual([
+        ['BANXA', 6_000],
+        ['TRANSAK', 3_000],
+      ]);
     });
   });
 

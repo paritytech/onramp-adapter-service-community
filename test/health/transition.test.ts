@@ -11,7 +11,7 @@ const UNKNOWN: ProbeResult = { outcome: 'unknown', code: 'UNREACHABLE' };
 const THROTTLED: ProbeResult = { outcome: 'throttled', code: 'HTTP_503' };
 
 const step = (previous: ProviderHealthRow | undefined, results: ProbeResult[], now: number) =>
-  nextHealth(KEY, previous, results, now, 2);
+  nextHealth(KEY, previous, results, now, 2, now + 100);
 
 describe('nextHealth', () => {
   it('records a first successful round as up', () => {
@@ -24,13 +24,14 @@ describe('nextHealth', () => {
       last_code: null,
       last_request_id: null,
       updated_at: 1,
+      expires_at: 101,
     });
   });
 
   it('marks a provider down after two failed rounds, not one', () => {
     const once = step(undefined, [DOWN, DOWN], 1);
     expect(once).toMatchObject({ state: 'up', failures: 1, last_failed_at: 1, last_code: 'INCOMPATIBLE_REQUEST' });
-    expect(step(once, [DOWN, DOWN], 2)).toMatchObject({ state: 'down', failures: 2, last_failed_at: 2 });
+    expect(step(once, [DOWN, DOWN], 2)).toMatchObject({ state: 'down', failures: 2, last_failed_at: 2, expires_at: 102 });
   });
 
   it('records the request ID of the failure it counted', () => {

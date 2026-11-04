@@ -682,6 +682,7 @@ describe('provider health', () => {
       last_code: 'INCOMPATIBLE_REQUEST',
       last_request_id: null,
       updated_at: NOW,
+      expires_at: NOW + 1,
     });
     return store;
   };

@@ -66,8 +66,10 @@ return:
   that provider for that direction and method category everywhere and then in that country.
 
 A probe proves that a provider prices a request, not that its widget, KYC or settlement works.
-When probes stop reaching a conclusion, a down provider counts as available again after three
-probe intervals. `POST /session` checks the amount against the same narrowed bound; when every
+Each stored result expires after three times the time between two probes of its provider,
+direction and category, and a pause after Meld throttles a probe pushes every expiry back by the
+pause. When probes stop reaching a conclusion, a down provider counts as available again once its
+result expires. `POST /session` checks the amount against the same narrowed bound; when every
 provider is down it checks the full bound, so availability never refuses a session on its own.
 
 ## Bounds a caller will meet

@@ -4,7 +4,6 @@ import type { ProviderHealthRow, SupportedCorridorRow } from '../../src/funding/
 import { healthView, NO_HEALTH, storedMethods } from '../../src/health/view.js';
 
 const NOW = 10_000_000;
-const STALE = 1_800_000;
 
 const down = (over: Partial<ProviderHealthRow> = {}): ProviderHealthRow => ({
   provider: 'BANXA',
@@ -18,6 +17,7 @@ const down = (over: Partial<ProviderHealthRow> = {}): ProviderHealthRow => ({
   last_code: 'INCOMPATIBLE_REQUEST',
   last_request_id: null,
   updated_at: NOW,
+  expires_at: NOW + 1,
   ...over,
 });
 
@@ -33,7 +33,7 @@ describe('healthView', () => {
   });
 
   it('bounds a method by the providers that are not down', () => {
-    expect(healthView([down()], NOW, STALE).apply(card, providers, 'buy', 'US')).toEqual({
+    expect(healthView([down()], NOW).apply(card, providers, 'buy', 'US')).toEqual({
       ...card,
       min: '5',
       max: '3000',
@@ -42,34 +42,34 @@ describe('healthView', () => {
   });
 
   it('keeps the bound and flags the method when every provider is down', () => {
-    const view = healthView([down(), down({ provider: 'TRANSAK' })], NOW, STALE);
+    const view = healthView([down(), down({ provider: 'TRANSAK' })], NOW);
     expect(view.apply(card, providers, 'buy', 'US')).toEqual({ ...card, availability: 'temporarily_unavailable' });
   });
 
   it('applies a country-scoped outage to that country only', () => {
-    const view = healthView([down({ scope: 'DE' })], NOW, STALE);
+    const view = healthView([down({ scope: 'DE' })], NOW);
     expect(view.apply(card, providers, 'buy', 'DE')).toMatchObject({ max: '3000' });
     expect(view.apply(card, providers, 'buy', 'US')).toMatchObject({ max: '15000' });
   });
 
   it('applies an outage to its own direction only', () => {
-    expect(healthView([down({ direction: 'sell' })], NOW, STALE).apply(card, providers, 'buy', 'US')).toMatchObject({ max: '15000' });
+    expect(healthView([down({ direction: 'sell' })], NOW).apply(card, providers, 'buy', 'US')).toMatchObject({ max: '15000' });
   });
 
   it('applies an outage to its own method category only', () => {
     const bank = { ...card, paymentMethodType: 'SEPA', category: 'bank' as const };
-    const view = healthView([down()], NOW, STALE);
+    const view = healthView([down()], NOW);
     expect(view.apply(card, providers, 'buy', 'US')).toMatchObject({ max: '3000' });
     expect(view.apply(bank, providers, 'buy', 'US')).toMatchObject({ max: '15000' });
   });
 
-  it('ignores a down state older than the stale window', () => {
-    const view = healthView([down({ updated_at: NOW - STALE - 1 })], NOW, STALE);
+  it('ignores a down state past its expiry', () => {
+    const view = healthView([down({ expires_at: NOW })], NOW);
     expect(view.apply(card, providers, 'buy', 'US')).toMatchObject({ max: '15000', availability: 'available' });
   });
 
   it('serves a method without stored providers as it is', () => {
-    expect(healthView([down()], NOW, STALE).apply(card, undefined, 'buy', 'US')).toEqual({ ...card, availability: 'available' });
+    expect(healthView([down()], NOW).apply(card, undefined, 'buy', 'US')).toEqual({ ...card, availability: 'available' });
   });
 });
 
@@ -85,7 +85,7 @@ describe('storedMethods', () => {
       method_providers: [{ paymentMethodType: 'CREDIT_DEBIT_CARD', providers }],
       updated_at: NOW,
     };
-    expect(storedMethods(healthView([down()], NOW, STALE), row).map(({ paymentMethodType, max }) => [paymentMethodType, max])).toEqual([
+    expect(storedMethods(healthView([down()], NOW), row).map(({ paymentMethodType, max }) => [paymentMethodType, max])).toEqual([
       ['CREDIT_DEBIT_CARD', '3000'],
       ['ACH', '500'],
     ]);

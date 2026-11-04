@@ -136,10 +136,12 @@ export interface ProviderHealthRow {
   last_code: string | null;
   last_request_id: string | null;
   updated_at: number;
+  /** When the row stops counting, unless a probe writes it again first. */
+  expires_at: number;
 }
 
 const HEALTH_KEY = ['provider', 'direction', 'category', 'scope'] as const;
-const HEALTH_FIELDS = ['state', 'failures', 'last_ok_at', 'last_failed_at', 'last_code', 'last_request_id', 'updated_at'] as const;
+const HEALTH_FIELDS = ['state', 'failures', 'last_ok_at', 'last_failed_at', 'last_code', 'last_request_id', 'updated_at', 'expires_at'] as const;
 const HEALTH_COLUMNS = [...HEALTH_KEY, ...HEALTH_FIELDS] satisfies readonly (keyof ProviderHealthRow)[];
 
 /** The outcome of a reservation attempt. See `reserve`. */
@@ -802,6 +804,11 @@ export class FundingStore {
         HEALTH_FIELDS.map((column) => `${column} = EXCLUDED.${column}`).join(', '),
       HEALTH_COLUMNS.map((column) => row[column]),
     );
+  }
+
+  /** Moves the expiry of every row not yet expired at `now` later by `ms`. */
+  async extendProviderHealth(ms: number, now: number): Promise<void> {
+    await this.pool.query('UPDATE provider_health SET expires_at = expires_at + $1 WHERE expires_at > $2', [ms, now]);
   }
 
   /**

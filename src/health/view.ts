@@ -19,11 +19,11 @@ export interface HealthView {
 }
 
 /**
- * Provider health as of `now`. A `down` row older than `staleMs` counts as up: when probes stop
+ * Provider health as of `now`. A `down` row past its expiry counts as up: when probes stop
  * reaching conclusions, every provider is served again rather than one being hidden indefinitely.
  */
-export function healthView(rows: readonly ProviderHealthRow[], now: number, staleMs: number): HealthView {
-  const down = new Set(rows.filter((row) => row.state === 'down' && now - row.updated_at <= staleMs).map(keyOf));
+export function healthView(rows: readonly ProviderHealthRow[], now: number): HealthView {
+  const down = new Set(rows.filter((row) => row.state === 'down' && now < row.expires_at).map(keyOf));
   const isDown = (provider: string, direction: Direction, category: MethodCategory, country: string): boolean =>
     down.has(keyOf({ provider, direction, category, scope: GLOBAL_SCOPE })) || down.has(keyOf({ provider, direction, category, scope: country }));
   return {
@@ -37,7 +37,7 @@ export function healthView(rows: readonly ProviderHealthRow[], now: number, stal
 }
 
 /** A view in which every provider is up. */
-export const NO_HEALTH: HealthView = healthView([], 0, 0);
+export const NO_HEALTH: HealthView = healthView([], 0);
 
 /** A live corridor's methods as a client sees them. */
 export const liveMethods = (view: HealthView, corridor: Corridor, direction: Direction): WithAvailability<Omit<MethodLimit, 'providers'>>[] =>

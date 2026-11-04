@@ -59,6 +59,7 @@ const row = (over: Partial<ProviderHealthRow>): ProviderHealthRow => ({
   last_code: null,
   last_request_id: null,
   updated_at: 0,
+  expires_at: INTERVAL,
   ...over,
 });
 
@@ -94,6 +95,9 @@ function harness(
     readProviderHealth: async () => [...health.values()],
     writeProviderHealth: async (r: ProviderHealthRow) => {
       health.set(`${r.provider}|${r.direction}|${r.category}|${r.scope}`, r);
+    },
+    extendProviderHealth: async (ms: number, at: number) => {
+      for (const r of health.values()) if (r.expires_at > at) r.expires_at += ms;
     },
   };
   const prober = createProber(
@@ -221,6 +225,30 @@ describe('the probe pace', () => {
     expect(h.state('BANXA')).toMatchObject({ state: 'down' });
     expect(h.state('BANXA', 'global', 'bank')).toMatchObject({ state: 'up' });
     expect(h.sent.filter(({ target }) => target.category === 'bank').map(({ target }) => target.country)).not.toContain('US');
+  });
+
+  it('keeps stored health valid for three times the time between two probes of a group', async () => {
+    const h = harness(banxaDown);
+    await h.step();
+    expect(h.state('BANXA')).toMatchObject({ state: 'down', expires_at: 3 * GAP + 3 * INTERVAL });
+
+    const slow = harness(banxaDown, { maxProbesPerHour: 10 });
+    await slow.step();
+    expect(slow.state('BANXA')).toMatchObject({ state: 'down', expires_at: 3 * 360_000 + 3 * 4 * 360_000 });
+  });
+
+  it('keeps stored health valid through a throttle pause, without reviving what had expired', async () => {
+    const stored = [
+      row({ provider: 'TRANSAK', state: 'down', failures: 2, expires_at: 2 * INTERVAL }),
+      row({ provider: 'STRIPE', state: 'down', expires_at: 0 }),
+    ];
+    const throttled: PinnedQuote = async () => {
+      throw new MeldHttpError(429);
+    };
+    const h = harness(throttled, {}, undefined, stored);
+    await h.step();
+    expect(h.state('TRANSAK')).toMatchObject({ expires_at: 2 * INTERVAL + OPTIONS.throttlePauseMs });
+    expect(h.state('STRIPE')).toMatchObject({ expires_at: 0 });
   });
 
   it('pauses after Meld throttles a probe, then probes again', async () => {
@@ -383,6 +411,7 @@ describe('startProviderProbes', () => {
       readCorridors: async () => [corridor('DE', 'EUR')],
       readProviderHealth: async () => fresh(),
       writeProviderHealth: async () => undefined,
+      extendProviderHealth: async () => undefined,
     };
     const probes = startProviderProbes(
       { store, quote, jobs: [{ crypto: 'DOT', direction: 'buy' }], log: { info: vi.fn(), warn: vi.fn() } },
@@ -407,6 +436,7 @@ describe('startProviderProbes', () => {
       },
       readProviderHealth: async () => [],
       writeProviderHealth: async () => undefined,
+      extendProviderHealth: async () => undefined,
     };
     const log = { info: vi.fn<(message: string) => void>(), warn: vi.fn<(message: string) => void>() };
     const probes = startProviderProbes({ store, quote: offers, jobs: [{ crypto: 'DOT', direction: 'buy' }], log }, { ...OPTIONS, intervalMs: 5 });

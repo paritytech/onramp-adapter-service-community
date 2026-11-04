@@ -97,6 +97,7 @@ const PROVIDER_HEALTH_TABLE =
   ' last_code TEXT,' +
   ' last_request_id TEXT,' +
   ' updated_at BIGINT NOT NULL,' +
+  ' expires_at BIGINT NOT NULL,' +
   ' PRIMARY KEY (provider, direction, category, scope),' +
   ` CONSTRAINT provider_health_direction_known CHECK (direction IN (${DIRECTIONS.map((d) => `'${d}'`).join(', ')})),` +
   ` CONSTRAINT provider_health_category_known CHECK (category IN (${METHOD_CATEGORIES.map((c) => `'${c}'`).join(', ')})),` +
