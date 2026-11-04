@@ -229,6 +229,9 @@ health:
   enabled: true
   # The least time between two probes of one provider, direction and category.
   interval_ms: 600000
+  # Probe quotes share the Meld key's rate limit with buyers: never two closer than an hour divided
+  # by this. More providers make each probe repeat less often, never faster than this rate.
+  max_probes_per_hour: 120
   # The crypto a sell probe prices, per asset. A sell asset without an amount is not probed. An
   # amount outside a provider's limits is inconclusive, never a failure.
   sell_amounts:

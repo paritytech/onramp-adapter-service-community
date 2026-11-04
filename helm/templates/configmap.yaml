@@ -100,6 +100,7 @@ data:
       "health": {
         "enabled": {{ .Values.health.enabled }},
         "interval_ms": {{ int .Values.health.interval_ms }},
+        "max_probes_per_hour": {{ int .Values.health.max_probes_per_hour }},
         "sell_amounts": {{ .Values.health.sell_amounts | toJson }}
       }
     }
