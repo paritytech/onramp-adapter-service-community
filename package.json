@@ -28,7 +28,7 @@
     "jose": "^6.2.10",
     "pg": "^8.23.0",
     "verifiablejs": "1.6.0",
-    "zod": "^4.5.4"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
