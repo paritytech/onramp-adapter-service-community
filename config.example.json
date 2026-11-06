@@ -44,7 +44,7 @@
         }
       ],
       "challenge_ttl_ms": 60000,
-      "token_ttl_s": 300
+      "token_ttl_s": 86400
     }
   },
   "assets": {

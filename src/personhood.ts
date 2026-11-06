@@ -1,11 +1,11 @@
 /**
  * The personhood handshake that gates every Meld-spending call.
  *
- * Two routes, one asymmetric protocol. `challenge` is public and rate-limited; nothing of value
- * is minted, just a fresh 56-byte token. `redeem` is where a proof becomes a short-lived JWT. It
- * verifies the challenge was authentic and unexpired, proves the caller is currently in the
- * People ring (the on-chain commitment check), then mints a JWT binding that person (`sub`) to
- * this product (`aud`).
+ * Two routes, one asymmetric protocol. `challenge` is public and rate-limited; nothing of value is
+ * minted, just a fresh 56-byte token. `redeem` is where a proof becomes a JWT valid for
+ * `token_ttl_s`. It verifies the challenge was authentic and unexpired, proves the caller is
+ * currently in the People ring (the on-chain commitment check), then mints a JWT binding that
+ * person (`sub`) to this product (`aud`).
  *
  * The protected routes only verify the JWT: cheap, stateless, no chain touch per spend. The
  * `sub` alias is the audit key and the rate-limit key (see src/caller.ts for how
@@ -16,6 +16,7 @@
 
 import { unauthorized, upstreamUnavailable } from './contract.js';
 import { mintChallenge, verifyChallenge } from './personhood/challenge.js';
+import { productProofContext } from './personhood/context.js';
 import {
   ProofRefusal,
   ProofRejected,
@@ -64,7 +65,12 @@ interface Redeemed {
 
 const toWire = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64url');
 const fromWire = (s: string) => new Uint8Array(Buffer.from(s, 'base64url'));
-const utf8 = (s: string) => new TextEncoder().encode(s);
+
+/**
+ * Fixed rather than caller-chosen: each index yields a distinct alias, so a free index would let one
+ * person hold any number of identities per product.
+ */
+const PROOF_CONTEXT_INDEX = 0;
 
 export class PersonhoodService {
   constructor(private readonly deps: PersonhoodDeps) {}
@@ -74,7 +80,7 @@ export class PersonhoodService {
   }
 
   /**
-   * Turn a proof and the challenge it answers into a short-lived bearer JWT.
+   * Turn a proof and the challenge it answers into a bearer JWT valid for `token_ttl_s`.
    *
    * Order is the point: the challenge must be authentic and unexpired before the chain
    * membership check, so a captured proof cannot be replayed to open a new token. The chain check
@@ -96,7 +102,7 @@ export class PersonhoodService {
 
     // The proof was minted over `context` = the product, `message` = the challenge bytes. Binding
     // both makes the proof coherent with this handshake and this deployment.
-    const context = utf8(input.productId);
+    const context = productProofContext(input.productId, PROOF_CONTEXT_INDEX);
     const message = challenge;
 
     // Each collection until one opens the proof. Order costs work, not outcome: a proof opens

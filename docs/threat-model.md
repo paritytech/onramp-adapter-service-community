@@ -5,7 +5,7 @@ first, because it lists what an attacker can still do.
 
 **Status.** Prototype, not externally audited. Caller authentication is the shipped personhood
 gate: a caller proves current membership of the People ring against the chain's commitment and
-receives a short-lived JWT that authenticates the protected routes. `insecure_dev` authenticates
+receives a JWT that authenticates the protected routes until it expires. `insecure_dev` authenticates
 nothing and is refused outside `development`. See R1 and R3 for what that does not cover.
 
 ## 1. What is being protected
@@ -59,7 +59,7 @@ The operator is trusted for configuration and for the secret files.
 | T15 | Development posture reaching production | `insecure_dev` is refused outside `development`, sandbox included, and logs a warning naming itself at boot. See R15. |
 | T16 | PII or card data in logs | None is handled. The audit record carries the caller alias, the pinned terms and Meld's session id: no account, no address history, no card detail. |
 | T17 | A recorded proof replayed to open a fresh token | The challenge must verify as authentic and unexpired before the chain read, and the proof's `message` binding is the challenge bytes, so a proof captured against one challenge validates against no other. See R14 for what this does not close. |
-| T18 | A proof aimed at a foreign ring, or a caller-shrunk proof domain | The collection is fixed at configuration and the request only declares `ring` within it. The ring exponent is a config constant, never caller-supplied. A ring with no current `Root` is refused as `UnknownRing`, and a `Root` shorter than the 768-byte commitment is refused rather than truncated, since `subarray` shortens without complaining. |
+| T18 | A proof aimed at a foreign ring, or a caller-shrunk proof domain | The collection is fixed at configuration and the request only declares `ring` within it. The ring exponent is a config constant, never caller-supplied. A ring with no current `Root` is refused as `UnknownRing`, and a `Root` that is not exactly a 1140-byte `RingRoot` is refused rather than sliced, since `subarray` would take the first 288 bytes of any value without complaining. |
 | T18b | The JWT signing key weak enough to brute-force offline | A 32-byte floor, refused at boot below it. HKDF expands it into the challenge MAC key and the HS256 token key without creating entropy, and `jose` will sign HS256 with a single byte, so a short mount would leave the gate brute-forceable from one captured token and forged `sub`/`aud` claims readable. |
 | T19 | The proof proves something other than a distinct, stable person | Verifying against the chain commitment proves current ring membership. The recovered alias is stable per person, unlinkable to any account, and is the only per-person key, so it is what rate limiting and audit key on. |
 | T20 | Buyer landed on an attacker page immediately after payment | `redirectUrl` is the one caller-supplied value a browser follows, at the worst moment. The schema refuses any scheme that is not `http:`/`https:`, because `z.url()` constrains shape and not scheme. The https floor is `config.ts` refusing a plaintext entry in `cors.allowed_origins` outside development. `Onramp` then requires the parsed origin to be in that list and forwards the parse's own `href`, so a prefix host, userinfo, a subdomain, a registrable parent, and forms the WHATWG and RFC-3986 parsers read differently are each refused or neutralised. |
@@ -183,6 +183,12 @@ person, never the application.**
 SQL Auth Proxy as its own Deployment rather than as a sidecar. If yours is one of them, the hop
 from this pod to the proxy is pod-to-pod over the cluster network rather than loopback, and
 `store.plaintext_link: "in-cluster-proxy"` is the operator asserting that hop is acceptable.
+
+**R21: a session token is a bearer credential for its alias until it expires.** `token_ttl_s`
+defaults to 24 hours so one handshake covers a purchase or a sale, including a client's background
+follow-up after the page closes. Whoever copies a token reads that person's funding rows and spends
+from their rate-limit bucket for the rest of its life, and a person dropped from the ring keeps
+access for as long. A shorter TTL narrows both at the cost of more proofs.
 
 ## 6. Out of scope
 

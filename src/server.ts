@@ -378,10 +378,10 @@ export async function buildServer(
    * The personhood handshake. Public (no subject yet) and cheap; the rate limit already bounds
    * them per address.
    *
-   * `challenge` mints a fresh blind token; `redeem` turns a ring-VRF proof plus that challenge
-   * into a short-lived JWT, proving the caller is currently in the People ring this deployment
-   * serves. In `insecure_dev` these routes do not exist: there is no personhood to speak of, and
-   * a 404 reads as "personhood not configured" rather than "verified and refused".
+   * `challenge` mints a fresh blind token; `redeem` turns a ring-VRF proof plus that challenge into
+   * a JWT valid for `token_ttl_s`, proving the caller is currently in the People ring this
+   * deployment serves. In `insecure_dev` these routes do not exist: there is no personhood to speak
+   * of, and a 404 reads as "personhood not configured" rather than "verified and refused".
    */
   if (personhood) {
     app.post('/api/v1/auth/challenge', async (_request, reply) =>

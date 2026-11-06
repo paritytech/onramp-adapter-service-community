@@ -184,8 +184,9 @@ under their own Meld commercial agreement, and at their own discretion.
 Two properties of the current state are worth knowing before any deployment.
 
 `auth.mode: "personhood"` is the production gate. A caller proves ring-VRF membership of the People
-chain and receives a short-lived JWT before any spend. The proof context is `utf8(productId)`
-(`src/personhood.ts`), so nothing in the path derives an RFC 0025 `ProductProofContext`.
+chain and receives a JWT, valid for `token_ttl_s`, before any spend. The proof is bound to the product context
+`[productId, 0]` exactly as a native Host derives it for `host_account_create_proof`
+(`src/personhood/context.ts`).
 
 `auth.mode: "insecure_dev"` performs **no caller verification** and takes the calling product's
 identity from a request header. Configuration validation refuses it anywhere but `development`,

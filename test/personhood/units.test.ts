@@ -14,9 +14,11 @@ import {
   CHALLENGE_BYTES,
   NONCE_BYTES,
 } from '../../src/personhood/challenge.js';
+import { productProofContext } from '../../src/personhood/context.js';
 import { membersRootKey } from '../../src/personhood/key.js';
 import { ProofRejected, ProofRefusal, verifyRingMembership } from '../../src/personhood/register.js';
 import { commitmentsFrom } from '../../src/personhood/source.js';
+import { validateWithCommitment } from '../../src/personhood/verifiablejs.js';
 import { chainReader, type ChainReader } from '../../src/personhood/chain.js';
 import { redeemRequest } from '../../src/contract.js';
 import { mintToken, verifyToken } from '../../src/personhood/token.js';
@@ -127,6 +129,17 @@ describe('challenge', () => {
   });
 });
 
+describe('productProofContext', () => {
+  it('matches the vectors the native Hosts pin', () => {
+    expect(u8aToHex(productProofContext('voting.dot', 0))).toBe(
+      '0xfc8e5a62a2abf020f4f5bc5d00c06c18404674804c8dacd5198357c5c761440d',
+    );
+    expect(u8aToHex(productProofContext('voting.dot', 5))).toBe(
+      '0x28fbecf75aae5c703268e5d6de12a6df21f42e3ca29467c7c68d8e67e2657baa',
+    );
+  });
+});
+
 describe('membersRootKey', () => {
   it('hashes pallet and storage names, appends the identifier verbatim, and blake2s the ring', () => {
     const identifier = '0x' + '44'.repeat(32);
@@ -151,15 +164,16 @@ describe('membersRootKey', () => {
 });
 
 describe('commitmentsFrom', () => {
-  it('reads the Root key and returns the first 768 bytes as the commitment', async () => {
-    const commitment = '11'.repeat(768);
-    const value = '0x' + commitment + 'aa' + 'bb'; // trailing bytes beyond the commitment
+  const commitment = '11'.repeat(288);
+  const ringRoot = '0x' + commitment + '07000000' + '22'.repeat(848);
+
+  it('reads the Root key and returns the RingRoot commitment', async () => {
     const reader: ChainReader = {
       getStorage: async (key) => {
         expect(key).toBe(
           membersRootKey('0x' + '44'.repeat(32), 9),
         );
-        return value;
+        return ringRoot;
       },
       };
 
@@ -172,7 +186,6 @@ describe('commitmentsFrom', () => {
     // `chainReader` opens a fresh WebSocket per call and holds it for up to eight seconds, and
     // `/redeem` is public. Concurrent proofs against the same ring (the ordinary case, since a
     // deployment targets one collection) must cost one socket between them, not one each.
-    const commitment = '11'.repeat(768);
     let opened = 0;
     let release: (v: string) => void = () => undefined;
     const reader: ChainReader = {
@@ -187,7 +200,7 @@ describe('commitmentsFrom', () => {
     const source = commitmentsFrom(reader);
     const id = '0x' + '44'.repeat(32);
     const all = Promise.all([source.commitment(id, 9), source.commitment(id, 9), source.commitment(id, 9)]);
-    release('0x' + commitment);
+    release(ringRoot);
 
     expect(await all).toEqual(['0x' + commitment, '0x' + commitment, '0x' + commitment]);
     expect(opened).toBe(1);
@@ -197,7 +210,7 @@ describe('commitmentsFrom', () => {
     // not a cache: a stale commitment would keep verifying proofs from a ring someone has been
     // removed from.
     const later = source.commitment(id, 9);
-    release('0x' + commitment);
+    release(ringRoot);
     await expect(later).resolves.toBe('0x' + commitment);
     expect(opened).toBe(2);
   });
@@ -256,29 +269,19 @@ describe('commitmentsFrom', () => {
     expect(await commitmentsFrom(reader).commitment('0x' + '44'.repeat(32), 9)).toBeNull();
   });
 
-  it('refuses a Root shorter than the commitment rather than truncating it', async () => {
-    // `subarray` shortens without complaining, so a `Root` the chain returned in some other shape
-    // was handed to `validate_with_commitment` as though it were whole: the one input that
-    // decides who is a person, silently truncated. This is a chain or configuration fault, not a
-    // caller mistake, so it surfaces as one rather than as a 401.
-    const reader: ChainReader = { getStorage: async () => '0x' + '11'.repeat(767) };
+  it('refuses a Root in any other layout rather than slicing it', async () => {
+    // The 768-byte commitment of `verifiable` before 1.6, which a sliced read would have accepted.
+    const reader: ChainReader = { getStorage: async () => '0x' + '11'.repeat(768) };
 
     await expect(commitmentsFrom(reader).commitment('0x' + '44'.repeat(32), 9)).rejects.toThrow(
-      /is 767 bytes; the commitment needs 768/,
+      /is 768 bytes; a RingRoot is 1140/,
     );
-  });
-
-  it('accepts a Root of exactly the commitment length', async () => {
-    const commitment = '11'.repeat(768);
-    const reader: ChainReader = { getStorage: async () => '0x' + commitment };
-
-    expect(await commitmentsFrom(reader).commitment('0x' + '44'.repeat(32), 9)).toBe('0x' + commitment);
   });
 });
 
 describe('verifyRingMembership', () => {
   const claim = { identifier: '0x' + '44'.repeat(32), ring: 0 };
-  const commitment = '0x' + '11'.repeat(768);
+  const commitment = '0x' + '11'.repeat(288);
   const proof = hexToU8a('0x0102');
   const context = new TextEncoder().encode('app.dot');
   const message = new Uint8Array(56);
@@ -704,10 +707,9 @@ describe('token', () => {
  * Every other test drives a hand-written stub (`validate`) that merely asserts "this is the shape
  * verifiablejs requires", a self-fulfilling agreement that never asked the library. This probe
  * anchors the gate to the actual artifact: it pins that the binding exists, takes five arguments
- * (the arity `verifyRingMembership` relies on), and rejects a malformed proof with no error
- * swallowed silently. It cannot produce a real member proof (out of scope: proofs come from the
- * product SDK), but it catches a boot-breaking rename or arity drift and confirms the gate is not
- * a stub-to-stub agreement.
+ * (the arity `verifyRingMembership` relies on), rejects a malformed proof with no error
+ * swallowed silently, and opens a real member proof against a `Members.Root` value, which pins the
+ * commitment layout to the installed version.
  */
 describe('verifiablejs binding (compatibility probe)', () => {
   it('exposes validate_with_commitment with the arity the gate assumes', async () => {
@@ -728,7 +730,7 @@ describe('verifiablejs binding (compatibility probe)', () => {
       outcome = v.validate_with_commitment(
         9,
         new Uint8Array(2),
-        new Uint8Array(768),
+        new Uint8Array(288),
         new TextEncoder().encode('app.dot'),
         new Uint8Array(56),
       );
@@ -737,5 +739,28 @@ describe('verifiablejs binding (compatibility probe)', () => {
     }
     // Either it rejected (threw), or it returned nothing usable as an alias.
     if (!threw) expect(outcome).toBeUndefined();
+  });
+
+  it('opens a member proof against the commitment read from Members.Root', async () => {
+    const v = await import('verifiablejs/nodejs').then((m) => m.default);
+    const entropy = new Uint8Array(32).fill(1);
+    const members = v.encode_members([2, 3, 1].map((n) => v.member_from_entropy(new Uint8Array(32).fill(n))));
+    const ringRoot = u8aConcat(v.members_root(9, members), new Uint8Array(4), v.members_intermediate(9, members));
+    const reader: ChainReader = { getStorage: () => Promise.resolve(u8aToHex(ringRoot)) };
+    const context = productProofContext('app.dot', 0);
+    const message = new Uint8Array(56);
+    const { proof, alias } = v.one_shot(9, entropy, members, context, message);
+
+    const person = await verifyRingMembership(
+      validateWithCommitment,
+      commitmentsFrom(reader),
+      9,
+      { identifier: '0x' + '44'.repeat(32), ring: 0 },
+      proof,
+      context,
+      message,
+    );
+
+    expect(person.alias).toBe(u8aToHex(alias));
   });
 });

@@ -31,7 +31,7 @@ a service that runs in production with a development posture. See
 | `auth.personhood.people_rpc_url` | The People-chain RPC the register gate reads the ring commitment from. **Must be `wss` outside `development`**: this is the root of trust for personhood, and over plaintext an on-path attacker can serve a ring commitment they generated themselves. |
 | `auth.personhood.collections` | The People collections a proof may open against, tried in order. Each is `{ identifier, ring_exponent }`. A **list** because personhood is not one population: full persons (`pop:polkadot.network/people`) and lite persons (`pop:polkadot.network/people-lite`) live in different collections, and pinning one silently refuses everyone in the other. The exponent rides with the collection because it is the ring domain, a property of the collection rather than of the deployment. The real ids are ASCII names **space-padded to 32 bytes**; do not trim the trailing `0x20`. |
 | `auth.personhood.challenge_ttl_ms` | How long a challenge stays acceptable; the freshness that stops replay. 1000 to 300000. |
-| `auth.personhood.token_ttl_s` | How long a redeemed session JWT is valid; the browser keeps it this long. 30 to 3600. |
+| `auth.personhood.token_ttl_s` | How long a redeemed session JWT is valid; the client keeps it this long. 30 to 86400. |
 | `limits[]` | Per `(asset, currency)`: `asset` (a deliverable asset named in `assets`, e.g. `dot@assethub`), `min`, `max`, `currency`. The Meld code the row applies to is the one `assets` names. **Optional, and no longer what decides whether a pair is buyable**: live discovery is. A row *tightens* Meld's live bound for the pair it names, so this is where a business ceiling stricter than Meld's goes; a pair with no row stays buyable at Meld's own bounds, and a row that does not overlap the live bound is refused rather than reconciled. It is also the fallback allow-list if the catalog is unreachable, where it does behave like the old hard gate; left empty, that window fails closed. A destination may appear more than once (a card buyer pays USD, a SEPA buyer EUR), but a repeated pair is refused rather than silently resolved. |
 | `allowed_products[]` | Product ids permitted to spend the key. Empty means closed, not open. |
 | `cors.allowed_origins[]` | Browser origins permitted to call, **and** the allowlist a caller's `redirectUrl` must match. Never a wildcard. Empty disables browser access and refuses every redirect. Accepts `polkadot://...` and the literal `null` for the app running inside the Polkadot host; see the warning below before putting `null` in a production list. |
@@ -147,8 +147,8 @@ in exactly the same way as the Meld key and never reaches a client, but the bear
 are an *inbound* credential (the opposite of the Meld key's outbound shape), so rotation *should*
 keep the previous key verifying for one token TTL. **That overlap is designed and not built.**
 Only one key verifies today, so rotating it invalidates every token minted under the previous one
-and every browser mid-purchase must re-run the handshake. The short TTL (`token_ttl_s`) is what
-bounds the damage; see [Before this can serve real traffic](../README.md#before-this-can-serve-real-traffic).
+and every client holding one must re-run the handshake. The TTL (`token_ttl_s`) is what bounds the
+damage; see [Before this can serve real traffic](../README.md#before-this-can-serve-real-traffic).
 Re-vetting a token's `aud` against the *current* `allowed_products` on every check does work, so
 dropping a product from config revokes its tokens within one TTL.
 

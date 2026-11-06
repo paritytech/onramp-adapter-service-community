@@ -57,7 +57,7 @@ describe('parseConfig', () => {
     ['supported.routes_interval_ms', ['supported', 'routes_interval_ms'], 59_999, 86_400_001],
     ['supported.sell_routes_interval_ms', ['supported', 'sell_routes_interval_ms'], 59_999, 7 * 86_400_000 + 1],
     ['auth.personhood.challenge_ttl_ms', ['auth', 'personhood', 'challenge_ttl_ms'], 999, 300_001],
-    ['auth.personhood.token_ttl_s', ['auth', 'personhood', 'token_ttl_s'], 29, 3_601],
+    ['auth.personhood.token_ttl_s', ['auth', 'personhood', 'token_ttl_s'], 29, 86_401],
   ])('bounds %s at both ends', (_label, path, tooLow, tooHigh) => {
     for (const value of [tooLow, tooHigh]) {
       if (value === undefined) continue;

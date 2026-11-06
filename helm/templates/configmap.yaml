@@ -63,7 +63,7 @@ data:
           */}}
           "collections": {{ .Values.auth.personhood.collections | toJson }},
           "challenge_ttl_ms": {{ int (.Values.auth.personhood.challenge_ttl_ms | default 60000) }},
-          "token_ttl_s": {{ int (.Values.auth.personhood.token_ttl_s | default 300) }}
+          "token_ttl_s": {{ int (.Values.auth.personhood.token_ttl_s | default 86400) }}
         }
       },
       "assets": {{ toJson .Values.assets }},

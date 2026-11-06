@@ -3,7 +3,7 @@
 Every route, its request and response shape, and the errors it returns.
 See [README.md](../README.md) for what the service is and how to run it.
 
-Twelve routes are authenticated by the short-lived JWT the handshake mints: `GET /assets`,
+Twelve routes are authenticated by the JWT the handshake mints: `GET /assets`,
 `POST /quote`, `POST /session`, `GET /supported`, `GET /supported/countries`,
 `GET /supported/corridors`, `GET /supported/offramp`, `GET /supported/offramp/corridors`,
 `GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel` and `GET /transaction/:id`. The
@@ -12,7 +12,7 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | Endpoint | Proxies | Purpose |
 | --- | --- | --- |
 | `POST /api/v1/auth/challenge` | none | Mints a fresh 56-byte blind challenge. No auth, rate-limited. |
-| `POST /api/v1/auth/redeem` | none | Exchanges a challenge + ring-VRF proof for a short-lived JWT. Verifies against the People-chain commitment. |
+| `POST /api/v1/auth/redeem` | none | Exchanges a challenge + ring-VRF proof for a JWT valid for `token_ttl_s`. Verifies against the People-chain commitment. |
 | `GET /assets` | none | What Meld currently calls each asset this deployment serves, from the `assets` config: `{assets: [{asset, code, chain, deliverable}]}`. Clients send these codes rather than keeping their own copy. See "`GET /assets`" below. |
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
@@ -565,7 +565,7 @@ so a proof recorded against an earlier challenge cannot be replayed.
 { "challenge": "<base64url, 56 bytes>" }
 ```
 
-`redeem` exchanges that challenge plus a ring-VRF proof for a short-lived HS256 JWT:
+`redeem` exchanges that challenge plus a ring-VRF proof for an HS256 JWT:
 
 ```json
 {
@@ -575,6 +575,9 @@ so a proof recorded against an earlier challenge cannot be replayed.
   "productId": "another-product.example"
 }
 ```
+
+The proof is the one `host_account_create_proof` returns for the product context
+`[productId, 0]` with the 56 raw challenge bytes as the message, not their base64url text.
 
 A stale or inauthentic challenge is rejected first. Then the ring's current `Root` commitment is
 read off the People chain (`people_rpc_url`) and the proof verified against it here, never on a
