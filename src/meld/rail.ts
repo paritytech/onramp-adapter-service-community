@@ -115,11 +115,13 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
             cryptoCurrencyCode: input.destinationCode,
             fiatCurrencyCode: input.fiat,
             cryptoAmount: input.cryptoAmount,
+            walletAddress: input.walletAddress,
             countryCode: input.countryCode,
             paymentMethodType: input.paymentMethodType,
             serviceProvider: input.serviceProvider,
             clientReference: input.clientReference,
             redirectUrl: input.redirectUrl,
+            clientIpAddress: input.clientIpAddress,
           }
         : {
             direction: 'buy',
@@ -132,6 +134,7 @@ export class MeldRail implements FundingRail, MeldTransactionReader {
             serviceProvider: input.serviceProvider,
             clientReference: input.clientReference,
             redirectUrl: input.redirectUrl,
+            clientIpAddress: input.clientIpAddress,
           },
     );
     return {

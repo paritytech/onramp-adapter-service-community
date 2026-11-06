@@ -972,6 +972,8 @@ describe('the funding journey over real HTTP', () => {
         fiat: 'GBP',
         destinationCurrencyCode: 'DOT',
         cryptoAmount: '12.3456789012',
+        // The seller's own Asset Hub account: required on this lane, and where a refund goes.
+        walletAddress: WALLET,
         paymentMethodType: 'PAYOUT_TO_BANK',
         serviceProvider: 'TRANSAK',
       }),
@@ -984,6 +986,7 @@ describe('the funding journey over real HTTP', () => {
     };
     expect(created.pinned).toEqual({
       destinationCurrencyCode: 'DOT',
+      walletAddress: WALLET,
       cryptoAmount: '12.3456789012',
       fiat: 'GBP',
       country: 'GB',
@@ -1004,7 +1007,7 @@ describe('the funding journey over real HTTP', () => {
         direction: 'sell',
         crypto_amount: '12.3456789012',
         source_amount: null,
-        wallet_address: null,
+        wallet_address: WALLET,
         status: 'session_opened',
         expires_at: null,
       },

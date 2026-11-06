@@ -147,6 +147,8 @@ export class MeldHttpError extends Error {
     readonly code?: string,
     readonly detail?: string,
     readonly providerDetail?: string,
+    /** Meld's `requestId`, the reference its support asks for. */
+    readonly requestId?: string,
   ) {
     super(`Meld answered HTTP ${String(status)}.`);
     this.name = 'MeldHttpError';
@@ -203,6 +205,9 @@ const quoteEnvelope = z.object({ quotes: z.array(z.unknown()).nullish() }).loose
 
 type MeldQuote = z.infer<typeof quoteSchema>;
 
+const providerFilter = ({ serviceProviders }: { serviceProviders?: readonly string[] }) =>
+  serviceProviders === undefined ? {} : { serviceProviders };
+
 /** What Meld's quote endpoint is asked for, on a buy. */
 export interface QuoteParams {
   countryCode: string;
@@ -212,6 +217,8 @@ export interface QuoteParams {
    *  the crypto out. Verified against api-sb.meld.io, which rejects a null `sourceAmount`. */
   sourceAmount: string;
   paymentMethodType: string;
+  /** Restricts the offers to these providers. */
+  serviceProviders?: readonly string[];
 }
 
 /**
@@ -243,6 +250,8 @@ export interface SellQuoteParams {
    */
   cryptoAmount: string;
   paymentMethodType: string;
+  /** Restricts the offers to these providers. */
+  serviceProviders?: readonly string[];
 }
 
 // --- session ----------------------------------------------------------------
@@ -297,6 +306,13 @@ interface WidgetSessionCommon {
    * unchecked value here is an open redirect handed to someone who has just paid.
    */
   redirectUrl?: string | undefined;
+  /**
+   * Sent as `sessionData.clientIpAddress`: the end user's public address. Meld's guidance is to
+   * always send it, and some providers refuse a session without it (Transak answers
+   * `CLIENT_IP_ADDRESS_REQUIRED`, buy and sell alike). Absent when the caller's address is not a
+   * public one.
+   */
+  clientIpAddress?: string | undefined;
 }
 
 /** Opening a buy: the buyer pays fiat and the crypto is delivered to an address they named. */
@@ -336,6 +352,12 @@ export interface SellWidgetSessionParams extends WidgetSessionCommon {
   fiatCurrencyCode: string;
   /** The exact crypto committed. Meld's `sourceAmount` on a sell, and required. */
   cryptoAmount: string;
+  /**
+   * The seller's own address, the one the crypto is sent from: Meld's `sessionData.walletAddress`
+   * on a sell, and where the provider refunds. Banxa refuses a sell without it
+   * (`CRYPTO_INVALID_DESTINATION_WALLET`). Absent leaves the key out of the body.
+   */
+  walletAddress?: string | undefined;
 }
 
 type WidgetSessionParams = BuyWidgetSessionParams | SellWidgetSessionParams;
@@ -458,6 +480,7 @@ export class MeldClient {
       destinationCurrencyCode: params.destinationCurrencyCode,
       sourceAmount: params.sourceAmount,
       paymentMethodType: params.paymentMethodType,
+      ...providerFilter(params),
     });
   }
 
@@ -487,6 +510,7 @@ export class MeldClient {
       destinationCurrencyCode: params.fiatCurrencyCode,
       sourceAmount: params.cryptoAmount,
       paymentMethodType: params.paymentMethodType,
+      ...providerFilter(params),
     });
   }
 
@@ -498,7 +522,7 @@ export class MeldClient {
    * this line. Duplicating the partial-offer handling per direction would give the sell path its
    * own copy of the rule that one bad provider must not discard the others.
    */
-  private async postQuote(request: Record<string, string>): Promise<MeldQuote[]> {
+  private async postQuote(request: Record<string, string | readonly string[]>): Promise<MeldQuote[]> {
     const body = await this.send('POST', QUOTE, request);
 
     const offers = this.read(quoteEnvelope, body, 'quote').quotes ?? [];
@@ -541,22 +565,21 @@ export class MeldClient {
     // destination is the fiat, which the server enforces rather than merely accepts (sending
     // fiat as source on a SELL answers "Source currency is not a valid crypto currency").
     //
-    // `walletAddress` is in this object rather than below it because it exists on exactly one
-    // side. Spreading it means a sell's body does not carry the key at all, as opposed to
-    // carrying it empty — and an empty one would be accepted, since this endpoint takes unknown
-    // and meaningless fields with a `200`.
+    // `walletAddress` is in this object rather than below it because it means different things on
+    // the two sides: a buy's is the delivery address, a sell's the seller's own (sent from, and
+    // refunded to). A sell without one leaves the key out of the body rather than sending it
+    // empty, since this endpoint takes unknown and meaningless fields with a `200`.
     const legs =
       params.direction === 'sell'
         ? {
             sourceCurrencyCode: params.cryptoCurrencyCode,
             destinationCurrencyCode: params.fiatCurrencyCode,
             sourceAmount: params.cryptoAmount,
-            // Plain `undefined`, as `serviceProvider` and `redirectUrl` below are: this object
-            // is only ever JSON-serialised and `JSON.stringify` drops an undefined value, so the
-            // key is genuinely absent from the sell body. Written this way rather than as a
-            // conditional spread so both branches emit the same field in the same position, and
-            // the bytes a buy POSTs do not depend on which branch produced them.
-            walletAddress: undefined,
+            // Plain assignment, as `serviceProvider` and `redirectUrl` below are: this object is
+            // only ever JSON-serialised and `JSON.stringify` drops an undefined value, so a sell
+            // without one carries no key at all. Written this way rather than as a conditional
+            // spread so both branches emit the same field in the same position.
+            walletAddress: params.walletAddress,
           }
         : {
             sourceCurrencyCode: params.sourceCurrency,
@@ -639,6 +662,8 @@ export class MeldClient {
         // and JSON.stringify drops an undefined value, so a conditional spread would render the
         // identical bytes.
         redirectUrl: params.redirectUrl,
+        // Same plain assignment: absent from the bytes when the caller's address is not public.
+        clientIpAddress: params.clientIpAddress,
         // A sell only: Meld's preferred off-ramp flow. The provider runs KYC and takes the payout
         // details, then sends the seller back to `redirectUrl` instead of showing its own deposit
         // address, because here the funds are sent for the seller once the address is read off
@@ -820,16 +845,19 @@ export class MeldClient {
       let code: string | undefined;
       let detail: string | undefined;
       let providerDetail: string | undefined;
+      let requestId: string | undefined;
       try {
         const body = (await response.json()) as {
           error?: unknown;
           code?: unknown;
           message?: unknown;
           serviceProviderDetails?: unknown;
+          requestId?: unknown;
         };
         if (typeof body.error === 'string') code = body.error;
         else if (typeof body.code === 'string') code = body.code;
         if (typeof body.message === 'string') detail = body.message;
+        if (typeof body.requestId === 'string') requestId = body.requestId;
         const provider: unknown = body.serviceProviderDetails;
         if (typeof provider === 'object' && provider !== null) {
           const nested = (provider as { message?: unknown }).message;
@@ -838,7 +866,7 @@ export class MeldClient {
       } catch {
         // no JSON body; the status carries the signal on its own
       }
-      throw new MeldHttpError(response.status, code, detail, providerDetail);
+      throw new MeldHttpError(response.status, code, detail, providerDetail, requestId);
     }
 
     try {

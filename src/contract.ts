@@ -359,9 +359,10 @@ const direction = z.enum(DIRECTIONS).optional();
  * So the wrong combination is refused rather than ignored, in both directions:
  *
  * - buy: `sourceAmount` required, `cryptoAmount` refused. On `/session`, `walletAddress` required.
- * - sell: `cryptoAmount` required, `sourceAmount` refused, and `walletAddress` refused because
- *   the provider issues the deposit address later; a caller-supplied one is read by nobody and
- *   accepting it would let a seller believe they had pinned a destination.
+ * - sell: `cryptoAmount` required, `sourceAmount` refused. `walletAddress` is the seller's own
+ *   address, the one the crypto is sent from and the provider refunds to, never a destination:
+ *   the provider issues the deposit address later. Whether it is required depends on the lane's
+ *   chain, which this schema cannot see, so `Onramp` decides (see `normalizeSellerAddress`).
  *
  * `requireSessionFields` is what the two schemas disagree about: `/quote` prices a corridor and
  * has no address in either direction.
@@ -383,9 +384,6 @@ function directionalFields(
     if (value.cryptoAmount === undefined) absent('cryptoAmount', 'A sell requires cryptoAmount.');
     if (value.sourceAmount !== undefined) {
       absent('sourceAmount', 'A sell commits crypto, not fiat: send cryptoAmount instead.');
-    }
-    if (value.walletAddress !== undefined) {
-      absent('walletAddress', 'A sell has no caller-supplied wallet address; the provider issues one.');
     }
     return;
   }

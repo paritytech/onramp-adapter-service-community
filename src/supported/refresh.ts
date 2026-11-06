@@ -2,8 +2,9 @@
 
 import { setTimeout as sleep } from 'node:timers/promises';
 
+import { isAbort, message, serial, stopWithin, type Serial } from '../background.js';
 import type { Discovery } from '../meld/discovery.js';
-import { toCorridorDto } from '../meld/discovery.js';
+import { providersOf, toCorridorDto } from '../meld/discovery.js';
 import type { FundingStore } from '../funding/store.js';
 import type { Direction } from '../rail.js';
 
@@ -47,10 +48,6 @@ export interface RefreshIntervals {
 /** A job that wrote nothing is retried this soon, then twice as long each time, until the wait
  *  reaches the job's own interval and the regular pass is the retry. */
 const DEFAULT_RETRY_BASE_MS = 60_000;
-
-const message = (error: unknown): string => (error instanceof Error ? error.message : String(error));
-
-const isAbort = (error: unknown): boolean => error instanceof Error && error.name === 'AbortError';
 
 /**
  * Which countries exist, and what fiat each uses.
@@ -141,7 +138,15 @@ export async function refreshRoutes(
       if (methods.length === 0) continue;
       // Abort may have arrived during the probe; do not write once shutdown has begun.
       if (stopped()) break;
-      await store.upsertCorridor({ destination_currency_code: crypto, direction, country, name, fiat: corridor.fiat, methods });
+      await store.upsertCorridor({
+        destination_currency_code: crypto,
+        direction,
+        country,
+        name,
+        fiat: corridor.fiat,
+        methods,
+        method_providers: providersOf(corridor),
+      });
       written += 1;
     } catch (error) {
       log(`supported refresh skipped ${direction} ${country}/${crypto}: ${message(error)}`);
@@ -164,6 +169,7 @@ export function startSupportedRefresh(
   jobs: readonly RefreshJob[],
   intervals: RefreshIntervals,
   log: (message: string) => void,
+  exclusive: Serial = serial(),
 ): { stop: (graceMs?: number) => Promise<void> } {
   const controller = new AbortController();
   const { signal } = controller;
@@ -255,17 +261,6 @@ export function startSupportedRefresh(
     }
   };
 
-  // One pass runs at a time across both loops, so a catalog and a routes pass never hit Meld together.
-  let chain: Promise<void> = Promise.resolve();
-  const exclusive = (pass: () => Promise<void>): Promise<void> => {
-    const next = chain.then(pass, pass);
-    chain = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
-  };
-
   const every = (ms: number, pass: () => Promise<void>): Promise<void> =>
     // Re-armed after each pass, not `interval()`: that generator banks every tick that fires while
     // the consumer is awaiting and then yields them back to back with no gap, so a pass outrunning
@@ -296,21 +291,8 @@ export function startSupportedRefresh(
   })();
 
   return {
-    stop: async (graceMs = 5_000) => {
-      // Halt at the next country boundary so no upsert races the pool close; grace bounds a hung call.
-      controller.abort();
-      if (graceMs <= 0) return;
-      const grace = new AbortController();
-      try {
-        await Promise.race([
-          // A retry mid-pass is a pass too: it halts at the same boundary.
-          Promise.all([loop, ...retries]),
-          // `.catch` because aborting the grace timer below rejects it after the race settled.
-          sleep(graceMs, undefined, { signal: grace.signal, ref: false }).catch(() => undefined),
-        ]);
-      } finally {
-        grace.abort();
-      }
-    },
+    // Halt at the next country boundary so no upsert races the pool close; grace bounds a hung call.
+    // A retry mid-pass is a pass too: it halts at the same boundary.
+    stop: (graceMs = 5_000) => stopWithin(controller, () => Promise.all([loop, ...retries]), graceMs),
   };
 }

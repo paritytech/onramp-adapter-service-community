@@ -1168,6 +1168,71 @@ describe('the supported-corridors cache', () => {
       expect((await store.readCorridors('DOT', 'sell'))[0]?.methods).toEqual([payout]);
     });
   });
+
+  it('round-trips each method\'s providers, and leaves them absent on a row written without', async () => {
+    await withStore(async (store) => {
+      const providers = [{ paymentMethodType: 'PIX', providers: [{ provider: 'TRANSAK', min: '10', max: '5000' }] }];
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix], method_providers: providers });
+      await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'US', name: 'United States', fiat: 'USD', methods: [pix] });
+
+      const [brazil, us] = await store.readCorridors('DOT', 'buy');
+      expect(brazil?.method_providers).toEqual(providers);
+      expect(us).not.toHaveProperty('method_providers');
+    });
+  });
+});
+
+describe('provider health', () => {
+  const down = {
+    provider: 'BANXA',
+    direction: 'buy' as const,
+    category: 'card' as const,
+    scope: 'global',
+    state: 'down' as const,
+    failures: 2,
+    last_ok_at: null,
+    last_failed_at: 2_000,
+    last_code: 'INCOMPATIBLE_REQUEST',
+    last_request_id: 'req-1',
+    updated_at: 2_000,
+    expires_at: 5_000,
+  };
+
+  it('writes a row and replaces it on the same provider, direction, category and scope', async () => {
+    await withStore(async (store) => {
+      await store.writeProviderHealth(down);
+      await store.writeProviderHealth({ ...down, direction: 'sell' });
+      await store.writeProviderHealth({ ...down, category: 'bank' });
+      const up = { ...down, state: 'up' as const, failures: 0, last_ok_at: 3_000, updated_at: 3_000 };
+      await store.writeProviderHealth(up);
+
+      expect(await store.readProviderHealth()).toEqual([{ ...down, category: 'bank' }, up, { ...down, direction: 'sell' }]);
+    });
+  });
+
+  it('moves later the expiry of every row not yet expired, and of no other', async () => {
+    await withStore(async (store) => {
+      await store.writeProviderHealth(down);
+      await store.writeProviderHealth({ ...down, provider: 'TRANSAK', expires_at: 3_000 });
+      await store.extendProviderHealth(1_000, 3_000);
+
+      expect((await store.readProviderHealth()).map((r) => [r.provider, r.expires_at])).toEqual([
+        ['BANXA', 6_000],
+        ['TRANSAK', 3_000],
+      ]);
+    });
+  });
+
+  it.each([
+    ['a state outside the vocabulary', { state: 'maybe' }],
+    ['a category outside the vocabulary', { category: 'cash' }],
+    ['a scope that is neither global nor a country code', { scope: 'usa' }],
+    ['a negative failure count', { failures: -1 }],
+  ])('refuses %s', async (_label, over) => {
+    await withStore(async (store) => {
+      await expect(store.writeProviderHealth({ ...down, ...over } as never)).rejects.toThrow(/provider_health_/);
+    });
+  });
 });
 
 describe('closing the store', () => {

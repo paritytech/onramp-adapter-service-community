@@ -11,7 +11,7 @@
  * neutral rail input, calls through the seam, and persists the neutral result.
  */
 
-import { normalizeAddress } from './address.js';
+import { normalizeAddress, normalizeSellerAddress } from './address.js';
 import { railRefusal } from './meld/refusal.js';
 import type { AuditEvent, AuditLog } from './audit.js';
 import type { Subject } from './auth.js';
@@ -34,6 +34,7 @@ import type {
   FundingRail,
   MeldTransactionReader,
   RailName,
+  RailQuote,
   RailRegistry,
 } from './rail.js';
 import { DEFAULT_DIRECTION, DEFAULT_RAIL } from './rail.js';
@@ -45,21 +46,29 @@ import {
   type OfframpCorridor,
   type OfframpMethod,
 } from './offramp.js';
-import { toMinorUnits } from './money.js';
-import type { Corridor, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
+import { compareDecimal, toMinorUnits } from './money.js';
+import type { Corridor, CorridorDto, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
+import { classifyError } from './health/classify.js';
+import type { HealthKey } from './health/transition.js';
+import { healthView, liveMethods, NO_HEALTH, storedMethods, type HealthView, type WithAvailability } from './health/view.js';
 
 /** Just the store surface onramp touches, injectable in a test. */
 export type FundingPort = Pick<
   FundingStore,
-  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel' | 'readCorridors'
+  'reserve' | 'create' | 'update' | 'byAlias' | 'byReference' | 'list' | 'cancel' | 'readCorridors' | 'readProviderHealth'
 >;
+
+/** One corridor as `GET /supported` serves it. */
+export interface SupportedDto extends Omit<CorridorDto, 'methods'> {
+  methods: WithAvailability<CorridorDto['methods'][number]>[];
+}
 
 /** One corridor as the bulk endpoint serves it: the stored row without the internal keys. */
 export interface SupportedCorridorDto {
   country: string;
   name: string;
   fiat: string;
-  methods: StoredMethod[];
+  methods: WithAvailability<StoredMethod>[];
 }
 
 /**
@@ -76,6 +85,12 @@ const STALE_PASSES = 3;
  * offered forever.
  */
 const FALLBACK_GRACE_MS = 24 * 3_600_000;
+
+/** The provider that made a rail's quote, when the quote names one. */
+const offeredBy = (quote: unknown): string | undefined =>
+  typeof quote === 'object' && quote !== null && 'serviceProvider' in quote && typeof quote.serviceProvider === 'string'
+    ? quote.serviceProvider
+    : undefined;
 
 /** An injectable clock so tests can pin "now" without mocking time. */
 export type Clock = () => number;
@@ -182,13 +197,16 @@ export class Onramp {
     // meaning unchanged. Absent, the limit gate falls back to `config.limits`, which is also the
     // degraded path when discovery is present but Meld's public catalog is briefly unreachable.
     private readonly discovery?: Discovery,
+    /** Receives the providers a live quote found missing in a country, for the probes to check. */
+    private readonly suspect?: (keys: readonly HealthKey[]) => void,
   ) {}
 
   /** The methods + fiat min/max a corridor offers, for the buyer's (or seller's) amount screen.
    *  Refuses an unknown crypto as `WrongAssetOrChain` before any probe. `direction` is absent
    *  means `buy`, exactly as `/quote` and `/session`; see `this.direction`. */
-  async supported(country: string, code: string, direction?: Direction): Promise<Corridor> {
-    resolveForDirection(code, this.direction(direction));
+  async supported(country: string, code: string, direction?: Direction): Promise<SupportedDto> {
+    const dir = this.direction(direction);
+    resolveForDirection(code, dir);
     if (this.discovery === undefined) {
       throw reject(
         { tag: 'Other', value: { code: 'DISCOVERY_UNAVAILABLE', message: 'Capability discovery is not configured.' } },
@@ -197,7 +215,8 @@ export class Onramp {
       );
     }
     // Fiat is resolved from the country's default corridor, so the caller picks only a country.
-    return this.discovery.corridorForCountry(country, code, this.direction(direction));
+    const corridor = await this.discovery.corridorForCountry(country, code, dir);
+    return { country: corridor.country, fiat: corridor.fiat, crypto: corridor.crypto, methods: liveMethods(await this.health(), corridor, dir) };
   }
 
   // Cached supported corridors for a (crypto, direction), read from the DB off Meld; only rows
@@ -219,7 +238,8 @@ export class Onramp {
       const newest = Math.max(...all.map((r) => r.updated_at));
       rows = all.filter((r) => r.updated_at >= newest - window);
     }
-    return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: r.methods }));
+    const view = await this.health();
+    return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: storedMethods(view, r) }));
   }
 
   /** The countries this deployment can deliver a crypto to (or take it from, on a sell), for the
@@ -242,10 +262,11 @@ export class Onramp {
    */
   async offrampCorridors(): Promise<OfframpCorridor[]> {
     const freshAfter = this.clock() - this.cfg.supported.sell_routes_interval_ms * STALE_PASSES;
+    const view = await this.health();
     const rows: LaneCorridor[] = [];
     for (const lane of this.cfg.supported.offramp_lanes) {
       for (const r of await this.funding.readCorridors(lane.code, 'sell', freshAfter)) {
-        rows.push({ lane, country: r.country, name: r.name, fiat: r.fiat, methods: r.methods });
+        rows.push({ lane, country: r.country, name: r.name, fiat: r.fiat, methods: storedMethods(view, r) });
       }
     }
     return mergeOfframpCorridors(rows);
@@ -261,6 +282,7 @@ export class Onramp {
       );
     }
     const discovery = this.discovery;
+    const view = await this.health();
     // Each lane reads its own route, so one lane's failure (a 429 or a 5xx from Meld) counts as that
     // lane having no methods rather than failing the whole answer while the others replied. When
     // every lane fails there is no answer to give, and an empty-but-OK reply would read as "this
@@ -270,7 +292,7 @@ export class Onramp {
       this.cfg.supported.offramp_lanes.map(async (lane): Promise<LaneCorridor> => {
         try {
           const c = await discovery.corridorForCountry(country, lane.code, 'sell');
-          return { lane, country: c.country, fiat: c.fiat, methods: c.methods };
+          return { lane, country: c.country, fiat: c.fiat, methods: liveMethods(view, c, 'sell') };
         } catch (error) {
           failures.push(error);
           return { lane, country, fiat: '', methods: [] };
@@ -281,6 +303,44 @@ export class Onramp {
     const fiat = views.find((v) => v.methods.length > 0)?.fiat ?? views.find((v) => v.fiat !== '')?.fiat ?? '';
     const methods = mergeMethods(views, fiat);
     return { country, fiat, methods };
+  }
+
+  /**
+   * Reports each provider the corridor lists for this method that the live quote did not offer. A
+   * buy outside that provider's own limits explains its absence, and so does a failed quote that
+   * does not blame a provider. Best effort: a discovery outage reports nothing.
+   */
+  private async reportMissing(priced: RailQuote, answer: { quotes: readonly unknown[] } | { error: unknown }): Promise<void> {
+    if (this.suspect === undefined || this.discovery === undefined) return;
+    let corridor: Corridor;
+    try {
+      corridor = await this.discovery.corridor(priced.countryCode, priced.sourceCurrencyCode, priced.destinationCurrencyCode, priced.direction);
+    } catch {
+      return;
+    }
+    const offered = new Set('quotes' in answer ? answer.quotes.map(offeredBy) : []);
+    const method = corridor.methods.find((m) => m.paymentMethodType === priced.paymentMethodType);
+    if (method === undefined) return;
+    const missing = method.providers.filter(
+      (p) =>
+        !offered.has(p.provider) &&
+        ('quotes' in answer || classifyError(p.provider, answer.error).outcome === 'down') &&
+        (priced.direction === 'sell' ||
+          (compareDecimal(priced.sourceAmount, p.min) >= 0 && compareDecimal(priced.sourceAmount, p.max) <= 0)),
+    );
+    if (missing.length > 0) {
+      this.suspect(missing.map((p) => ({ provider: p.provider, direction: priced.direction, category: method.category, scope: priced.countryCode })));
+    }
+  }
+
+  /** Provider health for one request. A failed read serves every provider, as if no probe had run. */
+  private async health(): Promise<HealthView> {
+    if (!this.cfg.health.enabled) return NO_HEALTH;
+    try {
+      return healthView(await this.funding.readProviderHealth(), this.clock());
+    } catch {
+      return NO_HEALTH;
+    }
   }
 
   /**
@@ -360,7 +420,14 @@ export class Onramp {
       direction === 'sell'
         ? ({ ...legs, direction, cryptoAmount: committedTerm(request.cryptoAmount, 'cryptoAmount', direction) } as const)
         : ({ ...legs, direction, sourceAmount: committedTerm(request.sourceAmount, 'sourceAmount', direction) } as const);
-    const quotes = await rail.quote(priced);
+    let quotes: unknown[];
+    try {
+      quotes = await rail.quote(priced);
+    } catch (error) {
+      if (rail.provider === 'meld') void this.reportMissing(priced, { error });
+      throw error;
+    }
+    if (rail.provider === 'meld') void this.reportMissing(priced, { quotes });
 
     // The echo is built here rather than round-tripped through the rail: every value in it is
     // already in hand, so asking the rail to hand back its own arguments bought nothing.
@@ -420,6 +487,8 @@ export class Onramp {
     subject: Subject,
     request: CreateSessionRequest,
     requestId: string,
+    /** The end user's public address, for the provider; see `publicClientIp`. */
+    clientIpAddress?: string,
   ): Promise<CreateSessionResponse> {
     const rail = this.rail(request.rail);
     const name = rail.provider;
@@ -567,12 +636,18 @@ export class Onramp {
         paymentMethodType: request.paymentMethodType,
         serviceProvider: request.serviceProvider,
         redirectUrl,
+        clientIpAddress,
         // This record's id, not the caller's key (see `RailSessionInput.clientReference`).
         clientReference: fundingId,
       };
       session = await rail.createSession(
         direction === 'sell'
-          ? { ...opening, direction, cryptoAmount: committedTerm(pinned.cryptoAmount, 'cryptoAmount', direction) }
+          ? {
+              ...opening,
+              direction,
+              cryptoAmount: committedTerm(pinned.cryptoAmount, 'cryptoAmount', direction),
+              walletAddress: pinned.walletAddress,
+            }
           : {
               ...opening,
               direction,
@@ -1072,6 +1147,7 @@ export class Onramp {
     country: string,
     method: string,
     onOutage?: 'refuse',
+    chosen?: string,
   ): Promise<{ min: string; max: string }>;
   private async buyLimit(
     code: string,
@@ -1086,6 +1162,7 @@ export class Onramp {
     country: string,
     method: string,
     onOutage: 'refuse' | 'ungate' = 'refuse',
+    chosen?: string,
   ): Promise<{ min: string; max: string } | undefined> {
     // Ground truth is Meld's live route catalog, not a hand-maintained list. The old static
     // `config.limits` refused any currency it did not enumerate, so a Canadian buyer met
@@ -1097,8 +1174,12 @@ export class Onramp {
     // discovery outage fails closed (every code -> RegionUnavailable), the safe direction for a
     // charge gate.
     if (this.discovery !== undefined) {
-      const offered = await this.corridorMethod(this.discovery, code, currency, country, method, 'buy');
-      if (offered !== undefined) {
+      const corridorMethod = await this.corridorMethod(this.discovery, code, currency, country, method, 'buy');
+      if (corridorMethod !== undefined) {
+        // Bounded by the providers that answer and the one the session names. With none answering,
+        // the full bound stays: health narrows what a session may charge, it never refuses one on
+        // its own.
+        const offered = (await this.health()).apply(corridorMethod, corridorMethod.providers, 'buy', country, chosen);
         // A configured (code, currency) row is a business floor that tightens the live bound.
         const floor = this.cfg.limits.find((l) => l.code === code && l.currency === currency);
         if (floor === undefined) return { min: offered.min, max: offered.max };
@@ -1224,11 +1305,11 @@ export class Onramp {
   ): Promise<Committed> {
     const destination = resolveForDirection(request.destinationCurrencyCode, direction);
     const currency = request.fiat.toUpperCase();
-    // Only a buy has an address to pin. On a sell the schema has already refused one, and the
-    // deposit address the seller will use is the provider's, issued after the session exists.
+    // A buy's address is where the crypto is delivered. A sell's is the seller's own, where it is
+    // sent from and refunded to; the deposit address is the provider's, issued after the session.
     const walletAddress =
       direction === 'sell'
-        ? undefined
+        ? normalizeSellerAddress(request.walletAddress, destination.code)
         : normalizeAddress(committedTerm(request.walletAddress, 'walletAddress', direction));
 
     // The fiat corridor gate is Meld's own question; only the fiat rail has one. A non-fiat rail
@@ -1254,7 +1335,7 @@ export class Onramp {
     // `docs/api.md`.
     if (rail.provider === 'meld') {
       if (direction === 'buy') {
-        const limit = await this.buyLimit(destination.code, currency, request.country, request.paymentMethodType);
+        const limit = await this.buyLimit(destination.code, currency, request.country, request.paymentMethodType, 'refuse', request.serviceProvider);
         // The threshold rides on the failure, as it does on the Meld-derived form of the same two
         // tags (`server.ts`'s `meld400`). The type has always carried `value`; only the rail's
         // version filled it, so a config-derived refusal reached the buyer as a bare "that amount is
