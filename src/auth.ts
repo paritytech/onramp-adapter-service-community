@@ -1,10 +1,11 @@
 /**
  * Who is calling.
  *
- * One invariant: a mode that cannot verify a caller must fail at boot, never per request, so
- * the absence of verification can never look like its presence. `personhood` is the production
- * mode. The bearer token is a short-lived JWT minted by the handshake after proving the caller is
- * currently in the People ring. See docs/threat-model.md R1 for why that is the shipped gate.
+ * One invariant: a mode that cannot verify a caller must fail at boot, never per request, so the
+ * absence of verification can never look like its presence. `personhood` is the production mode.
+ * The bearer token is a JWT, valid for `token_ttl_s`, minted by the handshake after proving the
+ * caller is currently in the People ring. See docs/threat-model.md R1 for why that is the shipped
+ * gate.
  */
 
 import type { FastifyRequest } from 'fastify';

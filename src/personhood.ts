@@ -1,11 +1,11 @@
 /**
  * The personhood handshake that gates every Meld-spending call.
  *
- * Two routes, one asymmetric protocol. `challenge` is public and rate-limited; nothing of value
- * is minted, just a fresh 56-byte token. `redeem` is where a proof becomes a short-lived JWT. It
- * verifies the challenge was authentic and unexpired, proves the caller is currently in the
- * People ring (the on-chain commitment check), then mints a JWT binding that person (`sub`) to
- * this product (`aud`).
+ * Two routes, one asymmetric protocol. `challenge` is public and rate-limited; nothing of value is
+ * minted, just a fresh 56-byte token. `redeem` is where a proof becomes a JWT valid for
+ * `token_ttl_s`. It verifies the challenge was authentic and unexpired, proves the caller is
+ * currently in the People ring (the on-chain commitment check), then mints a JWT binding that
+ * person (`sub`) to this product (`aud`).
  *
  * The protected routes only verify the JWT: cheap, stateless, no chain touch per spend. The
  * `sub` alias is the audit key and the rate-limit key (see src/caller.ts for how
@@ -80,7 +80,7 @@ export class PersonhoodService {
   }
 
   /**
-   * Turn a proof and the challenge it answers into a short-lived bearer JWT.
+   * Turn a proof and the challenge it answers into a bearer JWT valid for `token_ttl_s`.
    *
    * Order is the point: the challenge must be authentic and unexpired before the chain
    * membership check, so a captured proof cannot be replayed to open a new token. The chain check

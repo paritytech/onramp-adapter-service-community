@@ -308,10 +308,11 @@ const configSchema = z
       .object({
         /**
          * `personhood` is the production posture: the caller's ring-VRF proof is verified against
-         * the People-chain ring commitment, and a short-lived JWT carries the proven person to the
-         * protected routes. `insecure_dev` exists so the Meld leg can be exercised without it; it
-         * trusts a header and is refused anywhere but `development` (see the superRefine).
-         * It gives every caller of a product one alias, so it has no data separation at all.
+         * the People-chain ring commitment, and a JWT valid for `token_ttl_s` carries the proven
+         * person to the protected routes. `insecure_dev` exists so the Meld leg can be exercised
+         * without it; it trusts a header and is refused anywhere but `development` (see the
+         * superRefine). It gives every caller of a product one alias, so it has no data separation
+         * at all.
          */
         mode: z.enum(['personhood', 'insecure_dev']),
         /**

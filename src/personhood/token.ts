@@ -1,10 +1,10 @@
 /**
- * The short-lived bearer token that carries a proven person to the protected endpoints.
+ * The bearer token that carries a proven person to the protected endpoints for `token_ttl_s`.
  *
  * A ring proof proves membership but not, by itself, that the same caller is the one hitting
  * `/session` a moment later; the adapter cannot ask the People chain on every spend. So the
- * handshake ends by minting a short-TTL JWT that binds the proven person (`sub` = their
- * contextual alias) to the product (`aud` = the product id). The protected routes verify this
+ * handshake ends by minting a JWT, valid for `token_ttl_s`, that binds the proven person (`sub` =
+ * their contextual alias) to the product (`aud` = the product id). The protected routes verify this
  * JWT: cheap, stateless, no chain read. The recovered `sub` alias is both the audit key and the
  * rate-limit key on the protected routes (see src/caller.ts).
  *
