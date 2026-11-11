@@ -23,7 +23,7 @@ const VERIFIED: VerifiedSaleVaultProxy = {
   retryBlocks: 100,
   minReturn: 1_000_000n,
   maxReturn: 100_000_000n,
-  priceFloorBps: 9_900n,
+  priceFloorBps: 9_950n,
   feeAllowance: 50_000n,
   returnCooldown: 900n,
   releaseDelay: 86_400n,

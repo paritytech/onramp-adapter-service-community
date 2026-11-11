@@ -923,13 +923,13 @@ describe('a return held back', () => {
   });
 
   it('is not swappable when the quote is under the floor plus margin', async () => {
-    // floor = 20e6 * 0.99 - 0.05e6 = 19.75e6, plus 50 bps = 19,848,750
+    // floor = 20e6 * 0.995 - 0.05e6 = 19.85e6, plus 50 bps = 19,949,250
     const mem = memoryStore();
-    const under = keeperFor(world(base), mem, { limits: limitsOf({ quote: 19_848_749n }) }).keeper;
+    const under = keeperFor(world(base), mem, { limits: limitsOf({ quote: 19_949_249n }) }).keeper;
     await under.verify();
     expect((await under.trigger(sale())).blockedReason).toBe('not-swappable');
     expect(mem.calls).toEqual([]);
-    const at = keeperFor(world(base), mem, { limits: limitsOf({ quote: 19_848_750n }) }).keeper;
+    const at = keeperFor(world(base), mem, { limits: limitsOf({ quote: 19_949_250n }) }).keeper;
     await at.verify();
     await at.trigger(sale());
     expect(actionsOf(mem)).toEqual(['return:sent']);
