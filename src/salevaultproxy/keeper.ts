@@ -866,8 +866,8 @@ export class SaleVaultProxyKeeper {
       ? o.state.releaseAt !== 0n
       : o.state.releaseAt === 0n && o.balance >= v.minReturn && BigInt(o.state.attempts) < v.releaseAttempts;
     if (split && o.balance > 0n) return { decision: undefined, blockedReason: 'chain-unavailable', dueAt: now };
-    // Returns end once the factory is retired, or out of attempts once the contract opens release
-    if (o.balance >= v.minReturn && !o.retired && (BigInt(o.state.attempts) < v.releaseAttempts || o.state.releasable === 0n)) {
+    // A returnable balance is judged for a fresh return first, retired aside, so an out-of-attempts refund prefers returnHome when the quote clears and releases only when the return is held
+    if (o.balance >= v.minReturn && !o.retired) {
       // A pause leaves release on its own clock, and an unpause log makes the proxy due again
       if (o.returnsPaused) {
         // A paused factory gives every returnable balance a release time, so none means the reads split

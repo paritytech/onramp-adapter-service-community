@@ -744,16 +744,24 @@ describe('action priority', () => {
     expect(mem.calls).toMatchObject([{ action: 'return', target: PROXY, amount: '20000000', status: 'sent' }]);
   });
 
-  it('releases instead of returning once the factory is retired or the proxy is out of attempts', async () => {
+  it('releases instead of returning once the factory is retired, with no fresh return attempted', async () => {
     const retired = world({ balance: 20_000_000n, releaseAt: 0n, releasable: 20_000_000n });
     retired.state.retired = true;
     const a = memoryStore();
     await keeperFor(retired, a).keeper.pass();
     expect(actionsOf(a)).toEqual(['release:sent']);
+  });
 
-    const spent = memoryStore();
-    await keeperFor(world({ balance: 20_000_000n, attempts: 7n, releaseAt: 0n, releasable: 20_000_000n }), spent).keeper.pass();
-    expect(actionsOf(spent)).toEqual(['release:sent']);
+  it('prefers a fresh return over an out-of-attempts release when the quote clears, and releases only when the return is held', async () => {
+    const open = { balance: 20_000_000n, attempts: 7n, releaseAt: 0n, releasable: 20_000_000n };
+    const home = memoryStore();
+    await keeperFor(world(open), home).keeper.pass();
+    expect(actionsOf(home)).toEqual(['return:sent']);
+
+    const held = memoryStore();
+    const limits = limitsOf({ check: async () => Promise.reject(new ReturnNotSwappableError('above maximum')) });
+    await keeperFor(world(open), held, { limits }).keeper.pass();
+    expect(actionsOf(held)).toEqual(['release:sent']);
   });
 
   it('reads again next pass when state() and retired() come from nodes on either side of the retire', async () => {
@@ -1739,13 +1747,13 @@ describe('settling', () => {
     await keeper.trigger({ chain_id: 421614, proxy: PROXY });
     w0.state.proxy.releasable = 5_000_000n;
     await keeper.trigger({ chain_id: 421614, proxy: PROXY });
-    expect(actionsOf(mem)).toEqual(['release:sent']);
+    expect(actionsOf(mem)).toEqual(['return:sent']);
     for (const c of mem.calls) if (c.tx_hash !== null) w0.state.receipts.set(c.tx_hash, { status: '0x1' });
     // Another proxy's call is left to the pass
     await sentCall(mem, '0xother', 8, FACTORY);
     w0.state.receipts.set('0xother', { status: '0x1' });
     await keeper.trigger({ chain_id: 421614, proxy: PROXY });
-    expect(actionsOf(mem)).toEqual(['release:mined', 'return:sent', 'release:sent']);
+    expect(actionsOf(mem)).toEqual(['return:mined', 'return:sent', 'return:sent']);
     expect(w0.state.sent).toHaveLength(2);
   });
 
