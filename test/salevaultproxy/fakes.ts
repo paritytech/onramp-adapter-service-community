@@ -74,7 +74,7 @@ export function deployedGetters(overrides: Record<string, string> = {}): Record<
     [`${IMPL}:RETRY_BLOCKS()`]: w(100n),
     [`${IMPL}:MIN_RETURN()`]: w(1_000_000n),
     [`${IMPL}:MAX_RETURN()`]: w(100_000_000n),
-    [`${IMPL}:PRICE_FLOOR_BPS()`]: w(9_900n),
+    [`${IMPL}:PRICE_FLOOR_BPS()`]: w(9_950n),
     [`${IMPL}:FEE_ALLOWANCE()`]: w(50_000n),
     [`${IMPL}:RETURN_COOLDOWN()`]: w(900n),
     // The Perseverance release constants the contract vectors pin

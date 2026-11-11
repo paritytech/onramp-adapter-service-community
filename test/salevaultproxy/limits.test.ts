@@ -221,8 +221,8 @@ const minPriceX128 = (amount: bigint, terms: PriceTerms): bigint => (proxyMinOut
 
 describe('the proxy floor mirror', () => {
   it('matches the Solidity vectors', () => {
-    expect(minPriceX128(10_000_000n, { priceFloorBps: 9_900n, feeAllowance: 0n })).toBe(336879543251729078828740861357450529341n);
-    expect(minPriceX128(20_000_000n, { priceFloorBps: 9_900n, feeAllowance: 600_000n })).toBe(326671072244100924924839623134497482997n);
-    expect(proxyMinOut(20_000_000n, { priceFloorBps: 9_900n, feeAllowance: 600_000n })).toBe(19_200_000n);
+    expect(minPriceX128(10_000_000n, { priceFloorBps: 9_950n, feeAllowance: 0n })).toBe(338580955086333771146057734394609370398n);
+    expect(minPriceX128(20_000_000n, { priceFloorBps: 9_950n, feeAllowance: 600_000n })).toBe(328372484078705617242156496171656324055n);
+    expect(proxyMinOut(20_000_000n, { priceFloorBps: 9_950n, feeAllowance: 600_000n })).toBe(19_300_000n);
   });
 });
