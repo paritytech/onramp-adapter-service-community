@@ -995,6 +995,31 @@ describe('parseConfig', () => {
     });
   });
 
+  describe('provider_exclusions', () => {
+    const exclusions = (rules: unknown[]) => () => parseConfig(rawConfig({ provider_exclusions: rules }));
+
+    it('defaults to none and resolves a rule\'s assets to their Meld codes', () => {
+      expect(parseConfig(rawConfig()).provider_exclusions).toEqual([]);
+      expect(
+        exclusions([{ provider: 'BANXA', assets: ['usdt@assethub'], directions: ['buy'], reason: 'Not delivered' }])().provider_exclusions,
+      ).toEqual([{ provider: 'BANXA', codes: ['USDT_DOT'], directions: ['buy'], reason: 'Not delivered' }]);
+    });
+
+    it('refuses a lowercase provider, an empty list, a malformed country and a blank reason', () => {
+      expect(exclusions([{ provider: 'banxa', reason: 'x' }])).toThrow(/provider_exclusions\.0\.provider/);
+      expect(exclusions([{ provider: 'BANXA', payment_methods: [], reason: 'x' }])).toThrow(/provider_exclusions\.0\.payment_methods/);
+      expect(exclusions([{ provider: 'BANXA', countries: ['de'], reason: 'x' }])).toThrow(/provider_exclusions\.0\.countries\.0/);
+      expect(exclusions([{ provider: 'BANXA', reason: '  ' }])).toThrow(/provider_exclusions\.0\.reason/);
+    });
+
+    it('refuses an asset `assets` does not name', () => {
+      const cfg = rawConfig({ provider_exclusions: [{ provider: 'BANXA', assets: ['usdc@solana'], reason: 'x' }] });
+      const assets = { ...(cfg['assets'] as Record<string, string>) };
+      delete assets['usdc@solana'];
+      expect(() => parseConfig({ ...cfg, assets })).toThrow(/provider_exclusions\.0\.assets\.0: "usdc@solana" has no Meld code/);
+    });
+  });
+
   it('gives each Meld endpoint its own cache lifetime, on the scale its data moves', () => {
     const cfg = parseConfig(rawConfig());
     expect(cfg.meld.countries_cache_ttl_ms).toBe(6 * 3_600_000);

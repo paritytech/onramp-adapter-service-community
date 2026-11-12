@@ -54,6 +54,7 @@
     "usdc@arbitrum": "USDC_ARBITRUM",
     "usdc@solana": "USDC_SOLANA"
   },
+  "provider_exclusions": [],
   "limits": [
     {
       "asset": "dot@assethub",

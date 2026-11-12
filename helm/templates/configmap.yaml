@@ -68,6 +68,7 @@ data:
       },
       "assets": {{ toJson .Values.assets }},
       "limits": {{ toJson .Values.limits }},
+      "provider_exclusions": {{ toJson .Values.provider_exclusions }},
       "allowed_products": {{ toJson .Values.allowed_products }},
       "cors": {{ toJson (dict "allowed_origins" ((index (.Values.cors | default (dict)) "allowed_origins") | default list)) }},
       "rate_limit": {{ toJson .Values.rate_limit }},

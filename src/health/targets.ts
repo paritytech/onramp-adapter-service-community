@@ -1,3 +1,4 @@
+import { withoutExcluded, type ProviderExclusion } from '../exclusions.js';
 import type { SupportedCorridorRow } from '../funding/store.js';
 import type { MethodCategory, ProviderLimit } from '../meld/discovery.js';
 import { compareDecimal, doubleDecimal, isDecimal } from '../money.js';
@@ -27,6 +28,7 @@ export interface ProbeGroup {
 }
 
 export interface TargetOptions {
+  exclusions: readonly ProviderExclusion[];
   /** The crypto a sell probe commits, by Meld code. A sell corridor without one is not probed. */
   sellAmounts: ReadonlyMap<string, string>;
 }
@@ -71,7 +73,8 @@ function perCountry(rows: readonly SupportedCorridorRow[], options: TargetOption
   return [...groups.values()];
 }
 
-function targetsOf(row: SupportedCorridorRow, options: TargetOptions): ProbeTarget[] {
+function targetsOf(stored: SupportedCorridorRow, options: TargetOptions): ProbeTarget[] {
+  const row = withoutExcluded(stored, options.exclusions);
   const providers = new Map((row.method_providers ?? []).map((entry) => [entry.paymentMethodType, entry.providers]));
   return row.methods.flatMap((method) =>
     (providers.get(method.paymentMethodType) ?? []).flatMap((limit): ProbeTarget[] => {

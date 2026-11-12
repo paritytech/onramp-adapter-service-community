@@ -16,6 +16,7 @@ const OPTIONS: ProbeOptions = {
   throttlePauseMs: 900_000,
   maxProbesPerHour: 100,
   sellAmounts: new Map(),
+  exclusions: [],
 };
 
 /** The least gap between two quotes at `OPTIONS.maxProbesPerHour`. */

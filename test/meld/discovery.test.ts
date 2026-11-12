@@ -141,6 +141,15 @@ describe('MeldDiscovery.corridor', () => {
     expect(methods.some((m) => m.paymentMethodType === 'MYSTERY')).toBe(false);
   });
 
+  it('leaves out an excluded provider, so the bound and the methods are the remaining providers\' own', async () => {
+    const d = new MeldDiscovery(stubGet(), ttls(3_600_000), undefined, undefined, [{ provider: 'GUARDARIAN', reason: 'r' }]);
+    const { methods } = await d.corridor('US', 'USD', 'DOT', 'buy');
+
+    expect(methods.map(({ paymentMethodType, min, max }) => ({ paymentMethodType, min, max }))).toEqual([
+      { paymentMethodType: 'CREDIT_DEBIT_CARD', min: '2', max: '3000' },
+    ]);
+  });
+
   it('reads an empty route array as a corridor that is not served', async () => {
     const d = new MeldDiscovery(stubGet(), ttls(3_600_000));
     expect((await d.corridor('IN', 'INR', 'DOT', 'buy')).methods).toEqual([]);
