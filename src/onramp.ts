@@ -12,7 +12,7 @@
  */
 
 import { normalizeAddress, normalizeSellerAddress } from './address.js';
-import { railRefusal } from './meld/refusal.js';
+import { railRefusal, unpricedQuote } from './meld/refusal.js';
 import type { AuditEvent, AuditLog } from './audit.js';
 import type { Subject } from './auth.js';
 import { originAllowed, type Config } from './config.js';
@@ -425,7 +425,7 @@ export class Onramp {
       quotes = await rail.quote(priced);
     } catch (error) {
       if (rail.provider === 'meld') void this.reportMissing(priced, { error });
-      throw error;
+      throw unpricedQuote(error) ?? error;
     }
     if (rail.provider === 'meld') void this.reportMissing(priced, { quotes });
 

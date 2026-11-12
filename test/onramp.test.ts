@@ -47,6 +47,7 @@ class FakeMeld implements FundingRail, MeldTransactionReader {
   calls: RailSessionInput[] = [];
   quoteCalls: RailQuote[] = [];
   quotes: unknown[] = [];
+  quoteError: Error | undefined;
   transactions: Record<string, MeldTransaction> = {};
 
   constructor(private readonly behaviour: (n: number) => RailSession | Error = () => ok()) {}
@@ -60,6 +61,7 @@ class FakeMeld implements FundingRail, MeldTransactionReader {
 
   async quote(input: RailQuote): Promise<unknown[]> {
     this.quoteCalls.push(input);
+    if (this.quoteError !== undefined) throw this.quoteError;
     return this.quotes;
   }
 
@@ -339,6 +341,43 @@ describe('Onramp.quote', () => {
         })
       ).quotes,
     ).toEqual([]);
+  });
+
+  it.each(['NO_VALID_QUOTES', 'TRANSACTION_FAILED_GETTING_CRYPTO_QUOTE_FROM_PROVIDER'])(
+    'answers a Meld 422 %s with NoQuotesAvailable, so the caller can move on',
+    async (code) => {
+      const meld = new FakeMeld();
+      meld.quoteError = new MeldHttpError(422, code);
+      const { service } = build(meld);
+
+      const failure = await failureOf(() =>
+        service.quote({
+          destinationCurrencyCode: 'USDC_DOT',
+          sourceAmount: '20',
+          fiat: 'USD',
+          country: 'US',
+          paymentMethodType: 'CREDIT_DEBIT_CARD',
+        }),
+      );
+
+      expect(failure).toEqual({ tag: 'NoQuotesAvailable' });
+    },
+  );
+
+  it('leaves any other Meld 422 to the rail mapping', async () => {
+    const meld = new FakeMeld();
+    meld.quoteError = new MeldHttpError(422, 'UNEXPECTED');
+    const { service } = build(meld);
+
+    await expect(
+      service.quote({
+        destinationCurrencyCode: 'USDC_DOT',
+        sourceAmount: '20',
+        fiat: 'USD',
+        country: 'US',
+        paymentMethodType: 'CREDIT_DEBIT_CARD',
+      }),
+    ).rejects.toBe(meld.quoteError);
   });
 
   it('routes to the named rail and refuses an unregistered one', async () => {

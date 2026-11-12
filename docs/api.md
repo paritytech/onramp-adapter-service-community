@@ -765,10 +765,10 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 400 | `Other{ RAIL_REFUSED }` | The Chainflip rail refuses **session creation**: it swaps on-chain assets and has no fiat leg. Not retryable. (Its quote leg answers `422 NoQuotesAvailable`.) |
 | 409 | `Other{ REQUEST_IN_FLIGHT }` | Another request is already opening a session under this idempotency key. Well-formed; retry shortly. |
 | 404 | `Other{ NOT_FOUND }` | No such route, or no such funding request *for this caller*. |
-| 422 | `NoQuotesAvailable` | Meld served the corridor but had no offers, or the rail cannot quote at all. |
+| 422 | `NoQuotesAvailable` | Meld served the corridor but had no offers, no provider priced the quote, or the rail cannot quote at all. |
 | 429 | `Other{ RATE_LIMITED }` | Past the ceiling for this person, or for this address when no person is proven. `retry-after` says when. |
 | 500 | `Other{ INTERNAL }` | An unhandled failure. The detail is in the log against this `request_id`; the body never carries it. |
-| 503 | `ProviderTimeout` | Meld did not answer, or the People chain did not answer a `/redeem`, or answered with a non-400 error status. |
+| 503 | `ProviderTimeout` | Meld did not answer, or the People chain did not answer a `/redeem`, or answered with a non-400 error status other than a quote no provider priced. |
 
 Every `409` refuses because a request already exists, and each carries that request's id as
 `fundingRequestId` inside `Other`'s value. It turns "do not start another" into something the
