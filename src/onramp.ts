@@ -13,7 +13,7 @@
 
 import { normalizeAddress, normalizeSellerAddress } from './address.js';
 import { railRefusal, unpricedQuote } from './meld/refusal.js';
-import { withoutExcluded } from './exclusions.js';
+import { isExcluded, withoutExcluded } from './exclusions.js';
 import type { AuditEvent, AuditLog } from './audit.js';
 import type { Subject } from './auth.js';
 import { originAllowed, type Config } from './config.js';
@@ -434,6 +434,11 @@ export class Onramp {
       throw unpricedQuote(error) ?? error;
     }
     if (rail.provider === 'meld') void this.reportMissing(priced, { quotes });
+    const terms = { direction, code: destination.code, paymentMethodType: request.paymentMethodType, country: request.country };
+    const offered = quotes.filter((quote) => {
+      const provider = offeredBy(quote);
+      return provider === undefined || !isExcluded(this.cfg.provider_exclusions, { ...terms, provider });
+    });
 
     // The echo is built here rather than round-tripped through the rail: every value in it is
     // already in hand, so asking the rail to hand back its own arguments bought nothing.
@@ -449,7 +454,7 @@ export class Onramp {
     // amount as `sourceAmount` the day one of them stopped refusing. Meld serves a sell now, and
     // the wire contract grew the shape to carry it.
     return {
-      quotes,
+      quotes: offered,
       requested: {
         destinationCurrencyCode: destination.code,
         ...(priced.direction === 'sell'
@@ -1340,6 +1345,19 @@ export class Onramp {
     // denominated, enforced when Meld is called; see `sellCorridorCheck`'s doc comment and
     // `docs/api.md`.
     if (rail.provider === 'meld') {
+      const offer = {
+        provider: request.serviceProvider,
+        direction,
+        code: destination.code,
+        paymentMethodType: request.paymentMethodType,
+        country: request.country,
+      };
+      if (isExcluded(this.cfg.provider_exclusions, offer)) {
+        throw reject(
+          { tag: 'Other', value: { code: 'PROVIDER_UNAVAILABLE', message: 'That provider is not offered.' } },
+          `${request.serviceProvider} is excluded by provider_exclusions.`,
+        );
+      }
       if (direction === 'buy') {
         const limit = await this.buyLimit(destination.code, currency, request.country, request.paymentMethodType, 'refuse', request.serviceProvider);
         // The threshold rides on the failure, as it does on the Meld-derived form of the same two

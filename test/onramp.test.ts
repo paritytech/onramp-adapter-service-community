@@ -325,6 +325,25 @@ describe('Onramp.quote', () => {
     expect(answered.quotes).toEqual(meld.quotes);
   });
 
+  it('drops the offers of a provider provider_exclusions names', async () => {
+    const meld = new FakeMeld();
+    meld.quotes = [
+      { serviceProvider: 'REVOLUT', destinationAmount: '19.6', sourceAmount: '20' },
+      { serviceProvider: 'MERCURYO', destinationAmount: '19.4', sourceAmount: '20' },
+    ];
+    const { service } = build(meld, config({ provider_exclusions: [{ provider: 'REVOLUT', reason: 'r' }] }));
+
+    const answered = await service.quote({
+      destinationCurrencyCode: 'USDC_DOT',
+      sourceAmount: '20',
+      fiat: 'USD',
+      country: 'US',
+      paymentMethodType: 'CREDIT_DEBIT_CARD',
+    });
+
+    expect(answered.quotes).toEqual([meld.quotes[1]]);
+  });
+
   it('returns an empty list rather than failing when the rail offers nothing', async () => {
     const meld = new FakeMeld();
     meld.quotes = [];
@@ -1325,6 +1344,18 @@ describe('Onramp.create', () => {
       expect(failure.tag).toBe(expectedTag);
       // The point of the ordering: no upstream call, so no quota spent on a locally answerable
       // refusal.
+      expect(meld.calls).toHaveLength(0);
+    });
+
+    it('a provider provider_exclusions names, whatever its case', async () => {
+      const meld = new FakeMeld();
+      const { service } = build(meld, config({ provider_exclusions: [{ provider: 'TRANSAK', reason: 'r' }] }));
+
+      const failure = await failureOf(() =>
+        service.createSession(SUBJECT, createRequest({ serviceProvider: 'transak' }), REQUEST_ID),
+      );
+
+      expect(failure).toEqual({ tag: 'Other', value: { code: 'PROVIDER_UNAVAILABLE', message: 'That provider is not offered.' } });
       expect(meld.calls).toHaveLength(0);
     });
 

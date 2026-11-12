@@ -27,7 +27,7 @@ const covers = <T>(listed: readonly T[] | undefined, value: T): boolean => liste
 export const isExcluded = (rules: readonly ProviderExclusion[], offer: ProviderOffer): boolean =>
   rules.some(
     (rule) =>
-      rule.provider === offer.provider &&
+      rule.provider === offer.provider.toUpperCase() &&
       covers(rule.codes, offer.code) &&
       covers(rule.payment_methods, offer.paymentMethodType) &&
       covers(rule.directions, offer.direction) &&

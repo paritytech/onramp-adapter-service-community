@@ -76,6 +76,10 @@ Banxa down, a 10000 USD card session naming Banxa is checked against `5` to `150
 Transak against `5` to `3000`. When every provider is down the full bound applies, so availability
 never refuses a session on its own.
 
+A provider ruled out by `provider_exclusions` is a deployment's decision, not a probe result: it is
+absent from every corridor, its offers are dropped from `POST /quote`, and `POST /session` refuses
+it with `PROVIDER_UNAVAILABLE`.
+
 ## Bounds a caller will meet
 
 - Request body limit **16 KiB**. Whole request and idle connection bounded by
@@ -760,6 +764,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 400 | `RouteWithdrawn` | The operator has disabled session creation. |
 | 400 | `Other{ UNKNOWN_RAIL }` | A rail this build knows but this deployment has not wired. |
 | 400 | `Other{ AMOUNT_REJECTED }` | A provider turned the amount down without naming a bound (Meld's `INVALID_AMOUNT`). Not retryable as sent; the remedy is a different amount. Unlike `BelowMinimum`/`AboveMaximum`, there is no `value` to show. |
+| 400 | `Other{ PROVIDER_UNAVAILABLE }` | The session names a provider `provider_exclusions` rules out for its asset, method, direction or country. Checked locally, before any provider call. Not retryable as sent; quote again and pick another offer. |
 | 400 | `Other{ PROVIDER_REJECTED }` | Meld understood the request and declined it, for a reason not enumerated above. Not retryable. |
 | 400 | `Other{ DIRECTION_UNSUPPORTED }` | The named rail does not serve that direction. `chainflip` refuses `direction: "sell"` permanently, having no fiat leg to pay a seller from; `meld` serves both. Not retryable; the remedy is a different rail or a different direction, never the same request again. |
 | 400 | `Other{ RAIL_REFUSED }` | The Chainflip rail refuses **session creation**: it swaps on-chain assets and has no fiat leg. Not retryable. (Its quote leg answers `422 NoQuotesAvailable`.) |
