@@ -5,7 +5,7 @@ import { countryTarget, probeGroups, type TargetOptions } from '../../src/health
 import type { ProviderLimit } from '../../src/meld/discovery.js';
 import type { Direction } from '../../src/rail.js';
 
-const OPTIONS: TargetOptions = { sellAmounts: new Map([['DOT', '10']]) };
+const OPTIONS: TargetOptions = { sellAmounts: new Map([['DOT', '10']]), exclusions: [] };
 
 const first = () => 0;
 
@@ -125,6 +125,12 @@ describe('probeGroups', () => {
     expect(countryTarget(rows, key('BANXA', 'card', 'DE'), OPTIONS)).toMatchObject({ provider: 'BANXA', country: 'DE', fiat: 'EUR' });
     expect(countryTarget(rows, key('BANXA', 'bank', 'DE'), OPTIONS)).toBeUndefined();
     expect(countryTarget(rows, key('TRANSAK', 'card', 'US'), OPTIONS)).toBeUndefined();
+  });
+
+  it('never probes an excluded provider', () => {
+    const rows = [row('DE', 'EUR', { CREDIT_DEBIT_CARD: [banxa(), transak()] })];
+    const groups = probeGroups(rows, { ...OPTIONS, exclusions: [{ provider: 'BANXA', reason: 'r' }] }, first);
+    expect(groups.map((g) => g.provider)).toEqual(['TRANSAK']);
   });
 
   it('skips rows without stored providers and limits that are not plain decimals', () => {

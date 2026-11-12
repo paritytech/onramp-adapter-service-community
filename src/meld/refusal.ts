@@ -152,6 +152,18 @@ export function meld400(error: MeldHttpError): Refusal {
   );
 }
 
+const UNPRICED_QUOTE_CODES = new Set(['NO_VALID_QUOTES', 'TRANSACTION_FAILED_GETTING_CRYPTO_QUOTE_FROM_PROVIDER']);
+
+/**
+ * Meld's `422` for a quote no provider priced. Quotes only: a quote opens nothing upstream, so
+ * unlike a session there is no settlement surface whose existence is in doubt.
+ */
+export function unpricedQuote(cause: unknown): Refusal | undefined {
+  return cause instanceof MeldHttpError && cause.status === 422 && cause.code !== undefined && UNPRICED_QUOTE_CODES.has(cause.code)
+    ? noQuotesAvailable(`Meld: ${cause.code}`)
+    : undefined;
+}
+
 /**
  * The refusal this service answers a rail failure with, whatever shape the failure arrived in.
  *

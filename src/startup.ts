@@ -120,6 +120,7 @@ export async function start(
     },
     undefined,
     meld.publicGet.bind(meld),
+    cfg.provider_exclusions,
   );
 
   // The rail registry. Both rails are always wired, but only Meld can open a session:
@@ -322,6 +323,7 @@ export async function start(
               throttlePauseMs: cfg.health.throttle_pause_ms,
               maxProbesPerHour: cfg.health.max_probes_per_hour,
               sellAmounts: new Map(cfg.health.sell_amounts.map(({ code, amount }) => [code, amount])),
+              exclusions: cfg.provider_exclusions,
             },
             exclusive,
           )

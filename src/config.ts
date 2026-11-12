@@ -14,8 +14,10 @@ import { readFile } from 'node:fs/promises';
 import { compile } from '@fastify/proxy-addr';
 import { z } from 'zod';
 
+import type { ProviderExclusion } from './exclusions.js';
 import { ASSETS, ASSET_IDS, type AssetId } from './meld/catalog.js';
 import { MINOR_UNIT_DECIMAL, toMinorUnits } from './money.js';
+import { DIRECTIONS } from './rail.js';
 
 /** Shared so the refinement below can re-test it; see the guard in `limit`. */
 const DECIMAL = MINOR_UNIT_DECIMAL;
@@ -199,6 +201,18 @@ const limit = z
       });
     }
   });
+
+/** Provider offers never served, matched on every field the rule lists. */
+const providerExclusion = z
+  .object({
+    provider: meldCode,
+    assets: z.array(assetId).nonempty().optional(),
+    payment_methods: z.array(meldCode).nonempty().optional(),
+    directions: z.array(z.enum(DIRECTIONS)).nonempty().optional(),
+    countries: z.array(z.string().regex(/^[A-Z]{2}$/)).nonempty().optional(),
+    reason: z.string().trim().min(1),
+  })
+  .strict();
 
 const configSchema = z
   .object({
@@ -386,6 +400,7 @@ const configSchema = z
      * An asset left out is not served at all.
      */
     assets: z.partialRecord(assetId, meldCode),
+    provider_exclusions: z.array(providerExclusion).default([]),
     /**
      * Product ids permitted to spend the key.
      *
@@ -982,6 +997,11 @@ const configSchema = z
     cfg.health.sell_amounts.forEach((entry, i) => {
       named(entry.asset, ['health', 'sell_amounts', i, 'asset']);
     });
+    cfg.provider_exclusions.forEach((rule, i) => {
+      rule.assets?.forEach((asset, j) => {
+        named(asset, ['provider_exclusions', i, 'assets', j]);
+      });
+    });
   })
   // Resolve every asset reference to the code it is sent under, once, so nothing downstream reads
   // `assets` itself. Runs only on a config the refinements above passed, so every lookup hits.
@@ -991,6 +1011,9 @@ const configSchema = z
     return {
       ...cfg,
       limits: cfg.limits.map((entry) => ({ ...entry, code: codeOf(entry.asset) })),
+      provider_exclusions: cfg.provider_exclusions.map(
+        ({ assets, ...rule }): ProviderExclusion => (assets === undefined ? rule : { ...rule, codes: assets.map(codeOf) }),
+      ),
       meld: {
         ...cfg.meld,
         boot_probe: { ...cfg.meld.boot_probe, destination_code: codeOf(cfg.meld.boot_probe.asset) },

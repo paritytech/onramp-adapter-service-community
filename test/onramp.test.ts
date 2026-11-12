@@ -47,6 +47,7 @@ class FakeMeld implements FundingRail, MeldTransactionReader {
   calls: RailSessionInput[] = [];
   quoteCalls: RailQuote[] = [];
   quotes: unknown[] = [];
+  quoteError: Error | undefined;
   transactions: Record<string, MeldTransaction> = {};
 
   constructor(private readonly behaviour: (n: number) => RailSession | Error = () => ok()) {}
@@ -60,6 +61,7 @@ class FakeMeld implements FundingRail, MeldTransactionReader {
 
   async quote(input: RailQuote): Promise<unknown[]> {
     this.quoteCalls.push(input);
+    if (this.quoteError !== undefined) throw this.quoteError;
     return this.quotes;
   }
 
@@ -323,6 +325,25 @@ describe('Onramp.quote', () => {
     expect(answered.quotes).toEqual(meld.quotes);
   });
 
+  it('drops the offers of a provider provider_exclusions names', async () => {
+    const meld = new FakeMeld();
+    meld.quotes = [
+      { serviceProvider: 'REVOLUT', destinationAmount: '19.6', sourceAmount: '20' },
+      { serviceProvider: 'MERCURYO', destinationAmount: '19.4', sourceAmount: '20' },
+    ];
+    const { service } = build(meld, config({ provider_exclusions: [{ provider: 'REVOLUT', reason: 'r' }] }));
+
+    const answered = await service.quote({
+      destinationCurrencyCode: 'USDC_DOT',
+      sourceAmount: '20',
+      fiat: 'USD',
+      country: 'US',
+      paymentMethodType: 'CREDIT_DEBIT_CARD',
+    });
+
+    expect(answered.quotes).toEqual([meld.quotes[1]]);
+  });
+
   it('returns an empty list rather than failing when the rail offers nothing', async () => {
     const meld = new FakeMeld();
     meld.quotes = [];
@@ -339,6 +360,43 @@ describe('Onramp.quote', () => {
         })
       ).quotes,
     ).toEqual([]);
+  });
+
+  it.each(['NO_VALID_QUOTES', 'TRANSACTION_FAILED_GETTING_CRYPTO_QUOTE_FROM_PROVIDER'])(
+    'answers a Meld 422 %s with NoQuotesAvailable, so the caller can move on',
+    async (code) => {
+      const meld = new FakeMeld();
+      meld.quoteError = new MeldHttpError(422, code);
+      const { service } = build(meld);
+
+      const failure = await failureOf(() =>
+        service.quote({
+          destinationCurrencyCode: 'USDC_DOT',
+          sourceAmount: '20',
+          fiat: 'USD',
+          country: 'US',
+          paymentMethodType: 'CREDIT_DEBIT_CARD',
+        }),
+      );
+
+      expect(failure).toEqual({ tag: 'NoQuotesAvailable' });
+    },
+  );
+
+  it('leaves any other Meld 422 to the rail mapping', async () => {
+    const meld = new FakeMeld();
+    meld.quoteError = new MeldHttpError(422, 'UNEXPECTED');
+    const { service } = build(meld);
+
+    await expect(
+      service.quote({
+        destinationCurrencyCode: 'USDC_DOT',
+        sourceAmount: '20',
+        fiat: 'USD',
+        country: 'US',
+        paymentMethodType: 'CREDIT_DEBIT_CARD',
+      }),
+    ).rejects.toBe(meld.quoteError);
   });
 
   it('routes to the named rail and refuses an unregistered one', async () => {
@@ -1286,6 +1344,18 @@ describe('Onramp.create', () => {
       expect(failure.tag).toBe(expectedTag);
       // The point of the ordering: no upstream call, so no quota spent on a locally answerable
       // refusal.
+      expect(meld.calls).toHaveLength(0);
+    });
+
+    it('a provider provider_exclusions names, whatever its case', async () => {
+      const meld = new FakeMeld();
+      const { service } = build(meld, config({ provider_exclusions: [{ provider: 'TRANSAK', reason: 'r' }] }));
+
+      const failure = await failureOf(() =>
+        service.createSession(SUBJECT, createRequest({ serviceProvider: 'transak' }), REQUEST_ID),
+      );
+
+      expect(failure).toEqual({ tag: 'Other', value: { code: 'PROVIDER_UNAVAILABLE', message: 'That provider is not offered.' } });
       expect(meld.calls).toHaveLength(0);
     });
 

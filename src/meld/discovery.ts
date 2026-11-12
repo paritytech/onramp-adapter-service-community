@@ -42,6 +42,7 @@
 
 import { z } from 'zod';
 
+import { isExcluded, type ProviderExclusion } from '../exclusions.js';
 import { widestBound, type Bound } from '../money.js';
 import type { Direction } from '../rail.js';
 import { MeldHttpError } from './client.js';
@@ -288,6 +289,7 @@ export class MeldDiscovery implements Discovery {
      * `startup.ts` passes the unkeyed `publicGet` so the dropdown is the global list.
      */
     private readonly catalogGet: AuthedGet = get,
+    private readonly exclusions: readonly ProviderExclusion[] = [],
   ) {}
 
   private fresh<T>(entry: CacheEntry<T> | undefined, ttlMs: number): T | undefined {
@@ -348,6 +350,7 @@ export class MeldDiscovery implements Discovery {
     const byMethod = new Map<string, Omit<MethodLimit, keyof Bound | 'providers'> & { providers: [ProviderLimit, ...ProviderLimit[]] }>();
     for (const entry of entries) {
       for (const m of entry.paymentMethods ?? []) {
+        if (isExcluded(this.exclusions, { provider: entry.partner, direction, code: crypto, paymentMethodType: m.name, country })) continue;
         const min = m.limits?.min ?? undefined;
         const max = m.limits?.max ?? undefined;
         const currency = m.limits?.currencyCode ?? fiat;

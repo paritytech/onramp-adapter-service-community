@@ -33,6 +33,7 @@ a service that runs in production with a development posture. See
 | `auth.personhood.challenge_ttl_ms` | How long a challenge stays acceptable; the freshness that stops replay. 1000 to 300000. |
 | `auth.personhood.token_ttl_s` | How long a redeemed session JWT is valid; the client keeps it this long. 30 to 86400. |
 | `limits[]` | Per `(asset, currency)`: `asset` (a deliverable asset named in `assets`, e.g. `dot@assethub`), `min`, `max`, `currency`. The Meld code the row applies to is the one `assets` names. **Optional, and no longer what decides whether a pair is buyable**: live discovery is. A row *tightens* Meld's live bound for the pair it names, so this is where a business ceiling stricter than Meld's goes; a pair with no row stays buyable at Meld's own bounds, and a row that does not overlap the live bound is refused rather than reconciled. It is also the fallback allow-list if the catalog is unreachable, where it does behave like the old hard gate; left empty, that window fails closed. A destination may appear more than once (a card buyer pays USD, a SEPA buyer EUR), but a repeated pair is refused rather than silently resolved. |
+| `provider_exclusions[]` | Provider offers this deployment never serves, default `[]`. Each rule is `{ provider, assets?, payment_methods?, directions?, countries?, reason }`: `provider` is Meld's provider code (`BANXA`), `assets` are asset ids named in `assets`, `payment_methods` are Meld method names (`CREDIT_DEBIT_CARD`), `directions` are `buy` and/or `sell`, `countries` are ISO 3166-1 alpha-2 codes, and `reason` says why. A rule matches an offer when every list it gives contains the offer's value; a list left out matches anything, and a given list may not be empty. A matched provider is left out of discovered and stored corridors, so a method's limits are those of the providers left, a method with none left is not offered, and the provider is not probed. Its offers are dropped from `POST /quote`, and a session naming it is refused `PROVIDER_UNAVAILABLE`. For a provider Meld lists but cannot serve on this account, or one a client cannot present. |
 | `allowed_products[]` | Product ids permitted to spend the key. Empty means closed, not open. |
 | `cors.allowed_origins[]` | Browser origins permitted to call, **and** the allowlist a caller's `redirectUrl` must match. Never a wildcard. Empty disables browser access and refuses every redirect. Accepts `polkadot://...` and the literal `null` for the app running inside the Polkadot host; see the warning below before putting `null` in a production list. |
 | `rate_limit.per_person_max` | Requests per window for one proven person, who gets a bucket of their own. Default 120. |
@@ -104,6 +105,9 @@ fixing one error per restart stops reading the errors:
 - a missing `assets` block, an unknown asset id in it, a malformed code, one code for two assets,
   or a `limits`, `meld.boot_probe` or `supported.offramp_lanes` entry naming an asset `assets`
   gives no code;
+- a `provider_exclusions` rule with a provider or method that is not uppercase letters, digits and
+  `_`, an empty list, a country that is not two uppercase letters, a blank `reason`, or an asset
+  `assets` gives no code;
 - an unknown or never-delivered asset in `limits`, duplicate limits for one `(asset, currency)`
   pair, an inverted `min`/`max`, or a non-uppercase currency;
 - `store.ssl: false` outside development when `store.host` is not loopback;

@@ -12,7 +12,8 @@
  */
 
 import { normalizeAddress, normalizeSellerAddress } from './address.js';
-import { railRefusal } from './meld/refusal.js';
+import { railRefusal, unpricedQuote } from './meld/refusal.js';
+import { isExcluded, withoutExcluded } from './exclusions.js';
 import type { AuditEvent, AuditLog } from './audit.js';
 import type { Subject } from './auth.js';
 import { originAllowed, type Config } from './config.js';
@@ -28,7 +29,7 @@ import {
 } from './contract.js';
 import { TERMINAL_STATES } from './funding/state.js';
 import type { FundingRecord } from './funding/types.js';
-import type { FundingStore, StoredMethod } from './funding/store.js';
+import type { FundingStore, StoredMethod, SupportedCorridorRow } from './funding/store.js';
 import type {
   Direction,
   FundingRail,
@@ -239,7 +240,7 @@ export class Onramp {
       rows = all.filter((r) => r.updated_at >= newest - window);
     }
     const view = await this.health();
-    return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: storedMethods(view, r) }));
+    return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: this.storedMethods(view, r) }));
   }
 
   /** The countries this deployment can deliver a crypto to (or take it from, on a sell), for the
@@ -266,7 +267,7 @@ export class Onramp {
     const rows: LaneCorridor[] = [];
     for (const lane of this.cfg.supported.offramp_lanes) {
       for (const r of await this.funding.readCorridors(lane.code, 'sell', freshAfter)) {
-        rows.push({ lane, country: r.country, name: r.name, fiat: r.fiat, methods: storedMethods(view, r) });
+        rows.push({ lane, country: r.country, name: r.name, fiat: r.fiat, methods: this.storedMethods(view, r) });
       }
     }
     return mergeOfframpCorridors(rows);
@@ -331,6 +332,11 @@ export class Onramp {
     if (missing.length > 0) {
       this.suspect(missing.map((p) => ({ provider: p.provider, direction: priced.direction, category: method.category, scope: priced.countryCode })));
     }
+  }
+
+  /** A stored row's methods as a client sees them, without the configured exclusions. */
+  private storedMethods(view: HealthView, row: SupportedCorridorRow): WithAvailability<StoredMethod>[] {
+    return storedMethods(view, withoutExcluded(row, this.cfg.provider_exclusions));
   }
 
   /** Provider health for one request. A failed read serves every provider, as if no probe had run. */
@@ -425,9 +431,14 @@ export class Onramp {
       quotes = await rail.quote(priced);
     } catch (error) {
       if (rail.provider === 'meld') void this.reportMissing(priced, { error });
-      throw error;
+      throw unpricedQuote(error) ?? error;
     }
     if (rail.provider === 'meld') void this.reportMissing(priced, { quotes });
+    const terms = { direction, code: destination.code, paymentMethodType: request.paymentMethodType, country: request.country };
+    const offered = quotes.filter((quote) => {
+      const provider = offeredBy(quote);
+      return provider === undefined || !isExcluded(this.cfg.provider_exclusions, { ...terms, provider });
+    });
 
     // The echo is built here rather than round-tripped through the rail: every value in it is
     // already in hand, so asking the rail to hand back its own arguments bought nothing.
@@ -443,7 +454,7 @@ export class Onramp {
     // amount as `sourceAmount` the day one of them stopped refusing. Meld serves a sell now, and
     // the wire contract grew the shape to carry it.
     return {
-      quotes,
+      quotes: offered,
       requested: {
         destinationCurrencyCode: destination.code,
         ...(priced.direction === 'sell'
@@ -1334,6 +1345,19 @@ export class Onramp {
     // denominated, enforced when Meld is called; see `sellCorridorCheck`'s doc comment and
     // `docs/api.md`.
     if (rail.provider === 'meld') {
+      const offer = {
+        provider: request.serviceProvider,
+        direction,
+        code: destination.code,
+        paymentMethodType: request.paymentMethodType,
+        country: request.country,
+      };
+      if (isExcluded(this.cfg.provider_exclusions, offer)) {
+        throw reject(
+          { tag: 'Other', value: { code: 'PROVIDER_UNAVAILABLE', message: 'That provider is not offered.' } },
+          `${request.serviceProvider} is excluded by provider_exclusions.`,
+        );
+      }
       if (direction === 'buy') {
         const limit = await this.buyLimit(destination.code, currency, request.country, request.paymentMethodType, 'refuse', request.serviceProvider);
         // The threshold rides on the failure, as it does on the Meld-derived form of the same two

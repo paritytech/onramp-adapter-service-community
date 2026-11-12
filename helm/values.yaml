@@ -127,6 +127,10 @@ limits:
     max: "2000.00"
     currency: USD
 
+# Provider offers this deployment never serves: `{ provider, assets?, payment_methods?,
+# directions?, countries?, reason }`, each list optional. See docs/configuration.md.
+provider_exclusions: []
+
 allowed_products:
   - another-product.example
 

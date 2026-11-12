@@ -293,6 +293,23 @@ describe('Onramp.supportedCorridors', () => {
     ]);
   });
 
+  it('leaves out the providers provider_exclusions names', async () => {
+    const store = fakeStore();
+    await store.upsertCorridor({
+      destination_currency_code: 'DOT',
+      direction: 'buy',
+      country: 'BR',
+      name: 'Brazil',
+      fiat: 'BRL',
+      methods: [pix],
+      method_providers: [{ paymentMethodType: 'PIX', providers: [{ provider: 'BANXA', min: '10', max: '5000' }] }],
+    });
+    const cfg = config({ provider_exclusions: [{ provider: 'BANXA', reason: 'r' }] });
+    const svc = new Onramp(cfg, { meld: new FakeMeld() }, new FakeAudit(), store, new FakeMeld(), () => NOW, () => 'funding-1', undefined);
+
+    expect(await svc.supportedCorridors('DOT')).toEqual([{ country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [] }]);
+  });
+
   it('reads the sell row rather than the buy one when asked for direction sell', async () => {
     const store = fakeStore();
     await store.upsertCorridor({ destination_currency_code: 'DOT', direction: 'buy', country: 'BR', name: 'Brazil', fiat: 'BRL', methods: [pix] });
