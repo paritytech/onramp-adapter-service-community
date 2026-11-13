@@ -1475,13 +1475,20 @@ describe('the factory and Chainflip alerts', () => {
   it('alerts on every unattributed delivery once the cursor moves, and never reads its token as a home', async () => {
     const w0 = world();
     w0.state.head = 50n;
-    w0.state.factoryLogs = [unattributed('message'), unattributed('claimer'), unattributed('token', '0x')];
+    w0.state.factoryLogs = [
+      unattributed('message'),
+      unattributed('claimer'),
+      unattributed('token'),
+      unattributed('token', '0x'),
+    ];
     const mem = memoryStore([sale({ due_at: null })]);
     const log = vi.fn<KeeperLog>();
     await keeperFor(w0, mem, { log }).keeper.pass();
+    const quarantined = 'it is held in the quarantine treasury, recoverable with recoverQuarantined';
     expect(log.mock.calls.filter(([level]) => level === 'error').map(([, message]) => message)).toEqual([
-      `sale vault proxy factory ${FACTORY} left 3000000 base units of token ${SEPOLIA.usdc} unattributed (message) in blocks 1 to 50, a skim sends it to the treasury`,
-      `sale vault proxy factory ${FACTORY} left 3000000 base units of token ${SEPOLIA.usdc} unattributed (claimer) in blocks 1 to 50, a skim sends it to the treasury`,
+      `sale vault proxy factory ${FACTORY} left 3000000 base units of token ${SEPOLIA.usdc} unattributed (message) in blocks 1 to 50, ${quarantined}`,
+      `sale vault proxy factory ${FACTORY} left 3000000 base units of token ${SEPOLIA.usdc} unattributed (claimer) in blocks 1 to 50, ${quarantined}`,
+      `sale vault proxy factory ${FACTORY} left 3000000 base units of token ${SEPOLIA.usdc} unattributed (token) in blocks 1 to 50, a skim sends it to the treasury`,
       `sale vault proxy factory ${FACTORY} logged an unreadable unattributed delivery: return data has no word 0`,
     ]);
     expect(mem.marked).toEqual([]);
