@@ -716,14 +716,21 @@ export class SaleVaultProxyKeeper {
     }
   }
 
-  // USDC the factory booked to no home goes to the treasury on the next skim, so each one is an alert
+  // A foreign token waits for a skim to the treasury, a bad USDC message is quarantined for the guardian, each is an alert
   private alertUnattributed(logs: readonly RawLog[], from: bigint, to: bigint): void {
     for (const log of logs) {
       try {
         const [, token = ''] = log.topics;
+        const amount = decodeUint(log.data).toString();
+        const reason = decodeShortString(log.data, 1);
+        // Only a foreign token skims to the treasury, a bad USDC message is held for the guardian
+        const fate =
+          reason === 'token'
+            ? 'a skim sends it to the treasury'
+            : 'it is held in the quarantine treasury, recoverable with recoverQuarantined';
         this.deps.log(
           'error',
-          `sale vault proxy factory ${log.address} left ${decodeUint(log.data).toString()} base units of token ${topicAddress(token)} unattributed (${decodeShortString(log.data, 1)}) in blocks ${from.toString()} to ${to.toString()}, a skim sends it to the treasury`,
+          `sale vault proxy factory ${log.address} left ${amount} base units of token ${topicAddress(token)} unattributed (${reason}) in blocks ${from.toString()} to ${to.toString()}, ${fate}`,
         );
       } catch (error) {
         this.deps.log('error', `sale vault proxy factory ${log.address} logged an unreadable unattributed delivery: ${toMessage(error)}`);
